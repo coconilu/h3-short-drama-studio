@@ -5,6 +5,7 @@ import {
   Activity,
   AlertTriangle,
   BookMarked,
+  BookOpenText,
   Boxes,
   Check,
   CheckCircle2,
@@ -44,6 +45,7 @@ import {
 import type { Asset, BatchGenerationResult, Candidate, CandidateReview, DeliveryPlanItem, DeliveryWorkspace, DryRunResult, ExportPreflight, ExportRun, Health, Job, ProductionAcceptance, ProductionBatch, Project, ProjectArchive, Promotion, PromptPlan, ReviewWorkspace, RoughCut, Shot, ShotReference, Workbench, WorkspaceSettings } from './types'
 import { GlobalActivityPage, GlobalQueuePage, ProjectsWorkbench, SettingsPage } from './WorkbenchPages'
 import { ScriptStudio } from './ScriptStudio'
+import { CreativePlanning } from './CreativePlanning'
 import { ProductionBible } from './ProductionBible'
 import { PromptCompiler } from './PromptCompiler'
 
@@ -55,6 +57,7 @@ const globalNavItems = [
 
 const projectNavItems = [
   { id: 'overview', label: '项目概览', icon: CircleGauge },
+  { id: 'planning', label: '创作规划', icon: BookOpenText },
   { id: 'script', label: '剧本开发', icon: ScrollText },
   { id: 'bible', label: '生产圣经', icon: BookMarked },
   { id: 'compiler', label: '生成计划', icon: FileCheck2 },
@@ -368,7 +371,7 @@ function App() {
     }
   }
 
-  const switchProject = async (projectId: string, destination?: 'overview' | 'script' | 'storyboard' | 'assets') => {
+  const switchProject = async (projectId: string, destination?: 'overview' | 'planning' | 'script' | 'storyboard' | 'assets') => {
     if (projectId === project?.id) {
       if (destination) setActivePage(destination)
       return
@@ -548,7 +551,7 @@ function App() {
     setApiOnline(false)
   }
 
-  if (loading || !project || !selectedShot || !workbench || !settings) {
+  if (loading || !project || !workbench || !settings) {
     if (!loading && startupError) return <ServiceUnavailable error={startupError} attempting={startupAttempting} onRetry={() => setStartupRetry((value) => value + 1)} />
     return <div className="loading"><LoaderCircle className="spin" /> 正在打开镜场…</div>
   }
@@ -590,7 +593,7 @@ function App() {
             {activePage === 'projects' && <label className="topbar-search"><Search size={15} /><input aria-label="搜索项目" value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} placeholder="搜索项目名称" /></label>}
             <button className={`connection ${health?.comfyui === 'online' ? 'online' : ''}`} onClick={() => setActivePage('settings')} title="打开系统设置"><i />ComfyUI {health?.comfyui === 'online' ? '在线' : '离线'}</button>
             <button className={`button ${activePage === 'projects' ? 'primary' : 'secondary'}`} onClick={() => setModal('project')}><FolderPlus size={17} />新建项目</button>
-            {!isGlobalPage && activePage !== 'script' && <button className="button secondary" onClick={() => setModal('new')}><Plus size={17} />新建镜头</button>}
+            {!isGlobalPage && activePage !== 'script' && activePage !== 'planning' && <button className="button secondary" onClick={() => setModal('new')}><Plus size={17} />新建镜头</button>}
           </div>
         </header>
 
@@ -603,11 +606,12 @@ function App() {
         {activePage === 'global-queue' && <GlobalQueuePage workbench={workbench} onOpenProject={switchProject} />}
         {activePage === 'settings' && <SettingsPage settings={settings} health={health} onSave={saveSettings} onTest={testConnection} onRestartApi={restartApi} />}
 
+        {activePage === 'planning' && <CreativePlanning key={project.id} projectId={project.id} setNotice={setNotice} onOpenScript={() => setActivePage('script')} />}
         {activePage === 'script' && <ScriptStudio project={project} setNotice={setNotice} onProjectRefresh={refresh} onOpenStoryboard={() => setActivePage('storyboard')} />}
         {activePage === 'bible' && <ProductionBible key={project.id} projectId={project.id} assets={assets} setNotice={setNotice} />}
         {activePage === 'compiler' && <PromptCompiler key={project.id} projectId={project.id} setNotice={setNotice} onOpenStoryboard={(shotId) => { setSelectedShotId(shotId); setActivePage('storyboard') }} />}
 
-        {activePage === 'storyboard' && (
+        {activePage === 'storyboard' && selectedShot && (
           <Storyboard
             project={project}
             selectedShot={selectedShot}
@@ -624,16 +628,18 @@ function App() {
             setNotice={setNotice}
           />
         )}
+        {activePage === 'storyboard' && !selectedShot && <main className="empty-project-stage"><BookOpenText size={28} /><h1>先完成创作规划</h1><p>这个项目还没有镜头。请先确定剧情、角色、章节与小节，再进入剧本开发。</p><button className="button primary" onClick={() => setActivePage('planning')}>打开创作规划</button></main>}
         {activePage === 'overview' && <Overview project={project} health={health} assets={assets} jobs={jobs} acceptance={acceptance} onOpenStoryboard={() => setActivePage('script')} onRunAcceptance={runAcceptance} onSignoff={signoffDelivery} />}
         {activePage === 'assets' && <AssetsPage assets={assets} onRefresh={refresh} setNotice={setNotice} />}
         {activePage === 'queue' && <QueuePage jobs={jobs} onSync={syncShot} />}
-        {activePage === 'review' && <ReviewPage project={project} shot={selectedShot} candidates={candidates} promotions={promotions} reviewWorkspace={reviewWorkspace} onSelectShot={setSelectedShotId} onRefresh={async () => { await Promise.all([refresh(), refreshShotReview(selectedShot.id)]) }} setNotice={setNotice} />}
+        {activePage === 'review' && selectedShot && <ReviewPage project={project} shot={selectedShot} candidates={candidates} promotions={promotions} reviewWorkspace={reviewWorkspace} onSelectShot={setSelectedShotId} onRefresh={async () => { await Promise.all([refresh(), refreshShotReview(selectedShot.id)]) }} setNotice={setNotice} />}
+        {activePage === 'review' && !selectedShot && <main className="empty-project-stage"><Film size={28} /><h1>还没有可审片的镜头</h1><p>完成创作规划和剧本开发后，再同步分镜并生成候选。</p><button className="button primary" onClick={() => setActivePage('planning')}>返回创作规划</button></main>}
         {activePage === 'timeline' && <TimelinePage shots={project.shots} roughCut={roughCut} preflight={exportPreflight} exportRuns={exportRuns} deliveryWorkspace={deliveryWorkspace} onExport={submitExport} onRunAction={mutateExport} onRefresh={refresh} setNotice={setNotice} />}
       </div>
 
       {modal === 'new' && <NewShotModal onClose={() => setModal(null)} onCreated={async (shot) => { await refresh(); setSelectedShotId(shot.id); setActivePage('storyboard'); setModal(null); setNotice('新镜头已加入分镜表') }} />}
-      {modal === 'project' && <NewProjectModal onClose={() => setModal(null)} onCreated={async (created) => { setSelectedShotId(created.shots[0]?.id || ''); await refresh(); setActivePage('script'); setModal(null); setNotice(`“${created.title}”工作区已创建`) }} />}
-      {modal === 'confirm' && <ConfirmModal shot={selectedShot} onClose={() => setModal(null)} onConfirm={submitGeneration} />}
+      {modal === 'project' && <NewProjectModal onClose={() => setModal(null)} onCreated={async (created) => { setSelectedShotId(created.shots[0]?.id || ''); await refresh(); setActivePage('planning'); setModal(null); setNotice(`“${created.title}”工作区已创建，请先完善创作规划`) }} />}
+      {modal === 'confirm' && selectedShot && <ConfirmModal shot={selectedShot} onClose={() => setModal(null)} onConfirm={submitGeneration} />}
     </div>
   )
 }
@@ -1483,7 +1489,6 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
           prompt: parts[3] || `${parts[1]}, cinematic realism, coherent character and location, one continuous shot, no subtitles or logos`,
         }
       })
-      if (!shots.length) throw new Error('至少录入一个初始镜头')
       const created = await api<Project>('/api/projects', {
         method: 'POST',
         body: JSON.stringify({ ...form, target_duration: Number(form.target_duration), shots }),
@@ -1494,11 +1499,11 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
     }
   }
   return <div className="modal-backdrop"><form className="modal project-modal" onSubmit={submit}>
-    <div className="modal-title"><div><span className="eyebrow">新短剧工作区</span><h2>创建项目并批量录入分镜</h2></div><button type="button" onClick={onClose}><X /></button></div>
+    <div className="modal-title"><div><span className="eyebrow">新短剧工作区</span><h2>从创作规划开始新项目</h2></div><button type="button" onClick={onClose}><X /></button></div>
     <div className="form-grid project-fields"><label>项目名称<input required minLength={2} value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="例如：电梯停在十三层" /></label><label>集号<input required value={form.episode} onChange={(event) => setForm({ ...form, episode: event.target.value })} /></label><label>目标时长（秒）<input required type="number" min="5" max="3600" value={form.target_duration} onChange={(event) => setForm({ ...form, target_duration: event.target.value })} /></label></div>
-    <label>故事梗概<textarea required rows={3} value={form.logline} onChange={(event) => setForm({ ...form, logline: event.target.value })} placeholder="一句话说明人物、冲突和悬念。" /></label>
-    <label>初始分镜 <small>每行：标题｜剧情动作｜对白（可空）｜H3 提示词（可空）</small><textarea className="shot-import" required rows={8} value={form.shots} onChange={(event) => setForm({ ...form, shots: event.target.value })} placeholder={'电梯来电｜凌晨，林夏独自走入电梯，楼层灯闪烁｜｜East Asian woman enters an old elevator at midnight, cinematic suspense\n十三层｜电梯越过十二层，显示屏跳到不存在的十三层｜林夏：这栋楼没有十三层。｜close-up elevator display changes from 12 to 13'} /></label>
-    <p className="import-note">未填写英文提示词时，平台会使用剧情动作生成基础提示词；创建后仍可逐镜完善，再执行 dry-run。</p>
+    <label>已有故事想法 <small>可空，创建后在“创作规划”完善主题和剧情提案</small><textarea rows={3} value={form.logline} onChange={(event) => setForm({ ...form, logline: event.target.value })} placeholder="一句话想法，或者暂时留空。" /></label>
+    <label>已有初始分镜 <small>可空；每行：标题｜剧情动作｜对白（可空）｜H3 提示词（可空）</small><textarea className="shot-import" rows={6} value={form.shots} onChange={(event) => setForm({ ...form, shots: event.target.value })} placeholder={'如果已有分镜，可以在这里批量导入；没有就直接创建空项目。\n电梯来电｜凌晨，林夏独自走入电梯，楼层灯闪烁'} /></label>
+    <p className="import-note">空项目会先进入“创作规划”：简报 → 剧情提案 → 角色 → 章节与小节。这里不会调用 Agent 或提交 GPU。</p>
     {error && <p className="form-error">{error}</p>}
     <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary"><FolderPlus size={16} />创建工作区</button></div>
   </form></div>

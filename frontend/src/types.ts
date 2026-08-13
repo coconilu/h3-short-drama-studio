@@ -90,6 +90,138 @@ export type Project = {
   shots: Shot[]
 }
 
+export type CreativeBrief = {
+  project_id: string
+  theme: string
+  genre: string
+  tone: string
+  audience: string
+  target_duration: number
+  constraints: string
+  status: 'draft' | 'approved'
+  revision: number
+  version_count: number
+  created_at: string
+  updated_at: string
+}
+
+export type CreativeProposal = {
+  id: string
+  project_id: string
+  ordinal: number
+  title: string
+  synopsis: string
+  core_conflict: string
+  ending: string
+  status: 'draft' | 'finalized'
+  revision: number
+  version_count: number
+  created_at: string
+  updated_at: string
+}
+
+export type CreativeCharacter = {
+  id: string
+  project_id: string
+  ordinal: number
+  name: string
+  identity: string
+  goal: string
+  obstacle: string
+  personality: string
+  appearance: string
+  voice: string
+  relationships: string
+  reference_notes: string
+  status: 'draft' | 'approved'
+  revision: number
+  version_count: number
+  created_at: string
+  updated_at: string
+}
+
+export type CreativeSection = {
+  id: string
+  project_id: string
+  chapter_id: string
+  ordinal: number
+  title: string
+  summary: string
+  pacing_goal: string
+  planned_seconds: number
+  status: 'draft' | 'approved'
+  revision: number
+  version_count: number
+  created_at: string
+  updated_at: string
+}
+
+export type CreativeChapter = {
+  id: string
+  project_id: string
+  ordinal: number
+  title: string
+  summary: string
+  pacing_goal: string
+  planned_seconds: number
+  status: 'draft' | 'approved'
+  revision: number
+  version_count: number
+  created_at: string
+  updated_at: string
+  sections: CreativeSection[]
+}
+
+export type CreativePlanningWorkspace = {
+  project: { id: string; title: string; episode: string }
+  brief: CreativeBrief
+  proposals: CreativeProposal[]
+  characters: CreativeCharacter[]
+  chapters: CreativeChapter[]
+  summary: {
+    proposal_count: number
+    character_count: number
+    chapter_count: number
+    section_count: number
+    finalized_proposal_id?: string
+    ready: boolean
+  }
+  next_actions: Array<{ id: string; label: string; complete: boolean; action: string }>
+}
+
+export type CreativeRevisionHistory = {
+  entity_type: 'brief' | 'proposal' | 'character' | 'chapter' | 'section'
+  entity_id: string
+  revisions: Array<{
+    id: string
+    revision: number
+    source: string
+    snapshot: Record<string, unknown>
+    created_at: string
+  }>
+}
+
+export type CreativeArchiveEntry = {
+  id: string
+  entity_type: 'proposal' | 'character' | 'chapter' | 'section'
+  title: string
+  status: 'archived'
+  revision: number
+  updated_at: string
+  archived_at: string
+  source: string
+  history_url: string
+}
+
+export type CreativeArchive = {
+  project: { id: string; title: string; episode: string }
+  entries: CreativeArchiveEntry[]
+  summary: {
+    total: number
+    by_type: Record<CreativeArchiveEntry['entity_type'], number>
+  }
+}
+
 export type ProjectSummary = {
   id: string
   title: string

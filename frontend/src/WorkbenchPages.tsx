@@ -24,7 +24,7 @@ import {
 } from 'lucide-react'
 import type { Health, Workbench, WorkbenchActivity, WorkbenchProject, WorkspaceSettings } from './types'
 
-type ProjectDestination = 'overview' | 'storyboard' | 'assets'
+type ProjectDestination = 'overview' | 'planning' | 'storyboard' | 'assets'
 
 const phaseClass: Record<WorkbenchProject['category'], string> = {
   planning: 'planning',
@@ -154,11 +154,12 @@ export function ProjectsWorkbench({ workbench, health, search, onOpenProject, on
               <span className={`phase ${phaseClass[project.category]}`}>{project.phase}</span>
               <div>{project.archived
                 ? <button className="continue-project" disabled={busyProject === project.id} onClick={() => runProjectAction(project.id, onRestoreProject)}><ArchiveRestore size={15} />恢复项目</button>
-                : <button className="continue-project" onClick={() => onOpenProject(project.id, 'storyboard')}>继续制作<ChevronRight size={15} /></button>}
+                : <button className="continue-project" onClick={() => onOpenProject(project.id, project.shot_count ? 'storyboard' : 'planning')}>{project.shot_count ? '继续制作' : '开始规划'}<ChevronRight size={15} /></button>}
                 <div className="project-menu">
                   <button aria-label={`${project.title} 项目操作`} title="项目操作" onClick={() => setOpenMenu(openMenu === project.id ? null : project.id)}><MoreHorizontal size={18} /></button>
                   {openMenu === project.id && <div className="project-menu-popover">
                     {!project.archived && <button onClick={() => onOpenProject(project.id, 'overview')}>打开项目概览</button>}
+                    {!project.archived && <button onClick={() => onOpenProject(project.id, 'planning')}>进入创作规划</button>}
                     {!project.archived && <button onClick={() => onOpenProject(project.id, 'storyboard')}>进入剧本与分镜</button>}
                     {!project.archived && <button onClick={() => onOpenProject(project.id, 'assets')}>查看项目素材</button>}
                     <button disabled={busyProject === project.id} onClick={() => runProjectAction(project.id, onCreateArchive)}><Download size={13} />创建并下载归档包</button>

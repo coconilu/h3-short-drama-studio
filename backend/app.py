@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 try:
+    from .content_planning import create_content_router, init_content_schema
     from .delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
     from .project_archive import create_archive_router, init_archive_schema
     from .production_bible import create_bible_router, init_bible_schema
@@ -48,6 +49,7 @@ try:
     from .script_workspace import create_script_router, init_script_schema
     from .runtime_control import request_supervisor_action, supervisor_status
 except ImportError:  # Support `uvicorn app:app` when backend is the working directory.
+    from content_planning import create_content_router, init_content_schema
     from delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
     from project_archive import create_archive_router, init_archive_schema
     from production_bible import create_bible_router, init_bible_schema
@@ -413,6 +415,7 @@ def init_db() -> None:
               ON production_acceptance_runs(project_id, created_at DESC);
             """
         )
+        init_content_schema(db)
         init_script_schema(db)
         init_bible_schema(db)
         init_prompt_schema(db)
@@ -1115,9 +1118,9 @@ class ShotCreate(BaseModel):
 class ProjectCreate(BaseModel):
     title: str = Field(min_length=2, max_length=80)
     episode: str = Field("EP01", min_length=1, max_length=20)
-    logline: str = Field(min_length=2, max_length=500)
+    logline: str = Field("", max_length=500)
     target_duration: float = Field(60.0, ge=5.0, le=3600.0)
-    shots: list[ShotCreate] = Field(min_length=1, max_length=200)
+    shots: list[ShotCreate] = Field(default_factory=list, max_length=200)
 
 
 class GenerateRequest(BaseModel):
@@ -1227,6 +1230,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(create_content_router(DB_PATH))
 app.include_router(create_script_router(DB_PATH, ROOT))
 app.include_router(create_bible_router(DB_PATH))
 app.include_router(create_production_router(DB_PATH, lambda shot_id: compile_prompt_plan(DB_PATH, shot_id)))
@@ -1370,6 +1374,11 @@ def get_workbench() -> dict[str, Any]:
         MAX(
           projects.created_at,
           COALESCE((SELECT MAX(updated_at) FROM shots WHERE shots.project_id = projects.id), projects.created_at),
+          COALESCE((SELECT MAX(updated_at) FROM creative_briefs WHERE creative_briefs.project_id = projects.id), projects.created_at),
+          COALESCE((SELECT MAX(updated_at) FROM creative_proposals WHERE creative_proposals.project_id = projects.id), projects.created_at),
+          COALESCE((SELECT MAX(updated_at) FROM creative_characters WHERE creative_characters.project_id = projects.id), projects.created_at),
+          COALESCE((SELECT MAX(updated_at) FROM creative_chapters WHERE creative_chapters.project_id = projects.id), projects.created_at),
+          COALESCE((SELECT MAX(updated_at) FROM creative_sections WHERE creative_sections.project_id = projects.id), projects.created_at),
           COALESCE((SELECT MAX(jobs.updated_at) FROM jobs JOIN shots job_shot ON job_shot.id = jobs.shot_id
                     WHERE job_shot.project_id = projects.id), projects.created_at),
           COALESCE((SELECT MAX(updated_at) FROM export_runs WHERE export_runs.project_id = projects.id), projects.created_at)
