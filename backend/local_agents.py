@@ -4,6 +4,7 @@ import difflib
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
@@ -56,6 +58,9 @@ def init_local_agent_schema(db: sqlite3.Connection) -> None:
           probe_state TEXT NOT NULL DEFAULT 'unknown',
           installed INTEGER NOT NULL DEFAULT 0,
           callable INTEGER NOT NULL DEFAULT 0,
+          auth_state TEXT NOT NULL DEFAULT 'unknown',
+          model_state TEXT NOT NULL DEFAULT 'unknown',
+          callable_state TEXT NOT NULL DEFAULT 'unknown',
           version TEXT,
           last_error TEXT,
           last_probe_at TEXT,
@@ -84,6 +89,10 @@ def init_local_agent_schema(db: sqlite3.Connection) -> None:
           error TEXT,
           command_info TEXT NOT NULL DEFAULT '{}',
           provider_version TEXT,
+          provider_adapter TEXT NOT NULL DEFAULT '',
+          executable_path TEXT NOT NULL DEFAULT '',
+          executable_fingerprint TEXT NOT NULL DEFAULT '',
+          timeout_seconds INTEGER NOT NULL DEFAULT 300,
           model TEXT NOT NULL DEFAULT '',
           retry_of TEXT REFERENCES creative_agent_runs(id),
           attempt INTEGER NOT NULL DEFAULT 1,
@@ -102,6 +111,23 @@ def init_local_agent_schema(db: sqlite3.Connection) -> None:
           ON creative_agent_runs(state, created_at);
         """
     )
+    provider_columns = {row[1] for row in db.execute("PRAGMA table_info(local_agent_providers)").fetchall()}
+    for name, definition in (
+        ("auth_state", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("model_state", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("callable_state", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ):
+        if name not in provider_columns:
+            db.execute(f"ALTER TABLE local_agent_providers ADD COLUMN {name} {definition}")
+    run_columns = {row[1] for row in db.execute("PRAGMA table_info(creative_agent_runs)").fetchall()}
+    for name, definition in (
+        ("provider_adapter", "TEXT NOT NULL DEFAULT ''"),
+        ("executable_path", "TEXT NOT NULL DEFAULT ''"),
+        ("executable_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("timeout_seconds", "INTEGER NOT NULL DEFAULT 300"),
+    ):
+        if name not in run_columns:
+            db.execute(f"ALTER TABLE creative_agent_runs ADD COLUMN {name} {definition}")
     now = utc_now()
     defaults = (
         ("codex", "codex", "Codex CLI"),
@@ -174,12 +200,14 @@ def _provider_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     result["installed"] = bool(result["installed"])
     result["callable"] = bool(result["callable"])
     result["capabilities"] = _json(result.pop("capabilities"), [])
-    if result["callable"]:
-        result["action_hint"] = "已可调用，可在创作规划中选择此提供方。"
+    if result["callable_state"] == "verified":
+        result["action_hint"] = "安装、登录和模型调用条件均已验证。"
+    elif result["callable"]:
+        result["action_hint"] = "配置已就绪；为避免消耗额度，实际模型调用仍标记为未验证。"
     elif not result["enabled"]:
         result["action_hint"] = "提供方已停用；在系统设置中重新启用后再探测。"
     elif result["installed"]:
-        result["action_hint"] = "CLI 已找到但调用失败；请检查登录状态，并重新探测。"
+        result["action_hint"] = result.get("last_error") or "CLI 已找到，但登录或模型配置不可用。"
     else:
         command = "codex" if result["adapter"] == "codex" else "kimi"
         result["action_hint"] = f"未找到 {command}；请先安装 CLI，或填写可执行文件路径。"
@@ -212,8 +240,46 @@ def _resolve_executable(row: sqlite3.Row | dict[str, Any]) -> str | None:
     return shutil.which("codex" if row["adapter"] == "codex" else "kimi")
 
 
+def _executable_fingerprint(executable: str) -> str:
+    path = Path(executable).resolve(strict=True)
+    stat = path.stat()
+    identity = f"{os.path.normcase(str(path))}\0{stat.st_size}\0{stat.st_mtime_ns}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _isolated_environment(adapter: str) -> dict[str, str]:
+    """Pass only runtime/auth/proxy variables required by the selected CLI."""
+    common = {
+        "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "USERPROFILE", "HOME",
+        "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PATH", "PATHEXT",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    }
+    adapter_specific = {
+        "codex": {"CODEX_HOME", "OPENAI_API_KEY"},
+        "kimi": {"KIMI_CODE_HOME", "KIMI_API_KEY", "MOONSHOT_API_KEY"},
+    }[adapter]
+    result = {name: value for name, value in os.environ.items() if name in common | adapter_specific}
+    result.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
+    return result
+
+
 def _command_prefix(executable: str) -> list[str]:
     return [sys.executable, executable] if Path(executable).suffix.lower() == ".py" else [executable]
+
+
+def _probe_command(executable: str, args: list[str], adapter: str, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [*_command_prefix(executable), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=min(10, timeout_seconds),
+        check=False,
+        env=_isolated_environment(adapter),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
 
 
 def probe_provider(db_path: Path, provider_id: str) -> dict[str, Any]:
@@ -224,42 +290,72 @@ def probe_provider(db_path: Path, provider_id: str) -> dict[str, Any]:
         executable = _resolve_executable(row)
         installed = bool(executable)
         callable_state = False
+        auth_state = "unknown"
+        model_state = "unknown"
+        callable_detail = "unknown"
         version: str | None = None
         error: str | None = None
         if not row["enabled"]:
             error = "提供方已停用"
+            auth_state = model_state = callable_detail = "unavailable"
         elif not executable:
             error = "未找到可执行文件"
+            auth_state = model_state = callable_detail = "unavailable"
         else:
             try:
-                result = subprocess.run(
-                    [*_command_prefix(executable), "--version"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=min(10, int(row["timeout_seconds"])),
-                    check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
+                result = _probe_command(executable, ["--version"], row["adapter"], int(row["timeout_seconds"]))
                 version = (result.stdout or result.stderr or "已检测").strip().splitlines()[0][:160]
-                callable_state = result.returncode == 0
-                if not callable_state:
+                if result.returncode != 0:
                     error = f"版本探测退出码 {result.returncode}"
+                    auth_state = model_state = callable_detail = "unavailable"
+                elif row["adapter"] == "codex":
+                    auth = _probe_command(executable, ["login", "status"], "codex", int(row["timeout_seconds"]))
+                    auth_output = (auth.stdout or auth.stderr or "").strip()
+                    if auth.returncode == 0 and "logged in" in auth_output.lower():
+                        auth_state = "verified"
+                        model_state = "unverified"
+                        callable_detail = "unverified"
+                        callable_state = True
+                    else:
+                        auth_state = "unavailable" if auth.returncode != 0 else "unverified"
+                        model_state = callable_detail = "unverified"
+                        error = "Codex 登录状态未确认；请运行 codex login status"
+                else:
+                    configured = _probe_command(
+                        executable, ["provider", "list", "--json"], "kimi", int(row["timeout_seconds"])
+                    )
+                    config_output = (configured.stdout or configured.stderr or "").strip()
+                    model = (row["model"] or "").strip()
+                    config_ok = configured.returncode == 0 and bool(config_output)
+                    model_ok = config_ok and (not model or model.lower() in config_output.lower())
+                    auth_state = "unverified" if config_ok else "unavailable"
+                    model_state = "verified" if model_ok else "unavailable"
+                    callable_detail = "unverified" if model_ok else "unavailable"
+                    callable_state = model_ok
+                    if not config_ok:
+                        error = "Kimi 提供方配置不可读取；请运行 kimi provider list"
+                    elif not model_ok:
+                        error = f"Kimi 配置中未找到模型 {model}"
             except subprocess.TimeoutExpired:
                 error = "版本探测超时"
+                auth_state = model_state = callable_detail = "unavailable"
             except OSError as exc:
                 error = str(exc)[:500]
+                auth_state = model_state = callable_detail = "unavailable"
         now = utc_now()
         db.execute(
             """UPDATE local_agent_providers
             SET executable_path = COALESCE(executable_path, ?), probe_state = ?, installed = ?, callable = ?,
-                version = ?, last_error = ?, last_probe_at = ?, updated_at = ? WHERE id = ?""",
+                auth_state = ?, model_state = ?, callable_state = ?, version = ?, last_error = ?,
+                last_probe_at = ?, updated_at = ? WHERE id = ?""",
             (
                 executable,
-                "available" if callable_state else "unavailable",
+                callable_detail,
                 int(installed),
                 int(callable_state),
+                auth_state,
+                model_state,
+                callable_detail,
                 version,
                 error,
                 now,
@@ -379,19 +475,150 @@ def extract_json(raw: str) -> dict[str, Any]:
 
 
 def provider_result_text(adapter: str, raw: str) -> str:
-    if adapter != "kimi":
-        return raw
-    assistant_messages: list[str] = []
-    for line in raw.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("role") == "assistant" and isinstance(event.get("content"), str):
-            assistant_messages.append(event["content"])
-    if not assistant_messages:
-        raise ValueError("Kimi stream-json 中没有 assistant 输出")
-    return assistant_messages[-1]
+    return raw
+
+
+class ForbiddenToolError(RuntimeError):
+    pass
+
+
+def _write_kimi_profile(sandbox_root: Path) -> tuple[Path, Path]:
+    skills_dir = sandbox_root / "isolated-skills"
+    skills_dir.mkdir()
+    profile = sandbox_root / "structured-writer.md"
+    profile.write_text(
+        """---
+name: jingchang-structured-writer
+description: Isolated structured writing adapter
+tools: []
+subagents: []
+---
+Only return the requested structured JSON. Tool use, filesystem access, subprocesses, and subagents are disabled.
+""",
+        encoding="utf-8",
+    )
+    return skills_dir, profile
+
+
+def _acp_update_kind(message: dict[str, Any]) -> str:
+    if message.get("method") != "session/update":
+        return ""
+    update = message.get("params", {}).get("update", {})
+    if not isinstance(update, dict):
+        return ""
+    return str(update.get("sessionUpdate") or update.get("type") or "").lower()
+
+
+def _acp_message_text(message: dict[str, Any]) -> str:
+    if _acp_update_kind(message) not in {"agent_message_chunk", "agentmessagechunk"}:
+        return ""
+    content = message.get("params", {}).get("update", {}).get("content")
+    if isinstance(content, dict) and content.get("type") == "text":
+        return str(content.get("text") or "")
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+def _run_kimi_acp(
+    process: subprocess.Popen[str], prompt: str, timeout_seconds: int, sandbox_root: Path
+) -> tuple[str, str]:
+    """Drive Kimi through ACP stdin and reject every tool/permission request at the adapter boundary."""
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        raise RuntimeError("Kimi ACP 管道不可用")
+    output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+    def read_stream(name: str, stream: Any) -> None:
+        for line in iter(stream.readline, ""):
+            output_queue.put((name, line))
+        output_queue.put((name, None))
+
+    stdout_thread = threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True)
+    stderr_thread = threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    deadline = time.monotonic() + timeout_seconds
+    next_id = 1
+    stderr_lines: list[str] = []
+    assistant_chunks: list[str] = []
+
+    def send(method: str, params: dict[str, Any], *, request: bool = True) -> int | None:
+        nonlocal next_id
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "params": params}
+        request_id: int | None = None
+        if request:
+            request_id = next_id
+            next_id += 1
+            message["id"] = request_id
+        process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+        return request_id
+
+    def wait_for(request_id: int) -> dict[str, Any]:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"本地 Agent 超过 {timeout_seconds} 秒未完成")
+            try:
+                channel, line = output_queue.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError(f"本地 Agent 超过 {timeout_seconds} 秒未完成") from exc
+            if line is None:
+                if channel == "stdout":
+                    raise RuntimeError("Kimi ACP 在返回结果前结束")
+                continue
+            if channel == "stderr":
+                stderr_lines.append(line)
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = _acp_update_kind(message)
+            if kind.startswith("tool_call") or kind.startswith("toolcall"):
+                send("session/cancel", {"sessionId": session_id}, request=False)
+                raise ForbiddenToolError("Kimi 尝试调用被禁用的工具；提案已拒绝")
+            if "method" in message and "id" in message:
+                response = {
+                    "jsonrpc": "2.0", "id": message["id"],
+                    "error": {"code": -32001, "message": "Jingchang adapter denies all tools and permissions"},
+                }
+                process.stdin.write(json.dumps(response) + "\n")
+                process.stdin.flush()
+                raise ForbiddenToolError("Kimi 请求工具或权限；适配器已拒绝")
+            chunk = _acp_message_text(message)
+            if chunk:
+                assistant_chunks.append(chunk)
+            if message.get("id") == request_id:
+                if "error" in message:
+                    raise RuntimeError(f"Kimi ACP 错误：{message['error']}")
+                return message.get("result") or {}
+
+    session_id = ""
+    initialize_id = send(
+        "initialize",
+        {
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
+            "clientInfo": {"name": "jingchang", "title": "镜场", "version": "1"},
+        },
+    )
+    assert initialize_id is not None
+    wait_for(initialize_id)
+    session_request_id = send("session/new", {"cwd": str(sandbox_root), "mcpServers": []})
+    assert session_request_id is not None
+    session_result = wait_for(session_request_id)
+    session_id = str(session_result.get("sessionId") or "")
+    if not session_id:
+        raise RuntimeError("Kimi ACP 未返回 sessionId")
+    prompt_id = send(
+        "session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]}
+    )
+    assert prompt_id is not None
+    wait_for(prompt_id)
+    if not assistant_chunks:
+        raise RuntimeError("Kimi ACP 未返回文本提案")
+    return "".join(assistant_chunks), "".join(stderr_lines)
 
 
 def provider_command(
@@ -413,12 +640,21 @@ def provider_command(
         ])
         return [*prefix, *args], prompt, {"adapter": adapter, "executable": Path(executable).name, "arguments": args[:-1] + ["<stdin>"]}
     if adapter == "kimi":
+        skills_dir, profile = _write_kimi_profile(sandbox_root)
         args = []
         if model:
             args.extend(["--model", model])
-        args.extend(["--prompt", prompt, "--output-format", "stream-json"])
-        safe_args = (["--model", model] if model else []) + ["--prompt", "<redacted-input>", "--output-format", "stream-json"]
-        return [*prefix, *args], None, {"adapter": adapter, "executable": Path(executable).name, "arguments": safe_args}
+        args.extend(["--skills-dir", str(skills_dir), "--agent-file", str(profile), "acp"])
+        safe_args = (["--model", model] if model else []) + [
+            "--skills-dir", "<isolated-skills-dir>", "--agent-file", "<no-tools-agent-profile>", "acp",
+        ]
+        return [*prefix, *args], prompt, {
+            "adapter": adapter,
+            "transport": "acp-stdio",
+            "security_profile": "tools=[];subagents=[];mcp=[];client-fs=false;client-terminal=false",
+            "executable": Path(executable).name,
+            "arguments": safe_args,
+        }
     raise ValueError("不支持的本地 Agent 适配器")
 
 
@@ -559,6 +795,14 @@ def create_run_record(db_path: Path, payload: AgentRunCreate, *, retry_of: str |
             raise HTTPException(404, "本地 Agent 提供方不存在")
         if not provider["enabled"] or not provider["callable"]:
             raise HTTPException(409, f"{provider['label']} 当前不可调用，请到系统设置中重新探测")
+        executable = _resolve_executable(provider)
+        if not executable:
+            raise HTTPException(409, f"{provider['label']} 的可执行文件已不可用，请重新探测")
+        try:
+            executable = str(Path(executable).resolve(strict=True))
+            executable_fingerprint = _executable_fingerprint(executable)
+        except OSError as exc:
+            raise HTTPException(409, f"无法冻结提供方可执行文件：{exc}") from exc
         base_payload, base_revisions = _base_for_scope(db, project["id"], payload)
         active = db.execute(
             "SELECT id FROM creative_agent_runs WHERE project_id = ? AND state IN ('queued', 'running') LIMIT 1",
@@ -585,13 +829,16 @@ def create_run_record(db_path: Path, payload: AgentRunCreate, *, retry_of: str |
         db.execute(
             """INSERT INTO creative_agent_runs
             (id, project_id, provider_id, scope, operation, target_id, parent_id, instruction, state, message,
-             input_summary, input_hash, base_payload, base_revisions, model, retry_of, attempt, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', '等待本地 Agent', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             input_summary, input_hash, base_payload, base_revisions, provider_version, provider_adapter,
+             executable_path, executable_fingerprint, timeout_seconds, model, retry_of, attempt, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', '等待本地 Agent', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id, project["id"], payload.provider_id, payload.scope, payload.operation,
                 payload.target_id, payload.parent_id, payload.instruction.strip(), summary,
                 hashlib.sha256(hashed_input.encode("utf-8")).hexdigest(), encoded,
-                json.dumps(base_revisions, ensure_ascii=False), provider["model"], retry_of, attempt, now, now,
+                json.dumps(base_revisions, ensure_ascii=False), provider["version"], provider["adapter"],
+                executable, executable_fingerprint, int(provider["timeout_seconds"]), provider["model"],
+                retry_of, attempt, now, now,
             ),
         )
         db.commit()
@@ -600,13 +847,10 @@ def create_run_record(db_path: Path, payload: AgentRunCreate, *, retry_of: str |
 
 def _set_failed(db_path: Path, run_id: str, error: str, raw_output: str = "", log: str = "") -> None:
     with closing(connect(db_path)) as db:
-        current = db.execute("SELECT state FROM creative_agent_runs WHERE id = ?", (run_id,)).fetchone()
-        if not current or current["state"] == "cancelled":
-            return
         now = utc_now()
         db.execute(
             """UPDATE creative_agent_runs SET state = 'failed', message = 'Agent 任务失败', error = ?,
-            raw_output = ?, log = ?, updated_at = ?, completed_at = ? WHERE id = ?""",
+            raw_output = ?, log = ?, updated_at = ?, completed_at = ? WHERE id = ? AND state = 'running'""",
             (error[:2000], raw_output[-50000:], log[-20000:], now, now, run_id),
         )
         db.commit()
@@ -614,21 +858,29 @@ def _set_failed(db_path: Path, run_id: str, error: str, raw_output: str = "", lo
 
 def execute_agent_run(db_path: Path, run_id: str) -> None:
     with closing(connect(db_path)) as db:
-        run = db.execute("SELECT * FROM creative_agent_runs WHERE id = ?", (run_id,)).fetchone()
-        if not run or run["state"] != "queued":
-            return
-        provider = db.execute("SELECT * FROM local_agent_providers WHERE id = ?", (run["provider_id"],)).fetchone()
-        executable = _resolve_executable(provider) if provider else None
-        if not provider or not provider["enabled"] or not provider["callable"] or not executable:
-            _set_failed(db_path, run_id, "所选提供方已不可调用；任务不会自动切换到其他提供方")
-            return
+        db.execute("BEGIN IMMEDIATE")
         now = utc_now()
-        db.execute(
+        claimed = db.execute(
             """UPDATE creative_agent_runs SET state = 'running', message = '本地 Agent 正在生成提案',
-            provider_version = ?, started_at = ?, updated_at = ? WHERE id = ?""",
-            (provider["version"], now, now, run_id),
+            started_at = ?, updated_at = ?
+            WHERE id = ? AND state = 'queued' AND cancel_requested = 0""",
+            (now, now, run_id),
         )
+        if claimed.rowcount != 1:
+            db.rollback()
+            return
+        run = db.execute("SELECT * FROM creative_agent_runs WHERE id = ?", (run_id,)).fetchone()
         db.commit()
+
+    executable = run["executable_path"]
+    adapter = run["provider_adapter"]
+    try:
+        if not executable or _executable_fingerprint(executable) != run["executable_fingerprint"]:
+            _set_failed(db_path, run_id, "已冻结的提供方可执行文件发生变化；请重试以创建新的运行快照")
+            return
+    except OSError:
+        _set_failed(db_path, run_id, "已冻结的提供方可执行文件不存在；请重试")
+        return
 
     raw = ""
     stderr = ""
@@ -637,7 +889,7 @@ def execute_agent_run(db_path: Path, run_id: str) -> None:
             sandbox = Path(temp_name)
             result_path = sandbox / "result.json"
             command, stdin_text, command_info = provider_command(
-                provider["adapter"], executable, sandbox, _build_prompt(run), result_path, run["model"]
+                adapter, executable, sandbox, _build_prompt(run), result_path, run["model"]
             )
             with closing(connect(db_path)) as db:
                 db.execute(
@@ -645,37 +897,60 @@ def execute_agent_run(db_path: Path, run_id: str) -> None:
                     (json.dumps(command_info, ensure_ascii=False), utc_now(), run_id),
                 )
                 db.commit()
-            process = subprocess.Popen(
-                command,
-                cwd=sandbox,
-                env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
-                stdin=subprocess.PIPE if stdin_text is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
             with PROCESS_LOCK:
+                with closing(connect(db_path)) as db:
+                    state = db.execute(
+                        "SELECT state, cancel_requested FROM creative_agent_runs WHERE id = ?", (run_id,)
+                    ).fetchone()
+                if not state or state["state"] != "running" or state["cancel_requested"]:
+                    return
+                process = subprocess.Popen(
+                    command,
+                    cwd=sandbox,
+                    env=_isolated_environment(adapter),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
                 PROCESSES[run_id] = process
             try:
-                stdout, stderr = process.communicate(input=stdin_text, timeout=int(provider["timeout_seconds"]))
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-                raise TimeoutError(f"本地 Agent 超过 {provider['timeout_seconds']} 秒未完成")
+                if adapter == "kimi":
+                    raw, stderr = _run_kimi_acp(process, stdin_text or "", int(run["timeout_seconds"]), sandbox)
+                    if process.poll() is None:
+                        process.terminate()
+                    stdout = ""
+                else:
+                    try:
+                        stdout, stderr = process.communicate(input=stdin_text, timeout=int(run["timeout_seconds"]))
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                        raise TimeoutError(f"本地 Agent 超过 {run['timeout_seconds']} 秒未完成")
             finally:
                 with PROCESS_LOCK:
                     PROCESSES.pop(run_id, None)
-            raw = result_path.read_text(encoding="utf-8") if provider["adapter"] == "codex" and result_path.exists() else stdout
+                if process.poll() is None:
+                    process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None and not stream.closed:
+                        stream.close()
+            raw = result_path.read_text(encoding="utf-8") if adapter == "codex" and result_path.exists() else raw or stdout
             with closing(connect(db_path)) as db:
                 state = db.execute("SELECT state, cancel_requested FROM creative_agent_runs WHERE id = ?", (run_id,)).fetchone()
                 if not state or state["state"] == "cancelled" or state["cancel_requested"]:
                     return
-            if process.returncode != 0:
+            if adapter == "codex" and process.returncode != 0:
                 raise RuntimeError((stderr or raw or f"CLI 退出码 {process.returncode}")[-2000:])
-            proposal = validate_proposal(run["scope"], extract_json(provider_result_text(provider["adapter"], raw)))
+            proposal = validate_proposal(run["scope"], extract_json(provider_result_text(adapter, raw)))
             diff = build_diff(_json(run["base_payload"], {}), proposal, run["scope"])
             now = utc_now()
             with closing(connect(db_path)) as db:
@@ -792,7 +1067,15 @@ def apply_agent_proposal(db_path: Path, run_id: str, confirmed_by: str) -> dict[
         ).fetchone()
         if not run:
             raise HTTPException(404, "Agent 任务不存在")
-        if run["state"] != "completed":
+        now = utc_now()
+        claimed = db.execute(
+            """UPDATE creative_agent_runs SET state = 'applied',
+            message = '提案已由人工确认并创建正式修订', confirmed_by = ?, applied_at = ?, updated_at = ?
+            WHERE id = ? AND project_id = ? AND state = 'completed'""",
+            (confirmed_by.strip(), now, now, run_id, project["id"]),
+        )
+        if claimed.rowcount != 1:
+            db.rollback()
             raise HTTPException(409, "只有已完成且未处理的提案可以确认")
         _verify_revisions(db, project["id"], run)
         value = _json(run["proposed_payload"], {}).get("proposal", {})
@@ -882,12 +1165,6 @@ def apply_agent_proposal(db_path: Path, run_id: str, confirmed_by: str) -> dict[
                 db, "creative_sections", "section", run["target_id"], project["id"], revisions[0]["revision"],
                 source, {"content": value["content"]},
             )
-        now = utc_now()
-        db.execute(
-            """UPDATE creative_agent_runs SET state = 'applied', message = '提案已由人工确认并创建正式修订',
-            confirmed_by = ?, applied_at = ?, updated_at = ? WHERE id = ?""",
-            (confirmed_by.strip(), now, now, run_id),
-        )
         db.commit()
         return _run_public(db.execute("SELECT * FROM creative_agent_runs WHERE id = ?", (run_id,)).fetchone())
 
@@ -911,7 +1188,8 @@ def create_local_agent_router(db_path: Path) -> APIRouter:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 0, 0, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET label = excluded.label, executable_path = excluded.executable_path,
                   enabled = excluded.enabled, timeout_seconds = excluded.timeout_seconds, model = excluded.model,
-                  probe_state = 'unknown', callable = 0, updated_at = excluded.updated_at""",
+                  probe_state = 'unknown', callable = 0, auth_state = 'unknown', model_state = 'unknown',
+                  callable_state = 'unknown', updated_at = excluded.updated_at""",
                 (
                     provider_id, payload.adapter, payload.label or ("Codex CLI" if payload.adapter == "codex" else "Kimi Code CLI"),
                     payload.executable_path or None, int(payload.enabled), payload.timeout_seconds, payload.model.strip(),
@@ -937,7 +1215,9 @@ def create_local_agent_router(db_path: Path) -> APIRouter:
                 raise HTTPException(404, "本地 Agent 提供方不存在")
             assignments = ", ".join(f"{key} = ?" for key in values)
             db.execute(
-                f"UPDATE local_agent_providers SET {assignments}, probe_state = 'unknown', callable = 0, updated_at = ? WHERE id = ?",
+                f"""UPDATE local_agent_providers SET {assignments}, probe_state = 'unknown', callable = 0,
+                auth_state = 'unknown', model_state = 'unknown', callable_state = 'unknown', updated_at = ?
+                WHERE id = ?""",
                 (*values.values(), utc_now(), provider_id),
             )
             db.commit()
@@ -979,20 +1259,23 @@ def create_local_agent_router(db_path: Path) -> APIRouter:
     @router.post("/runs/{run_id}/cancel")
     def cancel_run(run_id: str) -> dict[str, Any]:
         with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
             row = db.execute(
                 "SELECT * FROM creative_agent_runs WHERE id = ? AND project_id = ?", (run_id, project["id"])
             ).fetchone()
             if not row:
                 raise HTTPException(404, "Agent 任务不存在")
-            if row["state"] not in ACTIVE_STATES:
-                raise HTTPException(409, "当前任务无法取消")
             now = utc_now()
-            db.execute(
+            cancelled = db.execute(
                 """UPDATE creative_agent_runs SET state = 'cancelled', cancel_requested = 1,
-                message = '任务已取消，正式内容未改变', updated_at = ?, completed_at = ? WHERE id = ?""",
-                (now, now, run_id),
+                message = '任务已取消，正式内容未改变', updated_at = ?, completed_at = ?
+                WHERE id = ? AND project_id = ? AND state IN ('queued', 'running') AND cancel_requested = 0""",
+                (now, now, run_id, project["id"]),
             )
+            if cancelled.rowcount != 1:
+                db.rollback()
+                raise HTTPException(409, "当前任务无法取消")
             db.commit()
         with PROCESS_LOCK:
             process = PROCESSES.get(run_id)
@@ -1028,20 +1311,23 @@ def create_local_agent_router(db_path: Path) -> APIRouter:
     @router.post("/runs/{run_id}/reject")
     def reject_run(run_id: str, payload: AgentApply) -> dict[str, Any]:
         with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
             row = db.execute(
                 "SELECT * FROM creative_agent_runs WHERE id = ? AND project_id = ?", (run_id, project["id"])
             ).fetchone()
             if not row:
                 raise HTTPException(404, "Agent 任务不存在")
-            if row["state"] != "completed":
-                raise HTTPException(409, "只有待确认提案可以拒绝")
             now = utc_now()
-            db.execute(
+            rejected = db.execute(
                 """UPDATE creative_agent_runs SET state = 'rejected', message = '提案已拒绝，正式内容未改变',
-                confirmed_by = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?""",
-                (payload.confirmed_by.strip(), now, now, run_id),
+                confirmed_by = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
+                WHERE id = ? AND project_id = ? AND state = 'completed'""",
+                (payload.confirmed_by.strip(), now, now, run_id, project["id"]),
             )
+            if rejected.rowcount != 1:
+                db.rollback()
+                raise HTTPException(409, "只有待确认提案可以拒绝")
             db.commit()
             return _run_public(db.execute("SELECT * FROM creative_agent_runs WHERE id = ?", (run_id,)).fetchone())
 

@@ -232,9 +232,12 @@ export type LocalAgentProvider = {
   timeout_seconds: number
   model: string
   capabilities: Array<{ scope: CreativeAgentScope; operations: CreativeAgentOperation[] }>
-  probe_state: 'unknown' | 'available' | 'unavailable'
+  probe_state: 'unknown' | 'verified' | 'unverified' | 'unavailable'
   installed: boolean
   callable: boolean
+  auth_state: 'unknown' | 'verified' | 'unverified' | 'unavailable'
+  model_state: 'unknown' | 'verified' | 'unverified' | 'unavailable'
+  callable_state: 'unknown' | 'verified' | 'unverified' | 'unavailable'
   version?: string
   last_error?: string
   last_probe_at?: string
@@ -264,8 +267,12 @@ export type CreativeAgentRun = {
   raw_output: string
   log: string
   error?: string
-  command_info: { adapter?: string; executable?: string; arguments?: string[] }
+  command_info: { adapter?: string; transport?: string; security_profile?: string; executable?: string; arguments?: string[] }
   provider_version?: string
+  provider_adapter: 'codex' | 'kimi'
+  executable_path: string
+  executable_fingerprint: string
+  timeout_seconds: number
   model: string
   retry_of?: string
   attempt: number
