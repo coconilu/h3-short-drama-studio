@@ -871,6 +871,7 @@ export type Job = {
   completed_at?: string
   h3_project?: string
   prompt_ids: string[]
+  candidate_ids?: string[]
   retry_safe?: number
   reconciliation_snapshot?: string
   reconciliation_revision?: number
