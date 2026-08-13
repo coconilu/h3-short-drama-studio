@@ -303,7 +303,9 @@ nav button.nav-active::before { content: ''; position: absolute; left: 0; width:
 .status-已定稿, .status-完成, .status-已完成, .status-校验通过 { border-color: #63512f; color: #d8b36c; background: #211b12; }
 .status-待审片, .status-等待审片 { border-color: #415d6a; color: #8fb9c9; background: #111b20; }
 .status-草稿已选 { border-color: #5b5f3f; color: #c8c87d; background: #1c1c12; }
-.status-生成中, .status-导出中, .status-已提交, .status-排队中, .status-恢复排队, .status-取消中, .status-运行中 { border-color: #645b36; color: #d8ca7c; }
+.status-生成中, .status-导出中, .status-提交中, .status-已提交待对账, .status-提交状态未知, .status-已提交, .status-排队中, .status-恢复排队, .status-取消中, .status-运行中 { border-color: #645b36; color: #d8ca7c; }
+.status-待人工对账 { border-color: #76533a; color: #e0aa72; background: #241a12; }
+.status-提交失败 { border-color: #6f3e3e; color: #d98a80; background: #241414; }
 .status-已取消 { border-color: #4b4a47; color: #99958d; background: #191a1a; }
 .status-失败 { border-color: #6b3f39; color: #e39a8e; background: #211513; }
 .status-可生成, .status-就绪 { border-color: #40614f; color: #83b99b; background: #111d17; }

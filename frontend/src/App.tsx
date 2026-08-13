@@ -70,7 +70,9 @@ const projectNavItems = [
 
 const globalPageIds = new Set(['projects', 'activity', 'global-queue', 'settings'])
 
-const activeGenerationStates = new Set(['已提交', '排队中', '运行中'])
+export const activeGenerationStates = new Set([
+  '提交中', '已提交待对账', '提交状态未知', '已提交', '排队中', '运行中',
+])
 const activeExportStates = new Set(['排队中', '恢复排队', '导出中', '取消中'])
 
 type ApiOptions = RequestInit & { timeoutMs?: number }

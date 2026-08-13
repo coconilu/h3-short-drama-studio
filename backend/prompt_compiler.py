@@ -99,17 +99,23 @@ def init_prompt_schema(db: sqlite3.Connection) -> None:
         """
     )
     # The application uses a single API worker. A new process cannot own leases
-    # left by a previous process, so startup safely clears crash leftovers.
+    # left by a previous process. The durable job is deliberately retained as
+    # unknown until manifest/queue evidence is reconciled; it is never made
+    # retry-safe merely because the local process restarted.
     db.execute("DELETE FROM h3_validation_leases")
     db.execute("DELETE FROM h3_generation_leases")
     if db.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
     ).fetchone():
         now = utc_now()
+        job_columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
+        retry_clause = ", retry_safe = 0" if "retry_safe" in job_columns else ""
         db.execute(
-            """UPDATE jobs SET state = '提交失败', message = '服务重启中断 H3 提交，可重试',
-            updated_at = ?, completed_at = ? WHERE kind = 'draft' AND state = '提交中'""",
-            (now, now),
+            f"""UPDATE jobs SET state = '提交状态未知',
+            message = '服务重启时 H3 提交尚未完成对账，不会自动重试',
+            updated_at = ?, completed_at = NULL{retry_clause}
+            WHERE kind = 'draft' AND state = '提交中'""",
+            (now,),
         )
     columns = {row[1] for row in db.execute("PRAGMA table_info(h3_prompt_plans)").fetchall()}
     if "stale_reasons" not in columns:

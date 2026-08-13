@@ -135,7 +135,9 @@ EXPORT_PROCESSES: dict[str, subprocess.Popen[str]] = {}
 EXPORT_WORKER_THREAD: threading.Thread | None = None
 EXPORT_WORKER_ID = f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
-ACTIVE_JOB_STATES = ("提交中", "已提交", "排队中", "运行中")
+RECONCILING_JOB_STATES = ("提交中", "已提交待对账", "提交状态未知")
+ACTIVE_JOB_STATES = (*RECONCILING_JOB_STATES, "已提交", "排队中", "运行中")
+SUBMISSION_BLOCKING_JOB_STATES = (*ACTIVE_JOB_STATES, "待人工对账")
 ASSET_LIMITS = {"image": 50 * 1024 * 1024, "video": 2 * 1024 * 1024 * 1024, "audio": 250 * 1024 * 1024}
 ASSET_EXTENSIONS = {
     "image": {".jpg", ".jpeg", ".png", ".webp"},
@@ -221,6 +223,8 @@ def migrate_db(db: sqlite3.Connection) -> None:
         ("completed_at", "TEXT"),
         ("plan_hash", "TEXT"),
         ("source_snapshot", "TEXT NOT NULL DEFAULT '{}'"),
+        ("reconciliation_snapshot", "TEXT NOT NULL DEFAULT '{}'"),
+        ("retry_safe", "INTEGER NOT NULL DEFAULT 0"),
     ):
         ensure_column(db, "jobs", name, definition)
     for name, definition in (
@@ -345,7 +349,9 @@ def init_db() -> None:
               updated_at TEXT,
               completed_at TEXT,
               plan_hash TEXT,
-              source_snapshot TEXT NOT NULL DEFAULT '{}'
+              source_snapshot TEXT NOT NULL DEFAULT '{}',
+              reconciliation_snapshot TEXT NOT NULL DEFAULT '{}',
+              retry_safe INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS promotions (
               id TEXT PRIMARY KEY,
@@ -857,6 +863,150 @@ def read_manifest(project: str) -> dict[str, Any]:
         raise HTTPException(502, f"H3 manifest 无法读取：{exc}") from exc
 
 
+def manifest_evidence(project: str) -> dict[str, Any]:
+    manifest = read_manifest(project)
+    return {
+        "project": manifest.get("project"),
+        "updated_at": manifest.get("updated_at"),
+        "candidate_ids": [str(record.get("id")) for record in manifest.get("candidates") or [] if record.get("id")],
+        "prompt_ids": [str(record.get("prompt_id")) for record in manifest.get("candidates") or [] if record.get("prompt_id")],
+    }
+
+
+def comfy_queue_evidence(prompt_ids: list[str]) -> dict[str, Any]:
+    expected = {str(prompt_id) for prompt_id in prompt_ids if prompt_id}
+    evidence: dict[str, Any] = {
+        "available": False,
+        "checked_at": utc_now(),
+        "expected_prompt_ids": sorted(expected),
+        "running_prompt_ids": [],
+        "pending_prompt_ids": [],
+    }
+    try:
+        with urllib.request.urlopen(f"{effective_comfy_url()}/queue", timeout=2.0) as response:
+            queue = json.load(response)
+        running = {
+            str(item[1]) for item in queue.get("queue_running") or []
+            if isinstance(item, (list, tuple)) and len(item) > 1 and item[1]
+        }
+        pending = {
+            str(item[1]) for item in queue.get("queue_pending") or []
+            if isinstance(item, (list, tuple)) and len(item) > 1 and item[1]
+        }
+        evidence.update({
+            "available": True,
+            "running_prompt_ids": sorted(expected & running),
+            "pending_prompt_ids": sorted(expected & pending),
+            "running_count": len(running),
+            "pending_count": len(pending),
+        })
+    except (OSError, urllib.error.URLError, ValueError, TypeError, IndexError) as exc:
+        evidence["error"] = str(exc)
+    return evidence
+
+
+def update_reconciliation_job(
+    job_id: int,
+    state: str,
+    message: str,
+    evidence: dict[str, Any],
+    *,
+    retry_safe: bool = False,
+    completed: bool = False,
+) -> None:
+    now = utc_now()
+    with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            """UPDATE jobs SET state = ?, message = ?, reconciliation_snapshot = ?, retry_safe = ?,
+            updated_at = ?, completed_at = ? WHERE id = ?""",
+            (
+                state,
+                message,
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                int(retry_safe),
+                now,
+                now if completed else None,
+                job_id,
+            ),
+        )
+        db.commit()
+
+
+def reconcile_generation_job(job: dict[str, Any]) -> dict[str, Any]:
+    project = str(job.get("h3_project") or "")
+    if not project:
+        update_reconciliation_job(
+            int(job["id"]), "待人工对账", "任务缺少 H3 项目标识，禁止自动重试", {}, completed=True,
+        )
+        return row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
+    try:
+        frozen = json.loads(job.get("reconciliation_snapshot") or "{}")
+    except (TypeError, ValueError):
+        frozen = {}
+    if (
+        not isinstance(frozen, dict)
+        or frozen.get("h3_project") != project
+        or "frozen_command" not in frozen
+        or "baseline_candidate_ids" not in frozen
+    ):
+        update_reconciliation_job(
+            int(job["id"]),
+            "待人工对账",
+            "提交任务缺少可信的冻结命令或 manifest 基线；禁止推断提交结果和自动重试",
+            frozen if isinstance(frozen, dict) else {},
+            completed=True,
+        )
+        return row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
+    baseline_ids = set(str(value) for value in frozen.get("baseline_candidate_ids") or [])
+    try:
+        manifest = read_manifest(project)
+    except HTTPException as exc:
+        evidence = {**frozen, "manifest_error": str(exc.detail), "last_checked_at": utc_now()}
+        update_reconciliation_job(
+            int(job["id"]), "待人工对账", "H3 manifest 缺失或损坏，提交副作用未知；禁止自动重试",
+            evidence, completed=True,
+        )
+        return row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
+    current_records = manifest.get("candidates") or []
+    submitted_records = [
+        record for record in current_records
+        if record.get("id") and str(record.get("id")) not in baseline_ids
+    ]
+    submitted_ids = [str(record.get("id")) for record in submitted_records]
+    submitted_prompt_ids = [str(record.get("prompt_id")) for record in submitted_records if record.get("prompt_id")]
+    evidence = {
+        **frozen,
+        "manifest_after": {
+            "updated_at": manifest.get("updated_at"),
+            "candidate_ids": [str(record.get("id")) for record in current_records if record.get("id")],
+            "prompt_ids": [str(record.get("prompt_id")) for record in current_records if record.get("prompt_id")],
+        },
+        "submitted_candidate_ids": submitted_ids,
+        "submitted_prompt_ids": submitted_prompt_ids,
+        "last_checked_at": utc_now(),
+    }
+    evidence["comfyui_queue"] = comfy_queue_evidence(submitted_prompt_ids)
+    if not submitted_ids:
+        message = (
+            "H3 适配器已返回成功，但 manifest 未出现本次候选；禁止自动重试"
+            if frozen.get("adapter_returned_success")
+            else "服务中断后未发现可证明本次提交结果的 manifest 候选；转人工对账，禁止自动重试"
+        )
+        update_reconciliation_job(int(job["id"]), "待人工对账", message, evidence, completed=True)
+        return row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
+    try:
+        state = sync_manifest_to_db(job["shot_id"], project, manifest, job_id=int(job["id"]), record_ids=submitted_ids)
+    except Exception as exc:
+        update_reconciliation_job(
+            int(job["id"]), "待人工对账", f"H3 候选已存在，但平台同步失败：{exc}；禁止重复提交",
+            {**evidence, "sync_error": str(exc)}, completed=True,
+        )
+        return row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
+    update_reconciliation_job(int(job["id"]), state["state"], state["message"], evidence, completed=state["state"] in {"完成", "失败"})
+    return row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
+
+
 def run_h3(arguments: list[str], timeout: int = 90) -> subprocess.CompletedProcess[str]:
     if not H3_SCRIPT.is_file():
         raise HTTPException(503, f"H3 适配脚本不存在：{H3_SCRIPT}")
@@ -906,13 +1056,26 @@ def promotion_public(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def sync_manifest_to_db(shot_id: str, project: str, manifest: dict[str, Any]) -> dict[str, Any]:
+def sync_manifest_to_db(
+    shot_id: str,
+    project: str,
+    manifest: dict[str, Any],
+    *,
+    job_id: int | None = None,
+    record_ids: list[str] | None = None,
+) -> dict[str, Any]:
     records = manifest.get("candidates") or []
+    tracked_ids = set(record_ids) if record_ids is not None else None
+    tracked_records = [record for record in records if tracked_ids is None or str(record.get("id")) in tracked_ids]
     selected_id = manifest.get("selected_id")
     status_order = {"error": 4, "running": 3, "queued": 2, "queueing": 1, "completed": 0}
-    completed_count = sum(record.get("status") == "completed" for record in records)
-    total_count = len(records)
-    worst_status = max((record.get("status", "queued") for record in records), key=lambda value: status_order.get(value, 2), default="queued")
+    completed_count = sum(record.get("status") == "completed" for record in tracked_records)
+    total_count = len(tracked_records)
+    worst_status = max(
+        (record.get("status", "queued") for record in tracked_records),
+        key=lambda value: status_order.get(value, 2),
+        default="queued",
+    )
 
     with closing(connect()) as db:
         shot = db.execute("SELECT * FROM shots WHERE id = ?", (shot_id,)).fetchone()
@@ -1044,11 +1207,15 @@ def sync_manifest_to_db(shot_id: str, project: str, manifest: dict[str, Any]) ->
             message = f"{completed_count}/{total_count} 条完成，等待 ComfyUI"
             completed_at = None
 
-        prompt_ids = [record.get("prompt_id") for record in records if record.get("prompt_id")]
-        latest_job = db.execute(
-            "SELECT id FROM jobs WHERE shot_id = ? AND kind = 'draft' AND h3_project = ? ORDER BY id DESC LIMIT 1",
-            (shot_id, project),
-        ).fetchone()
+        prompt_ids = [record.get("prompt_id") for record in tracked_records if record.get("prompt_id")]
+        latest_job = (
+            db.execute("SELECT id FROM jobs WHERE id = ? AND shot_id = ?", (job_id, shot_id)).fetchone()
+            if job_id is not None
+            else db.execute(
+                "SELECT id FROM jobs WHERE shot_id = ? AND kind = 'draft' AND h3_project = ? ORDER BY id DESC LIMIT 1",
+                (shot_id, project),
+            ).fetchone()
+        )
         if latest_job:
             db.execute(
                 """UPDATE jobs SET state = ?, message = ?, prompt_ids = ?, updated_at = ?, completed_at = ?
@@ -1085,6 +1252,7 @@ def sync_manifest_to_db(shot_id: str, project: str, manifest: dict[str, Any]) ->
         "completed": completed_count,
         "total": total_count,
         "prompt_ids": prompt_ids,
+        "external_ids": [str(record.get("id")) for record in tracked_records],
     }
 
 
@@ -1384,14 +1552,15 @@ def test_settings_connection(payload: ConnectionTestRequest) -> dict[str, Any]:
 def get_workbench() -> dict[str, Any]:
     current = active_project()
     project_rows = rows(
-        """SELECT projects.*,
+        f"""SELECT projects.*,
         (SELECT COUNT(*) FROM shots WHERE shots.project_id = projects.id) AS shot_count,
         (SELECT COUNT(*) FROM shots WHERE shots.project_id = projects.id AND shots.status = '已定稿') AS final_count,
         (SELECT COALESCE(ROUND(SUM(seconds), 2), 0) FROM shots WHERE shots.project_id = projects.id) AS planned_seconds,
         (SELECT COUNT(*) FROM jobs JOIN shots job_shot ON job_shot.id = jobs.shot_id
           WHERE job_shot.project_id = projects.id) AS job_count,
         (SELECT COUNT(*) FROM jobs JOIN shots active_shot ON active_shot.id = jobs.shot_id
-          WHERE active_shot.project_id = projects.id AND jobs.state IN ('已提交', '排队中', '运行中')) AS active_job_count,
+          WHERE active_shot.project_id = projects.id
+          AND jobs.state IN ({','.join('?' for _ in ACTIVE_JOB_STATES)})) AS active_job_count,
         (SELECT COUNT(*) FROM candidates JOIN shots candidate_shot ON candidate_shot.id = candidates.shot_id
           WHERE candidate_shot.project_id = projects.id AND candidates.status = 'completed' AND candidates.archived = 0) AS candidate_count,
         (SELECT '/api/projects/' || projects.id || '/thumbnail'
@@ -1411,7 +1580,8 @@ def get_workbench() -> dict[str, Any]:
                     WHERE job_shot.project_id = projects.id), projects.created_at),
           COALESCE((SELECT MAX(updated_at) FROM export_runs WHERE export_runs.project_id = projects.id), projects.created_at)
         ) AS updated_at
-        FROM projects ORDER BY updated_at DESC"""
+        FROM projects ORDER BY updated_at DESC""",
+        ACTIVE_JOB_STATES,
     )
     projects: list[dict[str, Any]] = []
     for project in project_rows:
@@ -3192,8 +3362,8 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
     if not request.dry_run:
         active = row(
             """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
-            AND state IN (?, ?, ?, ?) ORDER BY id DESC LIMIT 1""",
-            (shot_id, *ACTIVE_JOB_STATES),
+            AND state IN (?, ?, ?, ?, ?, ?, ?) ORDER BY id DESC LIMIT 1""",
+            (shot_id, *SUBMISSION_BLOCKING_JOB_STATES),
         )
         if active:
             raise HTTPException(409, f"该镜头已有活动任务：{active['state']}")
@@ -3254,6 +3424,15 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
 
     generation_lease_id = f"h3-generation-{uuid.uuid4().hex[:12]}"
     submitting_job_id: int | None = None
+    try:
+        baseline_evidence = manifest_evidence(project)
+    except HTTPException as exc:
+        baseline_evidence = {"manifest_error": str(exc.detail), "candidate_ids": [], "prompt_ids": []}
+    baseline_queue_evidence = (
+        comfy_queue_evidence(baseline_evidence.get("prompt_ids") or [])
+        if baseline_evidence.get("prompt_ids")
+        else {"available": None, "reason": "manifest 基线没有 prompt_id"}
+    )
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
         current_input = current_plan_input(db, shot_id, shot["project_id"])
@@ -3303,8 +3482,9 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
             raise HTTPException(409, "该镜头已有进行中的 H3 GPU 提交") from exc
         cursor = db.execute(
             """INSERT INTO jobs
-            (shot_id, kind, state, message, created_at, h3_project, updated_at, plan_hash, source_snapshot)
-            VALUES (?, 'draft', '提交中', '已冻结通过 dry-run 的 H3 命令，正在提交', ?, ?, ?, ?, ?)""",
+            (shot_id, kind, state, message, created_at, h3_project, updated_at, plan_hash,
+             source_snapshot, reconciliation_snapshot, retry_safe)
+            VALUES (?, 'draft', '提交中', '已冻结通过 dry-run 的 H3 命令，正在提交', ?, ?, ?, ?, ?, ?, 0)""",
             (
                 shot_id,
                 now,
@@ -3312,6 +3492,20 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
                 now,
                 validation_hash,
                 json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                json.dumps(
+                    {
+                        "h3_project": project,
+                        "input_hash": validation_hash,
+                        "frozen_command": input_snapshot,
+                        "baseline_candidate_ids": baseline_evidence.get("candidate_ids") or [],
+                        "manifest_before": baseline_evidence,
+                        "comfyui_before": baseline_queue_evidence,
+                        "adapter_returned_success": False,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             ),
         )
         submitting_job_id = int(cursor.lastrowid)
@@ -3323,10 +3517,11 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
         with closing(connect()) as db:
             db.execute("BEGIN IMMEDIATE")
             now = utc_now()
+            unknown_state = "提交状态未知"
             db.execute(
-                """UPDATE jobs SET state = '提交失败', message = ?, updated_at = ?, completed_at = ?
+                """UPDATE jobs SET state = ?, message = ?, updated_at = ?, completed_at = NULL, retry_safe = 0
                 WHERE id = ? AND state = '提交中'""",
-                (str(exc), now, now, submitting_job_id),
+                (unknown_state, f"H3 适配器返回异常，外部提交副作用未知：{exc}", now, submitting_job_id),
             )
             db.execute("DELETE FROM h3_generation_leases WHERE id = ?", (generation_lease_id,))
             db.commit()
@@ -3334,35 +3529,28 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
 
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
+        reconciliation = db.execute("SELECT reconciliation_snapshot FROM jobs WHERE id = ?", (submitting_job_id,)).fetchone()
+        try:
+            evidence = json.loads(reconciliation["reconciliation_snapshot"] or "{}") if reconciliation else {}
+        except (TypeError, ValueError):
+            evidence = {}
+        evidence["adapter_returned_success"] = True
+        evidence["adapter_completed_at"] = utc_now()
         db.execute(
-            """UPDATE jobs SET state = '已提交', message = '已向 ComfyUI 提交通过 dry-run 的冻结命令',
-            updated_at = ? WHERE id = ? AND state = '提交中'""",
-            (utc_now(), submitting_job_id),
+            """UPDATE jobs SET state = '已提交待对账',
+            message = 'H3 适配器已返回，正在核对 manifest 与 ComfyUI 证据',
+            reconciliation_snapshot = ?, updated_at = ? WHERE id = ? AND state = '提交中'""",
+            (json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")), utc_now(), submitting_job_id),
         )
         db.execute("DELETE FROM h3_generation_leases WHERE id = ?", (generation_lease_id,))
         db.commit()
 
-    manifest = read_manifest(project)
-    prompt_ids = [record.get("prompt_id") for record in manifest.get("candidates") or [] if record.get("prompt_id")]
-    with closing(connect()) as db:
-        db.execute("UPDATE candidates SET archived = 1 WHERE shot_id = ? AND source = 'mock'", (shot_id,))
-        db.execute(
-            """UPDATE jobs SET state = '已提交', message = ?, prompt_ids = ?, updated_at = ?
-            WHERE id = ?""",
-            (
-                f"已向 ComfyUI 提交 {len(prompt_ids)} 条真实候选",
-                json.dumps(prompt_ids),
-                utc_now(),
-                submitting_job_id,
-            ),
-        )
-        db.execute("UPDATE shots SET status = '生成中', updated_at = ? WHERE id = ?", (utc_now(), shot_id))
-        db.commit()
-    state = sync_manifest_to_db(shot_id, project, manifest)
+    reconciled = reconcile_generation_job(row("SELECT * FROM jobs WHERE id = ?", (submitting_job_id,)) or {})
+    prompt_ids = json.loads(reconciled.get("prompt_ids") or "[]")
     return {
         "ok": True,
-        "state": state["state"],
-        "message": state["message"],
+        "state": reconciled["state"],
+        "message": reconciled["message"],
         "h3_project": project,
         "prompt_ids": prompt_ids,
         "mode": plan["mode"],
@@ -3483,6 +3671,19 @@ def batch_submit(request: BatchGenerationRequest) -> dict[str, Any]:
 def sync_shot(shot_id: str) -> dict[str, Any]:
     require_active_shot(shot_id)
     project = h3_project_for_shot(shot_id)
+    reconciliation = row(
+        """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
+        AND state IN (?, ?, ?) ORDER BY id DESC LIMIT 1""",
+        (shot_id, *RECONCILING_JOB_STATES),
+    )
+    if reconciliation:
+        reconciled = reconcile_generation_job(reconciliation)
+        return {
+            "ok": reconciled["state"] not in {"待人工对账", "提交状态未知"},
+            "state": reconciled["state"],
+            "message": reconciled["message"],
+            "prompt_ids": json.loads(reconciled.get("prompt_ids") or "[]"),
+        }
     return {"ok": True, **refresh_h3_project(shot_id, project)}
 
 
