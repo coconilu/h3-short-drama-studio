@@ -1,0 +1,385 @@
+{
+  "schemaVersion": 2,
+  "selectedAt": "2026-08-12T08:32:59.418Z",
+  "brief": "Redesign an existing local-first desktop web workbench for solo AI short-drama production. Use a two-level information architecture: global workbench for all projects, recent activity, global generation queue, system health and settings; project workspace for overview, scripts/storyboards, assets, generation, review and delivery. The upper-left brand control must be a real labeled sidebar collapse action, not a decorative icon. System Settings must open a functional settings center for ComfyUI connection, H3 paths, export defaults, storage visibility and UI preferences. Preserve restrained near-black surfaces and warm cinematic gold as the only primary accent. Project cards use real shot thumbnails and production statuses. Desktop-first at 1536px and usable at 900px. All visible icons must have a real interaction or be visually non-interactive.",
+  "input": {
+    "styleId": "operational-saas-console",
+    "themeId": "theme-a1ba3ddb542f"
+  },
+  "inputKind": "direction",
+  "legacyStyleId": null,
+  "selection": {
+    "directionId": "operational-saas-console",
+    "themeId": "theme-a1ba3ddb542f"
+  },
+  "alias": {
+    "legacyStyleId": "operational-saas-console",
+    "directionId": "operational-saas-console",
+    "themeId": "theme-a1ba3ddb542f"
+  },
+  "direction": {
+    "id": "operational-saas-console",
+    "experienceType": "business-app",
+    "name": "Operational SaaS Console",
+    "legacyStyleIds": [
+      "operational-saas-console"
+    ],
+    "family": "saas",
+    "pageTypes": [
+      "app-redesign",
+      "dashboard",
+      "internal-tool",
+      "product-site"
+    ],
+    "audiences": [
+      "enterprise-buyers",
+      "operators",
+      "product-managers",
+      "teams"
+    ],
+    "goals": [
+      "book-call",
+      "daily-operation",
+      "explain-product"
+    ],
+    "tones": [
+      "calm",
+      "focused",
+      "operational",
+      "precise"
+    ],
+    "keywords": [
+      "admin",
+      "agent",
+      "crm",
+      "dashboard",
+      "monitor",
+      "project",
+      "saas",
+      "task",
+      "team",
+      "workflow"
+    ],
+    "bestFor": [
+      "agent control panels",
+      "B2B operations products",
+      "team SaaS",
+      "Workflow tools"
+    ],
+    "avoidFor": [
+      "Consumer launches that need emotional storytelling"
+    ],
+    "componentKits": [
+      "origin-ui",
+      "shadcn-ui",
+      "tremor"
+    ],
+    "risks": [
+      "May feel too restrained if the brief expects a big launch moment."
+    ],
+    "density": "medium-high",
+    "firstViewport": "Product UI is the hero: sidebar, rows, status, selected state, and clear primary action.",
+    "layoutRules": [
+      "Favor app shell, compact rows, and real states.",
+      "Do not turn dense workflows into card-only marketing sections."
+    ],
+    "typography": "Product UI typography with compact labels and strong information hierarchy.",
+    "legacyReferences": [
+      {
+        "provider": "awesome-design-md",
+        "slug": "intercom",
+        "label": "Intercom",
+        "role": "friendly operational product surfaces"
+      },
+      {
+        "provider": "awesome-design-md",
+        "slug": "linear.app",
+        "label": "Linear",
+        "role": "compact app shell, rows, and selected states"
+      },
+      {
+        "provider": "awesome-design-md",
+        "slug": "notion",
+        "label": "Notion",
+        "role": "calm workspace hierarchy"
+      }
+    ]
+  },
+  "theme": {
+    "id": "theme-a1ba3ddb542f",
+    "name": "Operational SaaS Console Theme",
+    "legacyStyleIds": [
+      "operational-saas-console"
+    ],
+    "tokens": {
+      "canvas": "#0E1015",
+      "surface": "#151821",
+      "surfaceAlt": "#202431",
+      "text": "#F4F4F5",
+      "muted": "#9CA3AF",
+      "accent": "#8B5CF6",
+      "border": "#303545"
+    },
+    "palette": [
+      "canvas #0E1015",
+      "surface #151821",
+      "surfaceAlt #202431",
+      "text #F4F4F5",
+      "muted #9CA3AF",
+      "accent #8B5CF6",
+      "border #303545"
+    ],
+    "appearance": "dark",
+    "tones": [
+      "calm",
+      "focused",
+      "operational",
+      "precise"
+    ],
+    "sources": [
+      {
+        "kind": "legacy-curated",
+        "provider": "awesome-design-md",
+        "slug": "linear-like"
+      }
+    ],
+    "legacyReferences": [
+      {
+        "provider": "awesome-design-md",
+        "slug": "intercom",
+        "label": "Intercom",
+        "role": "friendly operational product surfaces"
+      },
+      {
+        "provider": "awesome-design-md",
+        "slug": "linear.app",
+        "label": "Linear",
+        "role": "compact app shell, rows, and selected states"
+      },
+      {
+        "provider": "awesome-design-md",
+        "slug": "notion",
+        "label": "Notion",
+        "role": "calm workspace hierarchy"
+      }
+    ]
+  },
+  "link": {
+    "directionId": "operational-saas-console",
+    "themeId": "theme-a1ba3ddb542f",
+    "isDefault": true
+  },
+  "previewSpec": {
+    "directionId": "operational-saas-console",
+    "legacyVariant": "app-shell",
+    "layoutArchetype": "app-shell",
+    "contentPattern": "operational-saas-console",
+    "emphasis": "workflow",
+    "contentBlocks": [
+      "navigation",
+      "work-queue",
+      "detail-panel",
+      "primary-action"
+    ],
+    "hierarchy": {
+      "primary": "work-queue",
+      "secondary": [
+        "navigation",
+        "detail-panel"
+      ],
+      "supporting": [
+        "primary-action"
+      ]
+    }
+  },
+  "visualSelection": {
+    "styleId": "operational-saas-console",
+    "variant": "app-shell",
+    "theme": {
+      "canvas": "#0E1015",
+      "surface": "#151821",
+      "surfaceAlt": "#202431",
+      "text": "#F4F4F5",
+      "muted": "#9CA3AF",
+      "accent": "#8B5CF6",
+      "border": "#303545"
+    },
+    "references": [
+      {
+        "kind": "legacy-curated",
+        "provider": "awesome-design-md",
+        "slug": "linear-like",
+        "label": "Linear theme source",
+        "role": "theme palette source",
+        "referenceKinds": [
+          "theme"
+        ]
+      },
+      {
+        "provider": "awesome-design-md",
+        "slug": "intercom",
+        "label": "Intercom",
+        "role": "friendly operational product surfaces",
+        "pageUrl": "https://getdesign.md/intercom/design-md",
+        "lightPreviewUrl": "https://getdesign.md/design-md/intercom/preview.html",
+        "darkPreviewUrl": "https://getdesign.md/design-md/intercom/preview-dark.html",
+        "referenceKinds": [
+          "direction"
+        ]
+      },
+      {
+        "provider": "awesome-design-md",
+        "slug": "linear.app",
+        "label": "Linear",
+        "role": "compact app shell, rows, and selected states",
+        "pageUrl": "https://getdesign.md/linear.app/design-md",
+        "lightPreviewUrl": "https://getdesign.md/design-md/linear.app/preview.html",
+        "darkPreviewUrl": "https://getdesign.md/design-md/linear.app/preview-dark.html",
+        "referenceKinds": [
+          "direction"
+        ]
+      },
+      {
+        "provider": "awesome-design-md",
+        "slug": "notion",
+        "label": "Notion",
+        "role": "calm workspace hierarchy",
+        "pageUrl": "https://getdesign.md/notion/design-md",
+        "lightPreviewUrl": "https://getdesign.md/design-md/notion/preview.html",
+        "darkPreviewUrl": "https://getdesign.md/design-md/notion/preview-dark.html",
+        "referenceKinds": [
+          "direction"
+        ]
+      }
+    ],
+    "themeSources": [
+      {
+        "kind": "legacy-curated",
+        "provider": "awesome-design-md",
+        "slug": "linear-like",
+        "label": "Linear theme source",
+        "role": "theme palette source",
+        "referenceKinds": [
+          "theme"
+        ]
+      }
+    ]
+  },
+  "compatibilityLegacyStyleId": "operational-saas-console",
+  "style": {
+    "id": "operational-saas-console",
+    "name": "Operational SaaS Console",
+    "sourceProvider": "awesome-design-md",
+    "sourceSlug": "linear-like",
+    "family": "saas",
+    "pageTypes": [
+      "product-site",
+      "dashboard",
+      "internal-tool",
+      "app-redesign"
+    ],
+    "audiences": [
+      "operators",
+      "teams",
+      "product-managers",
+      "enterprise-buyers"
+    ],
+    "goals": [
+      "explain-product",
+      "daily-operation",
+      "book-call"
+    ],
+    "density": "medium-high",
+    "tones": [
+      "calm",
+      "precise",
+      "operational",
+      "focused"
+    ],
+    "keywords": [
+      "saas",
+      "workflow",
+      "task",
+      "project",
+      "team",
+      "dashboard",
+      "admin",
+      "crm",
+      "monitor",
+      "agent"
+    ],
+    "bestFor": [
+      "Workflow tools",
+      "team SaaS",
+      "B2B operations products",
+      "agent control panels"
+    ],
+    "avoidFor": [
+      "Consumer launches that need emotional storytelling"
+    ],
+    "firstViewport": "Product UI is the hero: sidebar, rows, status, selected state, and clear primary action.",
+    "layoutRules": [
+      "Favor app shell, compact rows, and real states.",
+      "Do not turn dense workflows into card-only marketing sections."
+    ],
+    "palette": [
+      "white",
+      "cool neutral",
+      "subtle borders",
+      "low-saturation accent"
+    ],
+    "typography": "Product UI typography with compact labels and strong information hierarchy.",
+    "componentKits": [
+      "shadcn-ui",
+      "origin-ui",
+      "tremor"
+    ],
+    "risks": [
+      "May feel too restrained if the brief expects a big launch moment."
+    ]
+  },
+  "visual": {
+    "styleId": "operational-saas-console",
+    "variant": "app-shell",
+    "theme": {
+      "canvas": "#0E1015",
+      "surface": "#151821",
+      "surfaceAlt": "#202431",
+      "text": "#F4F4F5",
+      "muted": "#9CA3AF",
+      "accent": "#8B5CF6",
+      "border": "#303545"
+    },
+    "references": [
+      {
+        "provider": "awesome-design-md",
+        "slug": "linear.app",
+        "label": "Linear",
+        "role": "compact app shell, rows, and selected states",
+        "pageUrl": "https://getdesign.md/linear.app/design-md",
+        "lightPreviewUrl": "https://getdesign.md/design-md/linear.app/preview.html",
+        "darkPreviewUrl": "https://getdesign.md/design-md/linear.app/preview-dark.html"
+      },
+      {
+        "provider": "awesome-design-md",
+        "slug": "notion",
+        "label": "Notion",
+        "role": "calm workspace hierarchy",
+        "pageUrl": "https://getdesign.md/notion/design-md",
+        "lightPreviewUrl": "https://getdesign.md/design-md/notion/preview.html",
+        "darkPreviewUrl": "https://getdesign.md/design-md/notion/preview-dark.html"
+      },
+      {
+        "provider": "awesome-design-md",
+        "slug": "intercom",
+        "label": "Intercom",
+        "role": "friendly operational product surfaces",
+        "pageUrl": "https://getdesign.md/intercom/design-md",
+        "lightPreviewUrl": "https://getdesign.md/design-md/intercom/preview.html",
+        "darkPreviewUrl": "https://getdesign.md/design-md/intercom/preview-dark.html"
+      }
+    ],
+    "previewCardPath": "catalog/previews/operational-saas-console.svg",
+    "previewCardMarkdownPath": "catalog/previews/operational-saas-console.svg"
+  }
+}

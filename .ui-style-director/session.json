@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 2,
+  "brief": "Redesign an existing local-first desktop web workbench for solo AI short-drama production. The app needs a global all-projects dashboard, clear separation between workspace-level and project-level navigation, functional settings, a real collapsible sidebar, dense project and shot status views, ComfyUI/GPU health, generation queues, review and delivery. Preserve a restrained dark cinematic identity with warm gold accent, but prioritize professional tool clarity, actionable icons, compact information density, accessibility, and a production operations feel. React desktop-first, responsive at 900px.",
+  "updatedAt": "2026-08-12T07:56:40.351Z",
+  "shownDirectionIds": [
+    "operational-saas-console",
+    "data-dashboard-command-center",
+    "saas-collaborative-workspace-canvas",
+    "enterprise-dashboard-grid-data",
+    "dashboard-incident-response-wallboard"
+  ],
+  "shownStyleIds": [
+    "operational-saas-console",
+    "data-dashboard-command-center",
+    "saas-collaborative-workspace-canvas",
+    "enterprise-dashboard-grid-data-7e324226",
+    "enterprise-dashboard-grid-data-817068c8",
+    "dashboard-incident-response-wallboard"
+  ],
+  "lastRecommendationIds": [
+    "operational-saas-console",
+    "data-dashboard-command-center",
+    "saas-collaborative-workspace-canvas",
+    "enterprise-dashboard-grid-data",
+    "dashboard-incident-response-wallboard"
+  ],
+  "lastRecommendations": [
+    {
+      "directionId": "operational-saas-console",
+      "themeId": "theme-a1ba3ddb542f"
+    },
+    {
+      "directionId": "data-dashboard-command-center",
+      "themeId": "theme-cf938d4f35ab"
+    },
+    {
+      "directionId": "saas-collaborative-workspace-canvas",
+      "themeId": "theme-a54719974d52"
+    },
+    {
+      "directionId": "enterprise-dashboard-grid-data",
+      "themeId": "theme-03117493c7de"
+    },
+    {
+      "directionId": "dashboard-incident-response-wallboard",
+      "themeId": "theme-9e86370293f7"
+    }
+  ]
+}

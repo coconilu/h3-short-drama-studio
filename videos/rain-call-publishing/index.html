@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-resolution="landscape">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1920, height=1080">
+    <title>雨夜来电 · EP01 发布包装</title>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #071011;
+      }
+      body {
+        color: #f0ece2;
+        font-family: "Noto Sans JP", sans-serif;
+      }
+      #root {
+        position: relative;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        isolation: isolate;
+        background: #071011;
+      }
+      .clip {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+      #intro-card {
+        overflow: hidden;
+        background: #071011;
+      }
+      #intro-bg {
+        position: absolute;
+        inset: -24px;
+        width: calc(100% + 48px);
+        height: calc(100% + 48px);
+        object-fit: cover;
+        transform: scale(1.035);
+        will-change: transform;
+      }
+      #intro-shade {
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(90deg, rgba(3, 10, 11, 0.93) 0%, rgba(3, 10, 11, 0.62) 39%, rgba(3, 10, 11, 0.22) 68%, rgba(3, 10, 11, 0.52) 100%),
+          linear-gradient(0deg, rgba(3, 10, 11, 0.80) 0%, rgba(3, 10, 11, 0.08) 56%, rgba(3, 10, 11, 0.50) 100%);
+      }
+      #intro-grid {
+        position: absolute;
+        inset: 62px 72px;
+        border-top: 2px solid rgba(224, 163, 58, 0.62);
+        border-bottom: 1px solid rgba(240, 236, 226, 0.18);
+      }
+      #intro-meta {
+        position: absolute;
+        top: 92px;
+        left: 104px;
+        display: flex;
+        gap: 28px;
+        align-items: center;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 21px;
+        font-weight: 600;
+        letter-spacing: 0.16em;
+        color: #e0a33a;
+      }
+      #intro-meta-line {
+        display: block;
+        width: 168px;
+        height: 2px;
+        background: #e0a33a;
+        transform-origin: left center;
+      }
+      #intro-copy {
+        position: absolute;
+        left: 104px;
+        bottom: 112px;
+        width: 930px;
+        padding-left: 32px;
+        border-left: 8px solid #e0a33a;
+      }
+      #intro-kicker {
+        margin-bottom: 38px;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 19px;
+        font-weight: 600;
+        letter-spacing: 0.24em;
+        color: #a7aea8;
+      }
+      #intro-title {
+        display: flex;
+        align-items: baseline;
+        gap: 0.03em;
+        margin: 0;
+        font-size: 150px;
+        line-height: 1;
+        font-weight: 800;
+        letter-spacing: -0.08em;
+        text-shadow: 0 8px 30px rgba(0, 0, 0, 0.55);
+      }
+      #intro-title .glyph {
+        display: inline-block;
+        min-width: 0.82em;
+        opacity: 0;
+        will-change: transform;
+      }
+      #intro-subtitle {
+        margin-top: 26px;
+        font-size: 32px;
+        font-weight: 500;
+        letter-spacing: 0.15em;
+        color: #f0ece2;
+      }
+      #intro-note {
+        position: absolute;
+        right: 104px;
+        bottom: 96px;
+        width: 360px;
+        text-align: right;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 16px;
+        line-height: 1.7;
+        letter-spacing: 0.12em;
+        color: rgba(240, 236, 226, 0.68);
+      }
+      #master-video {
+        object-fit: cover;
+        background: #000;
+      }
+      #outro-card {
+        display: grid;
+        place-items: center;
+        background: #050909;
+      }
+      #outro-glow {
+        position: absolute;
+        width: 960px;
+        height: 480px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(158, 35, 48, 0.13) 0%, rgba(7, 16, 17, 0) 70%);
+      }
+      #outro-copy {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        width: 1120px;
+      }
+      #outro-rule {
+        width: 112px;
+        height: 5px;
+        margin-bottom: 42px;
+        background: #e0a33a;
+        transform-origin: center;
+      }
+      #outro-title {
+        margin: 0;
+        font-size: 112px;
+        line-height: 1;
+        font-weight: 700;
+        letter-spacing: 0.20em;
+        text-indent: 0.20em;
+      }
+      #outro-meta {
+        margin-top: 34px;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: 0.22em;
+        color: #a7aea8;
+      }
+      #transition-layer {
+        pointer-events: none;
+      }
+      #transition-black {
+        position: absolute;
+        inset: 0;
+        background: #000;
+        opacity: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div data-hf-id="hf-7sjv" id="root" data-composition-id="main" data-start="0" data-duration="42.777" data-width="1920" data-height="1080">
+      <section id="intro-card" class="clip" data-start="0" data-duration="3.2" data-track-index="0" data-hf-id="intro-card">
+        <img data-hf-id="hf-jyt1" id="intro-bg" src="assets/cover-source.jpg" alt="林夏从后视镜看见后排模糊人影" data-layout-allow-overflow="">
+        <div data-hf-id="hf-tscs" id="intro-shade" aria-hidden="true"></div>
+        <div data-hf-id="hf-937l" id="intro-grid" aria-hidden="true"></div>
+        <div data-hf-id="hf-yekl" id="intro-meta"><span data-hf-id="hf-1wqv">EP01</span><span data-hf-id="hf-jrx5">RAIN CALL</span><span data-hf-id="hf-6yvm" id="intro-meta-line" aria-hidden="true"></span></div>
+        <div data-hf-id="hf-v7k5" id="intro-copy">
+          <div data-hf-id="hf-97nu" id="intro-kicker">SUSPENSE SHORT · 暴雨夜</div>
+          <h1 data-hf-id="hf-bosb" id="intro-title" aria-label="雨夜来电">
+            <span data-hf-id="hf-5eb0" class="glyph" id="title-glyph-1">雨</span><span data-hf-id="hf-f41d" class="glyph" id="title-glyph-2">夜</span><span data-hf-id="hf-a595" class="glyph" id="title-glyph-3">来</span><span data-hf-id="hf-n1os" class="glyph" id="title-glyph-4">电</span>
+          </h1>
+          <div data-hf-id="hf-g60a" id="intro-subtitle">失联三年的号码</div>
+        </div>
+        <div data-hf-id="hf-khjt" id="intro-note">A NUMBER SILENT FOR THREE YEARS<br data-hf-id="hf-x5px">CALLS AGAIN IN THE RAIN.</div>
+      </section>
+
+      <video id="master-video" class="clip" src="rain-call-ep01-roughcut-v2-1.mp4" muted playsinline data-start="3.2" data-duration="36.877" data-track-index="0" data-hf-id="approved-master-video"></video>
+      <audio data-hf-id="hf-8sjb" id="master-audio" class="clip" src="rain-call-ep01-roughcut-v2-1.mp4" data-start="3.2" data-duration="36.877" data-track-index="10" data-volume="1"></audio>
+
+      <section id="outro-card" class="clip" data-start="40.077" data-duration="2.7" data-track-index="0" data-hf-id="outro-card">
+        <div data-hf-id="hf-pyw3" id="outro-glow" aria-hidden="true"></div>
+        <div data-hf-id="hf-u1lw" id="outro-copy">
+          <div data-hf-id="hf-p0be" id="outro-rule" aria-hidden="true"></div>
+          <h2 data-hf-id="hf-lawc" id="outro-title">未完待续</h2>
+          <div data-hf-id="hf-d5vj" id="outro-meta">EP01 · 雨夜来电</div>
+        </div>
+      </section>
+
+      <audio data-hf-id="hf-btc6" id="intro-rain" class="clip" src="assets/rain-intro.m4a" data-start="0" data-duration="3.2" data-track-index="11" data-volume="1"></audio>
+      <audio data-hf-id="hf-xbag" id="outro-rain" class="clip" src="assets/rain-outro.m4a" data-start="40.077" data-duration="2.7" data-track-index="11" data-volume="1"></audio>
+
+      <div data-hf-id="hf-698t" id="transition-layer" class="clip" data-start="0" data-duration="42.777" data-track-index="20" aria-hidden="true">
+        <div data-hf-id="hf-imky" id="transition-black"></div>
+      </div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      const frame = 1 / 24;
+
+      tl.fromTo("#intro-bg", { scale: 1.035 }, { scale: 1, duration: 3.2, ease: "sine.out" }, 0);
+      tl.fromTo("#intro-meta", { y: -22, opacity: 0 }, { y: 0, opacity: 1, duration: 0.45, ease: "power3.out" }, 0.16);
+      tl.fromTo("#intro-meta-line", { scaleX: 0 }, { scaleX: 1, duration: 0.5, ease: "power3.out" }, 0.3);
+
+      const glyphs = [
+        { id: "#title-glyph-1", start: 0.42, y: 78, duration: 0.20 },
+        { id: "#title-glyph-2", start: 0.62, y: 54, duration: 0.16 },
+        { id: "#title-glyph-3", start: 0.74, y: 48, duration: 0.15 },
+        { id: "#title-glyph-4", start: 0.85, y: 42, duration: 0.13 }
+      ];
+      glyphs.forEach(({ id, start, y, duration }) => {
+        tl.set(id, { opacity: 1, y }, start);
+        tl.to(id, { y: 0, duration, ease: "power4.out" }, start);
+      });
+      tl.fromTo("#intro-subtitle", { y: 22, opacity: 0 }, { y: 0, opacity: 1, duration: 0.42, ease: "power3.out" }, 1.06);
+      tl.fromTo("#intro-note", { x: 28, opacity: 0 }, { x: 0, opacity: 1, duration: 0.48, ease: "power3.out" }, 1.22);
+      tl.fromTo("#transition-black", { opacity: 0 }, { opacity: 1, duration: 0.30, ease: "power2.in" }, 2.90);
+      tl.to("#transition-black", { opacity: 0, duration: 0.35, ease: "power2.out" }, 3.20);
+
+      tl.fromTo("#transition-black", { opacity: 0, immediateRender: false }, { opacity: 1, duration: 0.35, ease: "power2.in" }, 39.727);
+      tl.set("#outro-rule", { scaleX: 0 }, 40.077 + frame);
+      tl.to("#outro-rule", { scaleX: 1, duration: 0.34, ease: "power3.out" }, 40.077 + frame);
+      tl.fromTo("#outro-title", { y: 46, opacity: 0 }, { y: 0, opacity: 1, duration: 0.46, ease: "power4.out" }, 40.22);
+      tl.fromTo("#outro-meta", { y: 20, opacity: 0 }, { y: 0, opacity: 1, duration: 0.40, ease: "power3.out" }, 40.43);
+      tl.to("#transition-black", { opacity: 0, duration: 0.35, ease: "power2.out" }, 40.18);
+      tl.to("#outro-copy", { opacity: 0, duration: 0.45, ease: "power1.in" }, 42.22);
+
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

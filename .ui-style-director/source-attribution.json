@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 2,
+  "generatedBy": "ai-ui-style-director",
+  "selection": {
+    "directionId": "operational-saas-console",
+    "themeId": "theme-a1ba3ddb542f"
+  },
+  "sourceProvider": "awesome-design-md",
+  "sourceSlug": "linear-like",
+  "directionReferences": [
+    {
+      "provider": "awesome-design-md",
+      "slug": "intercom",
+      "label": "Intercom",
+      "role": "friendly operational product surfaces",
+      "pageUrl": "https://getdesign.md/intercom/design-md",
+      "lightPreviewUrl": "https://getdesign.md/design-md/intercom/preview.html",
+      "darkPreviewUrl": "https://getdesign.md/design-md/intercom/preview-dark.html",
+      "referenceKinds": [
+        "direction"
+      ]
+    },
+    {
+      "provider": "awesome-design-md",
+      "slug": "linear.app",
+      "label": "Linear",
+      "role": "compact app shell, rows, and selected states",
+      "pageUrl": "https://getdesign.md/linear.app/design-md",
+      "lightPreviewUrl": "https://getdesign.md/design-md/linear.app/preview.html",
+      "darkPreviewUrl": "https://getdesign.md/design-md/linear.app/preview-dark.html",
+      "referenceKinds": [
+        "direction"
+      ]
+    },
+    {
+      "provider": "awesome-design-md",
+      "slug": "notion",
+      "label": "Notion",
+      "role": "calm workspace hierarchy",
+      "pageUrl": "https://getdesign.md/notion/design-md",
+      "lightPreviewUrl": "https://getdesign.md/design-md/notion/preview.html",
+      "darkPreviewUrl": "https://getdesign.md/design-md/notion/preview-dark.html",
+      "referenceKinds": [
+        "direction"
+      ]
+    }
+  ],
+  "themeSources": [
+    {
+      "kind": "legacy-curated",
+      "provider": "awesome-design-md",
+      "slug": "linear-like",
+      "label": "Linear theme source",
+      "role": "theme palette source",
+      "referenceKinds": [
+        "theme"
+      ]
+    }
+  ],
+  "visualReferences": [
+    {
+      "provider": "awesome-design-md",
+      "slug": "linear.app",
+      "label": "Linear",
+      "role": "compact app shell, rows, and selected states",
+      "pageUrl": "https://getdesign.md/linear.app/design-md",
+      "lightPreviewUrl": "https://getdesign.md/design-md/linear.app/preview.html",
+      "darkPreviewUrl": "https://getdesign.md/design-md/linear.app/preview-dark.html"
+    },
+    {
+      "provider": "awesome-design-md",
+      "slug": "notion",
+      "label": "Notion",
+      "role": "calm workspace hierarchy",
+      "pageUrl": "https://getdesign.md/notion/design-md",
+      "lightPreviewUrl": "https://getdesign.md/design-md/notion/preview.html",
+      "darkPreviewUrl": "https://getdesign.md/design-md/notion/preview-dark.html"
+    },
+    {
+      "provider": "awesome-design-md",
+      "slug": "intercom",
+      "label": "Intercom",
+      "role": "friendly operational product surfaces",
+      "pageUrl": "https://getdesign.md/intercom/design-md",
+      "lightPreviewUrl": "https://getdesign.md/design-md/intercom/preview.html",
+      "darkPreviewUrl": "https://getdesign.md/design-md/intercom/preview-dark.html"
+    }
+  ],
+  "brandSafety": "Use as inspiration only; do not copy proprietary brand assets or exact layouts."
+}

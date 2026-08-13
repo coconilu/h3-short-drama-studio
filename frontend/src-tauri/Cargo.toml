@@ -1,0 +1,23 @@
+[package]
+name = "jingchang-desktop"
+version = "0.2.0"
+description = "镜场 MiniMax H3 本地短剧生产工作台"
+authors = ["Jingchang"]
+edition = "2021"
+
+[[bin]]
+name = "jingchang-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.11", features = [] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

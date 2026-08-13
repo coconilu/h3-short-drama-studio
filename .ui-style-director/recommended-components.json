@@ -1,0 +1,39 @@
+[
+  {
+    "id": "origin-ui",
+    "name": "Origin UI",
+    "bestFor": [
+      "SaaS screens",
+      "settings",
+      "account flows",
+      "app layouts"
+    ],
+    "useWhen": "Use for practical app UI blocks and repeated product surfaces.",
+    "avoidWhen": "Avoid when a highly custom visual identity is required."
+  },
+  {
+    "id": "shadcn-ui",
+    "name": "shadcn/ui",
+    "bestFor": [
+      "forms",
+      "navigation",
+      "dialogs",
+      "tables",
+      "app shells"
+    ],
+    "useWhen": "Use as the default accessible React and Tailwind component base.",
+    "avoidWhen": "Avoid treating the default examples as a final visual direction."
+  },
+  {
+    "id": "tremor",
+    "name": "Tremor",
+    "bestFor": [
+      "dashboards",
+      "charts",
+      "metric cards",
+      "business intelligence"
+    ],
+    "useWhen": "Use when data visualization is central to the product experience.",
+    "avoidWhen": "Avoid for brand-led consumer pages that do not need charts."
+  }
+]
