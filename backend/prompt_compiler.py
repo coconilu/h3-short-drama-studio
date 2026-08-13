@@ -86,11 +86,31 @@ def init_prompt_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_h3_validation_leases_project
           ON h3_validation_leases(project_id, shot_id);
+        CREATE TABLE IF NOT EXISTS h3_generation_leases (
+          id TEXT PRIMARY KEY,
+          shot_id TEXT NOT NULL UNIQUE REFERENCES shots(id) ON DELETE RESTRICT,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          validation_hash TEXT NOT NULL,
+          input_snapshot TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_h3_generation_leases_project
+          ON h3_generation_leases(project_id, shot_id);
         """
     )
     # The application uses a single API worker. A new process cannot own leases
     # left by a previous process, so startup safely clears crash leftovers.
     db.execute("DELETE FROM h3_validation_leases")
+    db.execute("DELETE FROM h3_generation_leases")
+    if db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+    ).fetchone():
+        now = utc_now()
+        db.execute(
+            """UPDATE jobs SET state = '提交失败', message = '服务重启中断 H3 提交，可重试',
+            updated_at = ?, completed_at = ? WHERE kind = 'draft' AND state = '提交中'""",
+            (now, now),
+        )
     columns = {row[1] for row in db.execute("PRAGMA table_info(h3_prompt_plans)").fetchall()}
     if "stale_reasons" not in columns:
         db.execute("ALTER TABLE h3_prompt_plans ADD COLUMN stale_reasons TEXT NOT NULL DEFAULT '[]'")

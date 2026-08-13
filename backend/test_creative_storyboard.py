@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -650,6 +652,152 @@ class CreativeStoryboardContractTests(unittest.TestCase):
                 db.execute("SELECT COUNT(*) FROM jobs WHERE kind = 'draft' AND shot_id IN (?, ?, ?)", tuple(shot_ids)).fetchone()[0],
                 0,
             )
+
+    def test_actual_generate_releases_database_lock_while_adapter_blocks_and_protects_current_shot(self) -> None:
+        target_section = self.approve_section(self.create_section("阻塞中提交"))
+        other_section = self.approve_section(self.create_section("其他镜头可写"))
+        applied = self.apply(self.preview())["sync"]["applied_snapshot"]
+        shots = {item["section_id"]: item["shot_id"] for item in applied}
+        target_shot_id = shots[target_section["id"]]
+        other_shot_id = shots[other_section["id"]]
+        _, _, validation = self.capture_generate_validation(target_shot_id)
+        entered = threading.Event()
+        release = threading.Event()
+        outcome: dict[str, object] = {}
+
+        def blocked_adapter(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release adapter")
+            return SimpleNamespace(stdout='{"ok": true}')
+
+        def submit() -> None:
+            try:
+                outcome["result"] = studio.generate(
+                    target_shot_id,
+                    studio.GenerateRequest(
+                        confirm=True,
+                        dry_run=False,
+                        expected_validation_hash=validation["validation_input_hash"],
+                    ),
+                )
+            except Exception as exc:  # pragma: no cover - asserted below with the thread outcome.
+                outcome["error"] = exc
+
+        with (
+            patch.object(studio, "run_h3", side_effect=blocked_adapter),
+            patch.object(studio, "read_manifest", return_value={"candidates": [], "promotions": []}),
+        ):
+            worker = threading.Thread(target=submit)
+            worker.start()
+            self.assertTrue(entered.wait(2), "actual generate did not reach the external adapter")
+            started = time.monotonic()
+            studio.update_shot(other_shot_id, studio.ShotPatch(title="外部调用中仍可修改"))
+            with closing(studio.connect()) as db:
+                db.execute(
+                    """INSERT INTO projects (id, title, episode, logline, target_duration, created_at)
+                    VALUES ('concurrent-other-project', '并发项目', 'EP02', '', 30, ?)""",
+                    (studio.utc_now(),),
+                )
+                db.commit()
+            elapsed = time.monotonic() - started
+
+            workspace = self.call_content("/api/creative-planning", "GET")
+            current_target = next(
+                section for chapter in workspace["chapters"] for section in chapter["sections"]
+                if section["id"] == target_section["id"]
+            )
+            self.call_content(
+                "/api/creative-planning/sections/{section_id}/archive", "POST", target_section["id"],
+                RevisionBase(base_revision=current_target["revision"], source="human:test-delete-during-submit"),
+            )
+            protected = self.preview()
+            protected_row = next(row for row in protected["rows"] if row.get("shot_id") == target_shot_id)
+            self.assertIn("进行中的 H3 GPU 提交", protected_row["protected_reasons"])
+            with self.assertRaises(HTTPException) as blocked_delete:
+                self.apply(protected)
+            self.assertEqual(blocked_delete.exception.status_code, 409)
+            release.set()
+            worker.join(5)
+
+        self.assertLess(elapsed, 2.0)
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertTrue(outcome["result"]["ok"])
+        self.assertEqual(studio.require_active_shot(other_shot_id)["title"], "外部调用中仍可修改")
+        with closing(studio.connect()) as db:
+            self.assertIsNotNone(db.execute("SELECT id FROM projects WHERE id = 'concurrent-other-project'").fetchone())
+            self.assertIsNotNone(db.execute("SELECT id FROM shots WHERE id = ?", (target_shot_id,)).fetchone())
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_generation_leases").fetchone()[0], 0)
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE shot_id = ? AND kind = 'draft' AND state <> '提交中'",
+                    (target_shot_id,),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_actual_generate_failure_and_timeout_finish_job_and_clear_generation_lease(self) -> None:
+        sections = [self.approve_section(self.create_section(title)) for title in ("提交失败", "提交超时")]
+        applied = self.apply(self.preview())["sync"]["applied_snapshot"]
+        shots = {item["section_id"]: item["shot_id"] for item in applied}
+        cases = (
+            (sections[0], RuntimeError("controlled actual failure"), RuntimeError),
+            (sections[1], HTTPException(504, "controlled actual timeout"), HTTPException),
+        )
+        for section, failure, exception_type in cases:
+            shot_id = shots[section["id"]]
+            _, _, validation = self.capture_generate_validation(shot_id)
+            with patch.object(studio, "run_h3", side_effect=failure):
+                with self.assertRaises(exception_type):
+                    studio.generate(
+                        shot_id,
+                        studio.GenerateRequest(
+                            confirm=True,
+                            dry_run=False,
+                            expected_validation_hash=validation["validation_input_hash"],
+                        ),
+                    )
+            with closing(studio.connect()) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_generation_leases").fetchone()[0], 0)
+                failed_job = db.execute(
+                    "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1", (shot_id,)
+                ).fetchone()
+                self.assertEqual(failed_job["state"], "提交失败")
+                self.assertTrue(failed_job["completed_at"])
+                db.execute("UPDATE projects SET logline = ? WHERE id = ?", ("post-failure write", self.project["id"]))
+                db.commit()
+
+    def test_restart_recovers_orphaned_generation_lease_and_submitting_job(self) -> None:
+        self.approve_section(self.create_section("重启恢复提交"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        now = studio.utc_now()
+        with closing(studio.connect()) as db:
+            db.execute(
+                """INSERT INTO h3_generation_leases
+                (id, shot_id, project_id, validation_hash, input_snapshot, created_at)
+                VALUES ('orphaned-generation', ?, ?, ?, '{}', ?)""",
+                (shot_id, self.project["id"], "f" * 64, now),
+            )
+            db.execute(
+                """INSERT INTO jobs
+                (shot_id, kind, state, message, created_at, updated_at, plan_hash, source_snapshot)
+                VALUES (?, 'draft', '提交中', '模拟进程中断', ?, ?, ?, '{}')""",
+                (shot_id, now, now, "f" * 64),
+            )
+            db.commit()
+
+        studio.init_db()
+
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_generation_leases").fetchone()[0], 0)
+            recovered = db.execute(
+                "SELECT state, message, completed_at FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1",
+                (shot_id,),
+            ).fetchone()
+            self.assertEqual(recovered["state"], "提交失败")
+            self.assertIn("服务重启", recovered["message"])
+            self.assertTrue(recovered["completed_at"])
 
     def test_generate_dry_run_rejects_shot_change_during_adapter_without_partial_result(self) -> None:
         self.approve_section(self.create_section("运行中改镜头"))

@@ -135,7 +135,7 @@ EXPORT_PROCESSES: dict[str, subprocess.Popen[str]] = {}
 EXPORT_WORKER_THREAD: threading.Thread | None = None
 EXPORT_WORKER_ID = f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
-ACTIVE_JOB_STATES = ("已提交", "排队中", "运行中")
+ACTIVE_JOB_STATES = ("提交中", "已提交", "排队中", "运行中")
 ASSET_LIMITS = {"image": 50 * 1024 * 1024, "video": 2 * 1024 * 1024 * 1024, "audio": 250 * 1024 * 1024}
 ASSET_EXTENSIONS = {
     "image": {".jpg", ".jpeg", ".png", ".webp"},
@@ -3192,7 +3192,7 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
     if not request.dry_run:
         active = row(
             """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
-            AND state IN (?, ?, ?) ORDER BY id DESC LIMIT 1""",
+            AND state IN (?, ?, ?, ?) ORDER BY id DESC LIMIT 1""",
             (shot_id, *ACTIVE_JOB_STATES),
         )
         if active:
@@ -3252,6 +3252,8 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
         finally:
             end_validation_lease(DB_PATH, lease_id)
 
+    generation_lease_id = f"h3-generation-{uuid.uuid4().hex[:12]}"
+    submitting_job_id: int | None = None
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
         current_input = current_plan_input(db, shot_id, shot["project_id"])
@@ -3282,7 +3284,62 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
             or validation_hash != expected_hash
         ):
             raise HTTPException(409, "当前 H3 适配器输入未通过最近一次 dry-run，禁止提交 GPU")
+        now = utc_now()
+        try:
+            db.execute(
+                """INSERT INTO h3_generation_leases
+                (id, shot_id, project_id, validation_hash, input_snapshot, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    generation_lease_id,
+                    shot_id,
+                    shot["project_id"],
+                    validation_hash,
+                    json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "该镜头已有进行中的 H3 GPU 提交") from exc
+        cursor = db.execute(
+            """INSERT INTO jobs
+            (shot_id, kind, state, message, created_at, h3_project, updated_at, plan_hash, source_snapshot)
+            VALUES (?, 'draft', '提交中', '已冻结通过 dry-run 的 H3 命令，正在提交', ?, ?, ?, ?, ?)""",
+            (
+                shot_id,
+                now,
+                project,
+                now,
+                validation_hash,
+                json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        submitting_job_id = int(cursor.lastrowid)
+        db.commit()
+
+    try:
         completed = run_h3(arguments, timeout=90)
+    except Exception as exc:
+        with closing(connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            db.execute(
+                """UPDATE jobs SET state = '提交失败', message = ?, updated_at = ?, completed_at = ?
+                WHERE id = ? AND state = '提交中'""",
+                (str(exc), now, now, submitting_job_id),
+            )
+            db.execute("DELETE FROM h3_generation_leases WHERE id = ?", (generation_lease_id,))
+            db.commit()
+        raise
+
+    with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            """UPDATE jobs SET state = '已提交', message = '已向 ComfyUI 提交通过 dry-run 的冻结命令',
+            updated_at = ? WHERE id = ? AND state = '提交中'""",
+            (utc_now(), submitting_job_id),
+        )
+        db.execute("DELETE FROM h3_generation_leases WHERE id = ?", (generation_lease_id,))
         db.commit()
 
     manifest = read_manifest(project)
@@ -3290,16 +3347,13 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
     with closing(connect()) as db:
         db.execute("UPDATE candidates SET archived = 1 WHERE shot_id = ? AND source = 'mock'", (shot_id,))
         db.execute(
-            """INSERT INTO jobs
-            (shot_id, kind, state, message, created_at, h3_project, prompt_ids, updated_at)
-            VALUES (?, 'draft', '已提交', ?, ?, ?, ?, ?)""",
+            """UPDATE jobs SET state = '已提交', message = ?, prompt_ids = ?, updated_at = ?
+            WHERE id = ?""",
             (
-                shot_id,
                 f"已向 ComfyUI 提交 {len(prompt_ids)} 条真实候选",
-                utc_now(),
-                project,
                 json.dumps(prompt_ids),
                 utc_now(),
+                submitting_job_id,
             ),
         )
         db.execute("UPDATE shots SET status = '生成中', updated_at = ? WHERE id = ?", (utc_now(), shot_id))
