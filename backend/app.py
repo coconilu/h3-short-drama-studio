@@ -1079,7 +1079,8 @@ def legacy_draft_jobs_needing_recovery(shot_id: str) -> list[dict[str, Any]]:
     no-job manifest importer would merge unrelated historical attempts.  A row
     already placed in manual reconciliation is excluded because its failed
     recovery has been audited and it must remain stable until a human resolves
-    it.
+    it.  ``retry_safe`` is also an audited zero-submission outcome, so it never
+    owns candidates and must not be reopened by later manifest polling.
     """
     return [
         job for job in rows(
@@ -1087,7 +1088,7 @@ def legacy_draft_jobs_needing_recovery(shot_id: str) -> list[dict[str, Any]]:
             AND state != '待人工对账' ORDER BY id""",
             (shot_id,),
         )
-        if not string_list(job.get("candidate_ids"))
+        if not job.get("retry_safe") and not string_list(job.get("candidate_ids"))
     ]
 
 
@@ -1135,7 +1136,8 @@ def recover_legacy_draft_job(
             expected_job_revision=int(job.get("reconciliation_revision") or 0),
             preserve_terminal_state=str(job["state"]) in DRAFT_TERMINAL_STATES,
         )
-        reserved_candidate_ids.update(attempt_ids)
+        persisted = row("SELECT candidate_ids FROM jobs WHERE id = ?", (job["id"],))
+        reserved_candidate_ids.update(string_list(persisted.get("candidate_ids") if persisted else None))
         return result
     except ReconciliationConflict:
         current = row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
@@ -1449,6 +1451,64 @@ def promotion_public(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def legacy_terminal_semantic_check(
+    state: str, candidate_ids: list[str], records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    record_evidence = [
+        {
+            "candidate_id": str(record.get("id") or ""),
+            "prompt_id": str(record.get("prompt_id") or ""),
+            "status": str(record.get("status") or "queued"),
+            "has_output_file": bool(str(record.get("output_file") or "").strip()),
+        }
+        for record in records
+    ]
+    observed_ids = [item["candidate_id"] for item in record_evidence]
+    result: dict[str, Any] = {
+        "expected_state": state,
+        "expected_candidate_ids": list(candidate_ids),
+        "records": record_evidence,
+        "consistent": True,
+        "reason": None,
+    }
+    if len(observed_ids) != len(candidate_ids) or set(observed_ids) != set(candidate_ids):
+        result.update({
+            "consistent": False,
+            "reason": "候选记录与恢复出的 candidate set 不完整一致",
+        })
+        return result
+    if state == "完成":
+        invalid = [
+            item["candidate_id"] for item in record_evidence
+            if item["status"] != "completed" or not item["has_output_file"]
+        ]
+        if invalid:
+            result.update({
+                "consistent": False,
+                "reason": "完成任务要求全部候选为 completed 且具有 output_file 完成证据",
+                "conflicting_candidate_ids": invalid,
+            })
+    elif state == "失败":
+        failed_ids = [item["candidate_id"] for item in record_evidence if item["status"] == "error"]
+        result["failed_candidate_ids"] = failed_ids
+        if not failed_ids:
+            result.update({
+                "consistent": False,
+                "reason": "失败任务至少需要一条 status=error 的候选证据",
+            })
+    elif state == "提交失败":
+        result.update({
+            "consistent": False,
+            "reason": "提交失败表示没有可信候选归属，不能从 manifest 认领候选",
+        })
+    else:
+        result.update({
+            "consistent": False,
+            "reason": f"不支持恢复未知终态：{state}",
+        })
+    return result
+
+
 def sync_manifest_to_db(
     shot_id: str,
     project: str,
@@ -1492,6 +1552,51 @@ def sync_manifest_to_db(
             ).fetchone()
             if not expected_job:
                 raise ReconciliationConflict("对账任务已被另一请求更新")
+        if preserve_terminal_state and expected_job is not None:
+            terminal_check = legacy_terminal_semantic_check(
+                str(expected_job["state"]), list(record_ids or []), tracked_records,
+            )
+            if not terminal_check["consistent"]:
+                evidence = dict(reconciliation_evidence or {})
+                recovery = evidence.get("legacy_attempt_recovery")
+                recovery = dict(recovery) if isinstance(recovery, dict) else {}
+                recovery.update({
+                    "status": "failed",
+                    "terminal_semantic_check": terminal_check,
+                })
+                evidence["legacy_attempt_recovery"] = recovery
+                now = utc_now()
+                message = (
+                    "旧终态任务与精确 manifest 证据冲突："
+                    f"{terminal_check['reason']}；候选和镜头均未写入，需人工对账"
+                )
+                cursor = db.execute(
+                    """UPDATE jobs SET state = '待人工对账', message = ?, reconciliation_snapshot = ?,
+                    retry_safe = 0, updated_at = ?, completed_at = ?,
+                    reconciliation_revision = reconciliation_revision + 1
+                    WHERE id = ? AND state = ? AND reconciliation_revision = ?""",
+                    (
+                        message,
+                        json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                        now,
+                        now,
+                        int(expected_job["id"]),
+                        expected_job_state,
+                        expected_job_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ReconciliationConflict("旧终态任务语义冲突 CAS 更新失败")
+                db.commit()
+                return {
+                    "project": project,
+                    "state": "待人工对账",
+                    "message": message,
+                    "completed": 0,
+                    "total": len(record_ids or []),
+                    "prompt_ids": string_list(expected_job["prompt_ids"]),
+                    "external_ids": [],
+                }
         for index, record in enumerate(records):
             external_id = str(record.get("id") or f"draft-{index + 1:03d}")
             if tracked_ids is not None and external_id not in tracked_ids:

@@ -1086,6 +1086,207 @@ class CreativeStoryboardContractTests(unittest.TestCase):
             }
         self.assertEqual(candidate_ids, {"draft-080", "draft-081"})
 
+    def test_retry_safe_zero_submission_job_is_never_reopened_by_later_success(self) -> None:
+        self.approve_section(self.create_section("零提交旧任务不复活"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        project = studio.h3_project_for_shot(shot_id)
+        now = studio.utc_now()
+        safe_audit = {
+            "manual_resolutions": [{
+                "action": "confirm_not_submitted",
+                "note": "已确认进程未启动且外部零提交",
+                "resolved_by": "human:qa",
+            }],
+        }
+        with closing(studio.connect()) as db:
+            safe_cursor = db.execute(
+                """INSERT INTO jobs
+                (shot_id, kind, state, message, created_at, updated_at, completed_at, h3_project,
+                 prompt_ids, candidate_ids, reconciliation_snapshot, retry_safe, reconciliation_revision)
+                VALUES (?, 'draft', '提交失败', '已审计零提交，可安全重试', ?, ?, ?, ?, ?, '[]', ?, 1, 7)""",
+                (
+                    shot_id,
+                    now,
+                    now,
+                    now,
+                    project,
+                    json.dumps(["old-safe-prompt"]),
+                    json.dumps(safe_audit, ensure_ascii=False),
+                ),
+            )
+            safe_job_id = safe_cursor.lastrowid
+            new_cursor = db.execute(
+                """INSERT INTO jobs
+                (shot_id, kind, state, message, created_at, updated_at, h3_project,
+                 prompt_ids, candidate_ids, reconciliation_snapshot, reconciliation_revision)
+                VALUES (?, 'draft', '运行中', '后续真实 attempt', ?, ?, ?, ?, ?, ?, 3)""",
+                (
+                    shot_id,
+                    now,
+                    now,
+                    project,
+                    json.dumps(["new-success-prompt"]),
+                    json.dumps(["draft-091"]),
+                    json.dumps({"submitted_candidate_ids": ["draft-091"]}),
+                ),
+            )
+            new_job_id = new_cursor.lastrowid
+            safe_before = dict(db.execute(
+                """SELECT state, message, updated_at, completed_at, prompt_ids, candidate_ids,
+                reconciliation_snapshot, retry_safe, reconciliation_revision
+                FROM jobs WHERE id = ?""",
+                (safe_job_id,),
+            ).fetchone())
+            db.commit()
+        manifest = {
+            "project": project,
+            "updated_at": "safe-old-plus-new-success",
+            "candidates": [
+                {
+                    "id": "draft-090",
+                    "prompt_id": "old-safe-prompt",
+                    "status": "completed",
+                    "output_file": "must-not-be-owned.mp4",
+                },
+                {
+                    "id": "draft-091",
+                    "prompt_id": "new-success-prompt",
+                    "status": "completed",
+                    "output_file": "new-success.mp4",
+                    "contact_sheet": "new-success.jpg",
+                },
+            ],
+            "promotions": [],
+        }
+        with (
+            patch.object(
+                studio, "run_h3", return_value=SimpleNamespace(stdout="", stderr="", returncode=0),
+            ) as adapter,
+            patch.object(studio, "read_manifest", return_value=manifest),
+            patch.object(studio.urllib.request, "urlopen", side_effect=OSError("controlled offline queue")),
+        ):
+            first = studio.sync_shot(shot_id)
+            second = studio.sync_shot(shot_id)
+
+        self.assertEqual(first["state"], "完成")
+        self.assertEqual(second["state"], "完成")
+        self.assertEqual(adapter.call_count, 2)
+        with closing(studio.connect()) as db:
+            safe_after = dict(db.execute(
+                """SELECT state, message, updated_at, completed_at, prompt_ids, candidate_ids,
+                reconciliation_snapshot, retry_safe, reconciliation_revision
+                FROM jobs WHERE id = ?""",
+                (safe_job_id,),
+            ).fetchone())
+            new_job = dict(db.execute("SELECT * FROM jobs WHERE id = ?", (new_job_id,)).fetchone())
+            candidates = db.execute(
+                "SELECT external_id FROM candidates WHERE shot_id = ? ORDER BY external_id", (shot_id,),
+            ).fetchall()
+            placeholders = ",".join("?" for _ in studio.SUBMISSION_BLOCKING_JOB_STATES)
+            blocking = db.execute(
+                f"""SELECT COUNT(*) FROM jobs WHERE shot_id = ? AND kind = 'draft'
+                AND state IN ({placeholders})""",
+                (shot_id, *studio.SUBMISSION_BLOCKING_JOB_STATES),
+            ).fetchone()[0]
+        self.assertEqual(safe_after, safe_before)
+        self.assertEqual(new_job["state"], "完成")
+        self.assertEqual(json.loads(new_job["candidate_ids"]), ["draft-091"])
+        self.assertEqual([record["external_id"] for record in candidates], ["draft-091"])
+        self.assertEqual(blocking, 0)
+
+    def test_legacy_terminal_job_conflicting_manifest_is_manual_and_zero_write(self) -> None:
+        sections = [
+            self.approve_section(self.create_section(title))
+            for title in (
+                "完成任务遇到运行证据",
+                "完成任务遇到失败证据",
+                "完成任务缺少产物证据",
+                "失败任务遇到完成证据",
+            )
+        ]
+        applied = self.apply(self.preview())["sync"]["applied_snapshot"]
+        shots = {item["section_id"]: item["shot_id"] for item in applied}
+        cases = (
+            (shots[sections[0]["id"]], "完成", "running", "running-output.mp4"),
+            (shots[sections[1]["id"]], "完成", "error", None),
+            (shots[sections[2]["id"]], "完成", "completed", None),
+            (shots[sections[3]["id"]], "失败", "completed", "completed-output.mp4"),
+        )
+        for shot_id, terminal_state, manifest_status, output_file in cases:
+            with self.subTest(terminal_state=terminal_state, status=manifest_status):
+                project = studio.h3_project_for_shot(shot_id)
+                now = studio.utc_now()
+                prompt_id = f"terminal-conflict-{manifest_status}"
+                with closing(studio.connect()) as db:
+                    shot_before = dict(db.execute(
+                        "SELECT status, thumbnail, video, updated_at FROM shots WHERE id = ?", (shot_id,),
+                    ).fetchone())
+                    cursor = db.execute(
+                        """INSERT INTO jobs
+                        (shot_id, kind, state, message, created_at, updated_at, completed_at, h3_project,
+                         prompt_ids, candidate_ids, reconciliation_revision)
+                        VALUES (?, 'draft', ?, '升级前终态任务', ?, ?, ?, ?, ?, '[]', 11)""",
+                        (shot_id, terminal_state, now, now, now, project, json.dumps([prompt_id])),
+                    )
+                    job_id = cursor.lastrowid
+                    db.commit()
+                manifest = {
+                    "project": project,
+                    "updated_at": f"completed-vs-{manifest_status}",
+                    "candidates": [{
+                        "id": f"draft-{manifest_status}",
+                        "prompt_id": prompt_id,
+                        "status": manifest_status,
+                        "output_file": output_file,
+                        "error": "controlled failure" if manifest_status == "error" else None,
+                    }],
+                    "promotions": [],
+                }
+                with (
+                    patch.object(
+                        studio, "run_h3",
+                        return_value=SimpleNamespace(stdout="", stderr="", returncode=0),
+                    ),
+                    patch.object(studio, "read_manifest", return_value=manifest),
+                    patch.object(studio.urllib.request, "urlopen", side_effect=OSError("controlled offline queue")),
+                ):
+                    result = studio.sync_shot(shot_id)
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["state"], "待人工对账")
+                self.assertIn("候选和镜头均未写入", result["message"])
+                with closing(studio.connect()) as db:
+                    job = dict(db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
+                    self.assertEqual(job["state"], "待人工对账")
+                    self.assertEqual(job["reconciliation_revision"], 12)
+                    self.assertEqual(json.loads(job["candidate_ids"]), [])
+                    audit = json.loads(job["reconciliation_snapshot"])["legacy_attempt_recovery"]
+                    self.assertEqual(audit["status"], "failed")
+                    semantic = audit["terminal_semantic_check"]
+                    self.assertFalse(semantic["consistent"])
+                    self.assertEqual(semantic["expected_state"], terminal_state)
+                    self.assertEqual(semantic["records"][0]["status"], manifest_status)
+                    self.assertEqual(db.execute(
+                        "SELECT COUNT(*) FROM candidates WHERE shot_id = ?", (shot_id,),
+                    ).fetchone()[0], 0)
+                    self.assertEqual(db.execute(
+                        "SELECT COUNT(*) FROM promotions WHERE shot_id = ?", (shot_id,),
+                    ).fetchone()[0], 0)
+                    shot_after = dict(db.execute(
+                        "SELECT status, thumbnail, video, updated_at FROM shots WHERE id = ?", (shot_id,),
+                    ).fetchone())
+                self.assertEqual(shot_after, shot_before)
+                with patch.object(studio, "run_h3") as repeated_adapter:
+                    repeated = studio.sync_shot(shot_id)
+                self.assertEqual(repeated["state"], "待人工对账")
+                repeated_adapter.assert_not_called()
+                with closing(studio.connect()) as db:
+                    sticky = db.execute(
+                        "SELECT state, reconciliation_revision FROM jobs WHERE id = ?", (job_id,),
+                    ).fetchone()
+                self.assertEqual(sticky["state"], "待人工对账")
+                self.assertEqual(sticky["reconciliation_revision"], 12)
+
     def test_legacy_terminal_incomplete_or_ambiguous_mapping_fails_closed_without_pollution(self) -> None:
         sections = [
             self.approve_section(self.create_section(title))
