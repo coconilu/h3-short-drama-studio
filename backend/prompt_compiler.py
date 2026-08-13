@@ -110,10 +110,14 @@ def init_prompt_schema(db: sqlite3.Connection) -> None:
         now = utc_now()
         job_columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
         retry_clause = ", retry_safe = 0" if "retry_safe" in job_columns else ""
+        revision_clause = (
+            ", reconciliation_revision = reconciliation_revision + 1"
+            if "reconciliation_revision" in job_columns else ""
+        )
         db.execute(
             f"""UPDATE jobs SET state = '提交状态未知',
             message = '服务重启时 H3 提交尚未完成对账，不会自动重试',
-            updated_at = ?, completed_at = NULL{retry_clause}
+            updated_at = ?, completed_at = NULL{retry_clause}{revision_clause}
             WHERE kind = 'draft' AND state = '提交中'""",
             (now,),
         )

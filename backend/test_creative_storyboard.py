@@ -47,9 +47,11 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         studio.ASSET_ROOT = root / "assets"
         studio.EXPORT_ROOT = root / "exports"
         studio.EXPORT_JOB_ROOT = root / "jobs"
+        studio.H3_PROJECT_ROOT = root / "h3-projects"
         studio.ASSET_ROOT.mkdir()
         studio.EXPORT_ROOT.mkdir()
         studio.EXPORT_JOB_ROOT.mkdir()
+        studio.H3_PROJECT_ROOT.mkdir()
         studio.init_db()
         self.project = studio.create_project(
             studio.ProjectCreate(title="同步合同项目", episode="EP01", logline="", target_duration=60, shots=[])
@@ -145,6 +147,15 @@ class CreativeStoryboardContractTests(unittest.TestCase):
             db.commit()
         studio.bind_shot_reference(shot_id, studio.ReferenceCreate(asset_id=asset_id, role="identity"))
 
+    @staticmethod
+    def empty_manifest(shot_id: str) -> dict:
+        return {
+            "project": studio.h3_project_for_shot(shot_id),
+            "updated_at": "baseline",
+            "candidates": [],
+            "promotions": [],
+        }
+
     def insert_locked_bible(self, entry_id: str, *, asset_id: str | None = None) -> None:
         with closing(studio.connect()) as db:
             db.execute(
@@ -201,11 +212,16 @@ class CreativeStoryboardContractTests(unittest.TestCase):
 
             def capture_gpu(arguments, **_kwargs):
                 gpu_arguments.extend(arguments)
-                return SimpleNamespace(stdout='{"ok": true}')
+                return SimpleNamespace(
+                    stdout="已排队 draft-001 seed=1 prompt_id=prompt-001\n"
+                    "已排队 draft-002 seed=2 prompt_id=prompt-002",
+                    stderr="",
+                    returncode=0,
+                )
 
             with (
                 patch.object(studio, "run_h3", side_effect=capture_gpu),
-                patch.object(studio, "read_manifest", return_value={"candidates": [], "promotions": []}),
+                patch.object(studio, "read_manifest", return_value=self.empty_manifest(shot_id)),
             ):
                 studio.generate(
                     shot_id,
@@ -669,7 +685,12 @@ class CreativeStoryboardContractTests(unittest.TestCase):
             entered.set()
             if not release.wait(5):
                 raise RuntimeError("test did not release adapter")
-            return SimpleNamespace(stdout='{"ok": true}')
+            return SimpleNamespace(
+                stdout="已排队 draft-001 seed=1 prompt_id=prompt-001\n"
+                "已排队 draft-002 seed=2 prompt_id=prompt-002",
+                stderr="",
+                returncode=0,
+            )
 
         def submit() -> None:
             try:
@@ -686,7 +707,7 @@ class CreativeStoryboardContractTests(unittest.TestCase):
 
         with (
             patch.object(studio, "run_h3", side_effect=blocked_adapter),
-            patch.object(studio, "read_manifest", return_value={"candidates": [], "promotions": []}),
+            patch.object(studio, "read_manifest", return_value=self.empty_manifest(target_shot_id)),
         ):
             worker = threading.Thread(target=submit)
             worker.start()
@@ -770,7 +791,7 @@ class CreativeStoryboardContractTests(unittest.TestCase):
                 db.commit()
 
             with (
-                patch.object(studio, "read_manifest", return_value={"candidates": [], "promotions": []}),
+                patch.object(studio, "read_manifest", return_value=self.empty_manifest(shot_id)),
                 patch.object(studio, "comfy_queue_evidence", return_value={"available": True}),
             ):
                 reconciled = studio.sync_shot(shot_id)
@@ -842,7 +863,7 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         self.assertEqual(project_card["phase"], "生成中")
         self.assertTrue(any(item["state"] == "提交状态未知" for item in workbench["queue"]))
         with (
-            patch.object(studio, "read_manifest", return_value={"candidates": [], "promotions": []}),
+            patch.object(studio, "read_manifest", return_value=self.empty_manifest(shot_id)),
             patch.object(studio, "comfy_queue_evidence", return_value={"available": True}),
         ):
             reconciled = studio.sync_shot(shot_id)
@@ -854,6 +875,14 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         for state in ("提交中", "已提交待对账", "提交状态未知", "已提交", "排队中", "运行中"):
             self.assertIn(f"'{state}'", frontend_source)
         self.assertIn("activeGenerationStates.has(job.state)", frontend_source)
+        for contract in (
+            "accept_current_manifest",
+            "confirm_not_submitted",
+            "expected_revision",
+            "接受证据",
+            "确认未提交",
+        ):
+            self.assertIn(contract, frontend_source)
         style_source = (Path(__file__).parents[1] / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
         for state in ("提交中", "已提交待对账", "提交状态未知", "待人工对账"):
             self.assertIn(f".status-{state}", style_source)
@@ -861,28 +890,47 @@ class CreativeStoryboardContractTests(unittest.TestCase):
     def test_post_submit_reconciliation_uses_manifest_and_queue_evidence_without_resubmitting(self) -> None:
         self.approve_section(self.create_section("提交后证据对账"))
         shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        studio.update_shot(shot_id, studio.ShotPatch(candidate_count=1))
         _, _, validation = self.capture_generate_validation(shot_id)
-        baseline = {"project": "before", "updated_at": "before", "candidates": [], "promotions": []}
+        baseline = self.empty_manifest(shot_id)
+        baseline["candidates"] = [{
+            "id": "draft-001",
+            "prompt_id": "old-prompt",
+            "status": "completed",
+            "output_file": "old.mp4",
+        }]
         submitted = {
             "project": studio.h3_project_for_shot(shot_id),
             "updated_at": "after",
-            "candidates": [{
-                "id": "draft-001",
-                "prompt_id": "prompt-001",
-                "status": "queued",
-                "seed": 7,
-            }],
+            "candidates": [
+                *baseline["candidates"],
+                {
+                    "id": "draft-002",
+                    "prompt_id": "prompt-002",
+                    "status": "queued",
+                    "seed": 7,
+                },
+            ],
             "promotions": [],
         }
         queue_evidence = {
             "available": True,
             "running_prompt_ids": [],
-            "pending_prompt_ids": ["prompt-001"],
+            "pending_prompt_ids": ["prompt-002"],
+        }
+        baseline_queue_evidence = {
+            "available": True,
+            "running_prompt_ids": [],
+            "pending_prompt_ids": [],
         }
         with (
-            patch.object(studio, "run_h3", return_value=SimpleNamespace(stdout='{"ok": true}')) as adapter,
+            patch.object(studio, "run_h3", return_value=SimpleNamespace(
+                stdout="已排队 draft-002 seed=7 prompt_id=prompt-002",
+                stderr="",
+                returncode=0,
+            )) as adapter,
             patch.object(studio, "read_manifest", side_effect=[baseline, submitted]),
-            patch.object(studio, "comfy_queue_evidence", return_value=queue_evidence),
+            patch.object(studio, "comfy_queue_evidence", side_effect=[baseline_queue_evidence, queue_evidence]),
         ):
             result = studio.generate(
                 shot_id,
@@ -903,10 +951,17 @@ class CreativeStoryboardContractTests(unittest.TestCase):
             self.assertEqual(job["retry_safe"], 0)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_generation_leases").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM candidates WHERE shot_id = ?", (shot_id,)).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT external_id FROM candidates WHERE shot_id = ?", (shot_id,)
+            ).fetchone()[0], "draft-002")
         evidence = json.loads(job["reconciliation_snapshot"])
-        self.assertEqual(evidence["manifest_before"]["candidate_ids"], [])
-        self.assertEqual(evidence["comfyui_before"]["reason"], "manifest 基线没有 prompt_id")
-        self.assertEqual(evidence["submitted_candidate_ids"], ["draft-001"])
+        self.assertEqual(evidence["manifest_before"]["candidate_ids"], ["draft-001"])
+        self.assertTrue(evidence["manifest_before"]["trusted"])
+        self.assertEqual(len(evidence["manifest_before"]["manifest_hash"]), 64)
+        self.assertEqual(evidence["input_hash"], job["plan_hash"])
+        self.assertEqual(evidence["source_plan_hash"], compile_prompt_plan(studio.DB_PATH, shot_id)["plan_hash"])
+        self.assertEqual(evidence["comfyui_before"], baseline_queue_evidence)
+        self.assertEqual(evidence["submitted_candidate_ids"], ["draft-002"])
         self.assertEqual(evidence["comfyui_queue"], queue_evidence)
 
         with patch.object(studio, "run_h3") as duplicate_adapter:
@@ -922,6 +977,46 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         self.assertEqual(duplicate.exception.status_code, 409)
         duplicate_adapter.assert_not_called()
 
+    def test_reconciliation_rejects_source_change_after_adapter_submission_without_partial_candidate(self) -> None:
+        self.approve_section(self.create_section("提交后来源变化"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        studio.update_shot(shot_id, studio.ShotPatch(candidate_count=1))
+        _, _, validation = self.capture_generate_validation(shot_id)
+        baseline = self.empty_manifest(shot_id)
+        submitted = {
+            "project": studio.h3_project_for_shot(shot_id),
+            "candidates": [{"id": "draft-001", "prompt_id": "prompt-source-change", "status": "queued"}],
+            "promotions": [],
+        }
+
+        def mutate_source(*_args, **_kwargs):
+            studio.update_shot(shot_id, studio.ShotPatch(prompt="adapter running 时被修改"))
+            return SimpleNamespace(
+                stdout="已排队 draft-001 seed=1 prompt_id=prompt-source-change",
+                stderr="",
+                returncode=0,
+            )
+
+        with (
+            patch.object(studio, "run_h3", side_effect=mutate_source),
+            patch.object(studio, "read_manifest", side_effect=[baseline, submitted]),
+            patch.object(studio, "comfy_queue_evidence", return_value={"available": True}),
+        ):
+            result = studio.generate(
+                shot_id,
+                studio.GenerateRequest(
+                    confirm=True,
+                    dry_run=False,
+                    expected_validation_hash=validation["validation_input_hash"],
+                ),
+            )
+        self.assertEqual(result["state"], "待人工对账")
+        self.assertIn("来源计划", result["message"])
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM candidates WHERE shot_id = ? AND source = 'h3'", (shot_id,)
+            ).fetchone()[0], 0)
+
     def test_post_submit_manifest_and_sync_failures_end_in_manual_reconciliation_without_partial_write(self) -> None:
         cases = (
             ("manifest缺失", HTTPException(404, "missing manifest"), None),
@@ -934,18 +1029,31 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         for section, (_, manifest_error, sync_error) in zip(sections, cases):
             shot_id = shots[section["id"]]
             _, _, validation = self.capture_generate_validation(shot_id)
-            baseline = {"candidates": [], "promotions": []}
+            baseline = self.empty_manifest(shot_id)
             after = {
-                "candidates": [{"id": f"candidate-{shot_id}", "prompt_id": f"prompt-{shot_id}", "status": "queued"}],
+                "project": studio.h3_project_for_shot(shot_id),
+                "candidates": [
+                    {"id": "draft-001", "prompt_id": "prompt-001", "status": "queued"},
+                    {"id": "draft-002", "prompt_id": "prompt-002", "status": "queued"},
+                ],
                 "promotions": [],
             }
             manifest_side_effect = [baseline, manifest_error or after]
             with ExitStack() as stack:
                 adapter = stack.enter_context(
-                    patch.object(studio, "run_h3", return_value=SimpleNamespace(stdout='{"ok": true}'))
+                    patch.object(studio, "run_h3", return_value=SimpleNamespace(
+                        stdout="已排队 draft-001 seed=1 prompt_id=prompt-001\n"
+                        "已排队 draft-002 seed=2 prompt_id=prompt-002",
+                        stderr="",
+                        returncode=0,
+                    ))
                 )
                 stack.enter_context(patch.object(studio, "read_manifest", side_effect=manifest_side_effect))
-                stack.enter_context(patch.object(studio, "comfy_queue_evidence", return_value={"available": True}))
+                stack.enter_context(patch.object(studio, "comfy_queue_evidence", return_value={
+                    "available": True,
+                    "running_prompt_ids": [],
+                    "pending_prompt_ids": ["prompt-001", "prompt-002"],
+                }))
                 if sync_error:
                     stack.enter_context(patch.object(studio, "sync_manifest_to_db", side_effect=sync_error))
                 result = studio.generate(
@@ -986,39 +1094,66 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
         project = studio.h3_project_for_shot(shot_id)
         now = studio.utc_now()
+        compiled = compile_prompt_plan(studio.DB_PATH, shot_id)
+        shot = studio.require_active_shot(shot_id)
+        _, arguments, _ = studio.build_h3_arguments(
+            shot,
+            False,
+            compiled_prompt_override=compiled["compiled_prompt"],
+            references_override=compiled["_references"],
+            prompt_plan_hash=compiled["plan_hash"],
+        )
+        command = studio.normalized_h3_input(arguments)
+        input_hash = studio.h3_input_hash(command)
+        before = studio.manifest_evidence_from_payload(project, self.empty_manifest(shot_id))
         evidence = json.dumps({
             "h3_project": project,
-            "frozen_command": {"command": "generate", "project": project},
+            "project_id": self.project["id"],
+            "source_plan_hash": compiled["plan_hash"],
+            "input_hash": input_hash,
+            "frozen_command": command,
             "baseline_candidate_ids": [],
+            "expected_candidate_ids": ["draft-001", "draft-002"],
+            "manifest_before": before,
             "adapter_returned_success": True,
+            "adapter_evidence": {
+                "process_started": True,
+                "returncode": 0,
+                "candidate_ids": ["draft-001", "draft-002"],
+                "prompt_ids": ["recovered-prompt-1", "recovered-prompt-2"],
+            },
         })
         with closing(studio.connect()) as db:
             db.execute(
                 """INSERT INTO h3_generation_leases
                 (id, shot_id, project_id, validation_hash, input_snapshot, created_at)
                 VALUES ('submitted-orphan', ?, ?, ?, '{}', ?)""",
-                (shot_id, self.project["id"], "e" * 64, now),
+                (shot_id, self.project["id"], input_hash, now),
             )
             db.execute(
                 """INSERT INTO jobs
                 (shot_id, kind, state, message, created_at, updated_at, h3_project, plan_hash,
                  source_snapshot, reconciliation_snapshot)
-                VALUES (?, 'draft', '已提交待对账', '模拟提交后进程中断', ?, ?, ?, ?, '{}', ?)""",
-                (shot_id, now, now, project, "e" * 64, evidence),
+                VALUES (?, 'draft', '已提交待对账', '模拟提交后进程中断', ?, ?, ?, ?, ?, ?)""",
+                (shot_id, now, now, project, input_hash, json.dumps(command), evidence),
             )
             db.commit()
 
         studio.init_db()
         self.assertEqual(studio.get_jobs()[0]["state"], "已提交待对账")
         manifest = {
-            "candidates": [{"id": "recovered-001", "prompt_id": "recovered-prompt", "status": "running"}],
+            "project": project,
+            "candidates": [
+                {"id": "draft-001", "prompt_id": "recovered-prompt-1", "status": "running"},
+                {"id": "draft-002", "prompt_id": "recovered-prompt-2", "status": "running"},
+            ],
             "promotions": [],
         }
         with (
             patch.object(studio, "read_manifest", return_value=manifest),
             patch.object(studio, "comfy_queue_evidence", return_value={
                 "available": True,
-                "running_prompt_ids": ["recovered-prompt"],
+                "running_prompt_ids": ["recovered-prompt-1", "recovered-prompt-2"],
                 "pending_prompt_ids": [],
             }),
             patch.object(studio, "run_h3") as adapter,
@@ -1028,11 +1163,285 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         adapter.assert_not_called()
         with closing(studio.connect()) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_generation_leases").fetchone()[0], 0)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM candidates WHERE shot_id = ?", (shot_id,)).fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM candidates WHERE shot_id = ?", (shot_id,)).fetchone()[0], 2)
             self.assertEqual(
                 db.execute("SELECT state FROM jobs WHERE shot_id = ? AND kind = 'draft'", (shot_id,)).fetchone()[0],
                 "运行中",
             )
+
+    def test_missing_or_corrupt_manifest_baseline_never_submits_or_trusts_recovered_old_manifest(self) -> None:
+        sections = [self.approve_section(self.create_section(title)) for title in ("缺失基线", "损坏基线")]
+        applied = self.apply(self.preview())["sync"]["applied_snapshot"]
+        shots = {item["section_id"]: item["shot_id"] for item in applied}
+        for section, baseline_error in zip(
+            sections,
+            (HTTPException(404, "missing baseline"), HTTPException(502, "corrupt baseline")),
+        ):
+            shot_id = shots[section["id"]]
+            _, _, validation = self.capture_generate_validation(shot_id)
+            with (
+                patch.object(studio, "read_manifest", side_effect=baseline_error),
+                patch.object(studio, "run_h3") as adapter,
+            ):
+                with self.assertRaises(HTTPException) as rejected:
+                    studio.generate(
+                        shot_id,
+                        studio.GenerateRequest(
+                            confirm=True,
+                            dry_run=False,
+                            expected_validation_hash=validation["validation_input_hash"],
+                        ),
+                    )
+            self.assertIn(rejected.exception.status_code, {404, 502})
+            adapter.assert_not_called()
+            with closing(studio.connect()) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_generation_leases").fetchone()[0], 0)
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE shot_id = ? AND kind = 'draft'", (shot_id,)
+                ).fetchone()[0], 0)
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM candidates WHERE shot_id = ? AND source = 'h3'", (shot_id,)
+                ).fetchone()[0], 0)
+
+            old_manifest = self.empty_manifest(shot_id)
+            old_manifest["candidates"] = [{"id": "draft-001", "prompt_id": "old-prompt", "status": "running"}]
+            with (
+                patch.object(studio, "read_manifest", return_value=old_manifest),
+                patch.object(studio, "run_h3", side_effect=studio.H3AdapterError(504, "unknown", process_started=True)) as adapter,
+            ):
+                with self.assertRaises(studio.H3AdapterError):
+                    studio.generate(
+                        shot_id,
+                        studio.GenerateRequest(
+                            confirm=True,
+                            dry_run=False,
+                            expected_validation_hash=validation["validation_input_hash"],
+                        ),
+                    )
+            # Recovery of an old manifest is merely the next safe baseline; it
+            # must never be imported as this failed call's submitted result.
+            self.assertEqual(adapter.call_count, 1)
+            with patch.object(studio, "read_manifest", return_value=old_manifest):
+                reconciled = studio.sync_shot(shot_id)
+            self.assertEqual(reconciled["state"], "待人工对账")
+            with closing(studio.connect()) as db:
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM candidates WHERE shot_id = ? AND source = 'h3'", (shot_id,)
+                ).fetchone()[0], 0)
+
+    def test_adapter_start_boundaries_set_retry_safe_only_before_process_creation(self) -> None:
+        original_script = studio.H3_SCRIPT
+        fake_script = Path(self.temp_dir.name) / "fake-h3.py"
+        fake_script.write_text("# controlled fake adapter\n", encoding="utf-8")
+        try:
+            studio.H3_SCRIPT = Path(self.temp_dir.name) / "missing-h3.py"
+            with self.assertRaises(studio.H3AdapterError) as missing:
+                studio.run_h3(["draft"])
+            self.assertFalse(missing.exception.process_started)
+
+            studio.H3_SCRIPT = fake_script
+            with patch.object(studio.subprocess, "run", side_effect=OSError("controlled spawn failure")):
+                with self.assertRaises(studio.H3AdapterError) as spawn:
+                    studio.run_h3(["draft"])
+            self.assertFalse(spawn.exception.process_started)
+            with patch.object(studio.subprocess, "run", return_value=SimpleNamespace(returncode=7, stderr="bad", stdout="")):
+                with self.assertRaises(studio.H3AdapterError) as nonzero:
+                    studio.run_h3(["draft"])
+            self.assertTrue(nonzero.exception.process_started)
+            with patch.object(
+                studio.subprocess,
+                "run",
+                side_effect=studio.subprocess.TimeoutExpired(cmd=["fake"], timeout=90),
+            ):
+                with self.assertRaises(studio.H3AdapterError) as timeout:
+                    studio.run_h3(["draft"])
+            self.assertTrue(timeout.exception.process_started)
+        finally:
+            studio.H3_SCRIPT = original_script
+
+        sections = [self.approve_section(self.create_section(title)) for title in (
+            "脚本缺失", "创建失败", "非零退出", "执行超时",
+        )]
+        applied = self.apply(self.preview())["sync"]["applied_snapshot"]
+        shots = {item["section_id"]: item["shot_id"] for item in applied}
+        cases = (
+            studio.H3AdapterError(503, "script missing", process_started=False),
+            studio.H3AdapterError(503, "spawn failed", process_started=False),
+            studio.H3AdapterError(502, "nonzero exit", process_started=True),
+            studio.H3AdapterError(504, "timeout", process_started=True),
+        )
+        for section, failure in zip(sections, cases):
+            shot_id = shots[section["id"]]
+            _, _, validation = self.capture_generate_validation(shot_id)
+            with patch.object(studio, "run_h3", side_effect=failure):
+                with self.assertRaises(studio.H3AdapterError):
+                    studio.generate(
+                        shot_id,
+                        studio.GenerateRequest(
+                            confirm=True,
+                            dry_run=False,
+                            expected_validation_hash=validation["validation_input_hash"],
+                        ),
+                    )
+            with closing(studio.connect()) as db:
+                job = db.execute(
+                    "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1", (shot_id,)
+                ).fetchone()
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_generation_leases").fetchone()[0], 0)
+            if failure.process_started:
+                self.assertEqual(job["state"], "提交状态未知")
+                self.assertEqual(job["retry_safe"], 0)
+                self.assertFalse(job["completed_at"])
+            else:
+                self.assertEqual(job["state"], "提交失败")
+                self.assertEqual(job["retry_safe"], 1)
+                self.assertTrue(job["completed_at"])
+                # Safe pre-spawn failures are explicitly retryable and do not block a repaired attempt.
+                with patch.object(studio, "run_h3", side_effect=failure) as retry_adapter:
+                    with self.assertRaises(studio.H3AdapterError):
+                        studio.generate(
+                            shot_id,
+                            studio.GenerateRequest(
+                                confirm=True,
+                                dry_run=False,
+                                expected_validation_hash=validation["validation_input_hash"],
+                            ),
+                        )
+                retry_adapter.assert_called_once()
+
+    def test_manual_reconciliation_is_sticky_auditable_and_requires_cas(self) -> None:
+        self.approve_section(self.create_section("人工对账保持"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        _, _, validation = self.capture_generate_validation(shot_id)
+        with patch.object(studio, "run_h3", side_effect=studio.H3AdapterError(504, "unknown", process_started=True)):
+            with self.assertRaises(studio.H3AdapterError):
+                studio.generate(
+                    shot_id,
+                    studio.GenerateRequest(
+                        confirm=True,
+                        dry_run=False,
+                        expected_validation_hash=validation["validation_input_hash"],
+                    ),
+                )
+        with patch.object(studio, "read_manifest", return_value=self.empty_manifest(shot_id)):
+            manual = studio.sync_shot(shot_id)
+        self.assertEqual(manual["state"], "待人工对账")
+        with patch.object(studio, "refresh_h3_project") as refresh:
+            first = studio.sync_shot(shot_id)
+            second = studio.sync_shot(shot_id)
+        self.assertEqual(first["state"], "待人工对账")
+        self.assertEqual(second["state"], "待人工对账")
+        refresh.assert_not_called()
+        with patch.object(studio, "run_h3") as adapter:
+            ordinary_sync = studio.refresh_h3_project(shot_id, studio.h3_project_for_shot(shot_id))
+        self.assertEqual(ordinary_sync["state"], "待人工对账")
+        adapter.assert_not_called()
+        job = next(item for item in studio.get_jobs() if item["kind"] == "draft")
+        revision = int(job["reconciliation_revision"])
+        resolved = studio.resolve_reconciliation(
+            shot_id,
+            studio.ReconciliationResolutionRequest(
+                action="confirm_not_submitted",
+                expected_revision=revision,
+                note="已在 ComfyUI 历史与队列中人工确认不存在该任务",
+                resolved_by="human:qa",
+                confirm=True,
+            ),
+        )
+        self.assertTrue(resolved["ok"])
+        self.assertEqual(resolved["job"]["state"], "提交失败")
+        self.assertEqual(resolved["job"]["retry_safe"], 1)
+        audit = json.loads(resolved["job"]["reconciliation_snapshot"])["manual_resolutions"][-1]
+        self.assertEqual(audit["resolved_by"], "human:qa")
+        self.assertIn("ComfyUI", audit["note"])
+        with self.assertRaises(HTTPException) as stale:
+            studio.resolve_reconciliation(
+                shot_id,
+                studio.ReconciliationResolutionRequest(
+                    action="confirm_not_submitted",
+                    expected_revision=revision,
+                    note="陈旧标签页重复确认",
+                    resolved_by="human:stale",
+                    confirm=True,
+                ),
+            )
+        self.assertEqual(stale.exception.status_code, 409)
+
+    def test_reconciliation_cas_prevents_late_error_or_success_from_overwriting_terminal(self) -> None:
+        self.approve_section(self.create_section("对账 CAS 竞态"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        _, _, validation = self.capture_generate_validation(shot_id)
+        studio.update_shot(shot_id, studio.ShotPatch(candidate_count=1))
+        _, _, validation = self.capture_generate_validation(shot_id)
+        manifest = {
+            "project": studio.h3_project_for_shot(shot_id),
+            "candidates": [{"id": "draft-001", "prompt_id": "prompt-cas", "status": "queued"}],
+            "promotions": [],
+        }
+        entered = threading.Event()
+        release = threading.Event()
+        original_sync = studio.sync_manifest_to_db
+
+        def delayed_sync(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return original_sync(*args, **kwargs)
+
+        with (
+            patch.object(studio, "run_h3", return_value=SimpleNamespace(
+                stdout="已排队 draft-001 seed=1 prompt_id=prompt-cas", stderr="", returncode=0,
+            )),
+            patch.object(studio, "read_manifest", side_effect=[self.empty_manifest(shot_id), manifest]),
+            patch.object(studio, "comfy_queue_evidence", return_value={
+                "available": True,
+                "running_prompt_ids": [],
+                "pending_prompt_ids": ["prompt-cas"],
+            }),
+            patch.object(studio, "sync_manifest_to_db", side_effect=delayed_sync),
+        ):
+            outcome: dict[str, object] = {}
+
+            def submit() -> None:
+                outcome["result"] = studio.generate(
+                    shot_id,
+                    studio.GenerateRequest(
+                        confirm=True,
+                        dry_run=False,
+                        expected_validation_hash=validation["validation_input_hash"],
+                    ),
+                )
+
+            worker = threading.Thread(target=submit)
+            worker.start()
+            self.assertTrue(entered.wait(3))
+            current = next(item for item in studio.get_jobs() if item["kind"] == "draft")
+            trusted = studio.update_reconciliation_job(
+                current,
+                "待人工对账",
+                "并发人工请求先写入可信终态",
+                json.loads(current["reconciliation_snapshot"]),
+                completed=True,
+            )
+            late_error = studio.update_reconciliation_job(
+                current,
+                "待人工对账",
+                "迟到错误证据不得覆盖",
+                {"late_error": True},
+                completed=True,
+            )
+            self.assertEqual(late_error["message"], trusted["message"])
+            self.assertEqual(late_error["reconciliation_revision"], trusted["reconciliation_revision"])
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        final = next(item for item in studio.get_jobs() if item["kind"] == "draft")
+        self.assertEqual(final["state"], "待人工对账")
+        self.assertEqual(final["message"], trusted["message"])
+        self.assertEqual(final["reconciliation_revision"], trusted["reconciliation_revision"])
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM candidates WHERE shot_id = ? AND source = 'h3'", (shot_id,)
+            ).fetchone()[0], 0)
 
     def test_generate_dry_run_rejects_shot_change_during_adapter_without_partial_result(self) -> None:
         self.approve_section(self.create_section("运行中改镜头"))

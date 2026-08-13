@@ -873,6 +873,7 @@ export type Job = {
   prompt_ids: string[]
   retry_safe?: number
   reconciliation_snapshot?: string
+  reconciliation_revision?: number
 }
 
 export type ProductionBatchItem = {
