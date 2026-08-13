@@ -138,6 +138,7 @@ EXPORT_WORKER_ID = f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 RECONCILING_JOB_STATES = ("提交中", "已提交待对账", "提交状态未知")
 ACTIVE_JOB_STATES = (*RECONCILING_JOB_STATES, "已提交", "排队中", "运行中")
 SUBMISSION_BLOCKING_JOB_STATES = (*ACTIVE_JOB_STATES, "待人工对账")
+DRAFT_TERMINAL_STATES = ("完成", "失败", "提交失败")
 ASSET_LIMITS = {"image": 50 * 1024 * 1024, "video": 2 * 1024 * 1024 * 1024, "audio": 250 * 1024 * 1024}
 ASSET_EXTENSIONS = {
     "image": {".jpg", ".jpeg", ".png", ".webp"},
@@ -1070,15 +1071,24 @@ def draft_attempt_marker(shot_id: str, db: sqlite3.Connection | None = None) -> 
     return (int(record["id"]), str(record["state"]), int(record["reconciliation_revision"] or 0))
 
 
-def legacy_active_draft_jobs(shot_id: str) -> list[dict[str, Any]]:
-    placeholders = ",".join("?" for _ in ACTIVE_JOB_STATES)
-    return rows(
-        f"""SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
-        AND state IN ({placeholders})
-        AND (candidate_ids IS NULL OR candidate_ids = '' OR candidate_ids = '[]')
-        ORDER BY id""",
-        (shot_id, *ACTIVE_JOB_STATES),
-    )
+def legacy_draft_jobs_needing_recovery(shot_id: str) -> list[dict[str, Any]]:
+    """Return every unaudited draft attempt whose persisted candidate set is missing.
+
+    Older releases did not persist ``candidate_ids``.  This applies equally to
+    active and terminal jobs: allowing a terminal row to fall through to the
+    no-job manifest importer would merge unrelated historical attempts.  A row
+    already placed in manual reconciliation is excluded because its failed
+    recovery has been audited and it must remain stable until a human resolves
+    it.
+    """
+    return [
+        job for job in rows(
+            """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
+            AND state != '待人工对账' ORDER BY id""",
+            (shot_id,),
+        )
+        if not string_list(job.get("candidate_ids"))
+    ]
 
 
 def legacy_recovery_result(project: str, job: dict[str, Any]) -> dict[str, Any]:
@@ -1113,9 +1123,8 @@ def recover_legacy_draft_job(
             completed=True,
         )
         return legacy_recovery_result(project, resolved)
-    reserved_candidate_ids.update(attempt_ids)
     try:
-        return sync_manifest_to_db(
+        result = sync_manifest_to_db(
             str(job["shot_id"]),
             project,
             manifest,
@@ -1124,9 +1133,13 @@ def recover_legacy_draft_job(
             reconciliation_evidence=evidence,
             expected_job_state=str(job["state"]),
             expected_job_revision=int(job.get("reconciliation_revision") or 0),
+            preserve_terminal_state=str(job["state"]) in DRAFT_TERMINAL_STATES,
         )
+        reserved_candidate_ids.update(attempt_ids)
+        return result
     except ReconciliationConflict:
         current = row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
+        reserved_candidate_ids.update(string_list(current.get("candidate_ids")))
         return legacy_recovery_result(project, current)
 
 
@@ -1134,7 +1147,7 @@ def recover_all_legacy_draft_jobs(
     shot_id: str, project: str, manifest: dict[str, Any], *, skip_job_id: int | None = None,
 ) -> list[dict[str, Any]]:
     legacy_jobs = [
-        job for job in legacy_active_draft_jobs(shot_id)
+        job for job in legacy_draft_jobs_needing_recovery(shot_id)
         if skip_job_id is None or int(job["id"]) != skip_job_id
     ]
     if not legacy_jobs:
@@ -1447,6 +1460,7 @@ def sync_manifest_to_db(
     expected_job_state: str | None = None,
     expected_job_revision: int | None = None,
     include_promotions: bool = False,
+    preserve_terminal_state: bool = False,
 ) -> dict[str, Any]:
     records = manifest.get("candidates") or []
     tracked_ids = set(record_ids) if record_ids is not None else None
@@ -1611,6 +1625,16 @@ def sync_manifest_to_db(
             message = f"{completed_count}/{total_count} 条完成，等待 ComfyUI"
             completed_at = None
 
+        # A migrated terminal job is historical evidence, not a live pollable
+        # attempt. Persist its exact candidate ownership without changing the
+        # trusted outcome recorded before the schema upgrade.
+        if preserve_terminal_state and expected_job is not None:
+            job_state = str(expected_job["state"])
+            message = str(expected_job["message"] or message)
+            completed_at = expected_job["completed_at"] or utc_now()
+            if job_state in {"失败", "提交失败"}:
+                shot_state = "生成失败"
+
         prompt_ids = [record.get("prompt_id") for record in tracked_records if record.get("prompt_id")]
         if expected_job is not None and len(prompt_ids) < total_count:
             persisted_prompt_ids = string_list(expected_job["prompt_ids"])
@@ -1694,7 +1718,7 @@ def refresh_h3_project(
             "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1",
             (shot_id,),
         )
-    pending_legacy_jobs = legacy_active_draft_jobs(shot_id)
+    pending_legacy_jobs = legacy_draft_jobs_needing_recovery(shot_id)
     manual = latest if latest and latest.get("state") == "待人工对账" else row(
         """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
         AND state = '待人工对账' ORDER BY id DESC LIMIT 1""",
@@ -1732,11 +1756,8 @@ def refresh_h3_project(
         }
     attempt_ids = draft_attempt_candidate_ids(latest) if latest else []
     attempt_evidence = job_reconciliation_evidence(latest) if latest else {}
-    legacy_recovery_needed = (
-        latest is not None
-        and latest.get("state") in ACTIVE_JOB_STATES
-        and not attempt_ids
-    )
+    pending_legacy_ids = {int(job["id"]) for job in pending_legacy_jobs}
+    legacy_recovery_needed = latest is not None and int(latest["id"]) in pending_legacy_ids
     if latest and latest.get("retry_safe"):
         return {
             "project": project,
@@ -1750,7 +1771,7 @@ def refresh_h3_project(
     try:
         manifest = read_manifest(project)
     except HTTPException as exc:
-        legacy_jobs = legacy_active_draft_jobs(shot_id)
+        legacy_jobs = legacy_draft_jobs_needing_recovery(shot_id)
         if not legacy_jobs and not legacy_recovery_needed:
             raise
         recovery_results: list[dict[str, Any]] = []
@@ -1844,6 +1865,11 @@ def refresh_h3_project(
                 "completed": 0,
                 "total": len(draft_attempt_candidate_ids(current)),
             }
+    # Full-manifest import is only a compatibility path for shots that truly
+    # predate persisted draft jobs. Any job row establishes an attempt boundary;
+    # losing that boundary must fail closed instead of importing other attempts.
+    if latest is not None:
+        raise HTTPException(409, "该镜头存在未绑定候选集合的 draft 任务，禁止全量 manifest 同步")
     return sync_manifest_to_db(shot_id, project, manifest)
 
 
@@ -4292,7 +4318,8 @@ def sync_shot(shot_id: str) -> dict[str, Any]:
         "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1",
         (shot_id,),
     )
-    if latest and latest["state"] == "待人工对账":
+    pending_legacy_jobs = legacy_draft_jobs_needing_recovery(shot_id)
+    if latest and latest["state"] == "待人工对账" and not pending_legacy_jobs:
         return {
             "ok": False,
             "state": latest["state"],
@@ -4316,7 +4343,8 @@ def sync_shot(shot_id: str) -> dict[str, Any]:
             "message": reconciled["message"],
             "prompt_ids": string_list(reconciled.get("prompt_ids")),
         }
-    return {"ok": True, **refresh_h3_project(shot_id, project, attempt_job=latest)}
+    refreshed = refresh_h3_project(shot_id, project, attempt_job=latest)
+    return {"ok": refreshed["state"] != "待人工对账", **refreshed}
 
 
 @app.post("/api/shots/{shot_id}/reconciliation/resolve")
