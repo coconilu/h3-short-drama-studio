@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -128,6 +129,19 @@ class CreativeStoryboardContractTests(unittest.TestCase):
             "POST",
             StoryboardApplyRequest(plan_hash=preview["plan_hash"], confirm=True, confirmed_by="human:test"),
         )
+
+    def bind_managed_image(self, shot_id: str, asset_id: str) -> None:
+        asset_path = studio.ASSET_ROOT / f"{asset_id}.png"
+        asset_path.write_bytes(f"fake-{asset_id}".encode())
+        with closing(studio.connect()) as db:
+            db.execute(
+                """INSERT INTO assets
+                (id, project_id, kind, name, description, preview, locked, source, managed_path, media_type)
+                VALUES (?, ?, '角色参考', ?, '', '', 0, 'managed', ?, 'image')""",
+                (asset_id, self.project["id"], asset_id, str(asset_path)),
+            )
+            db.commit()
+        studio.bind_shot_reference(shot_id, studio.ReferenceCreate(asset_id=asset_id, role="identity"))
 
     def test_structured_section_approve_return_and_immutable_versions(self) -> None:
         section = self.create_section("门口迟疑")
@@ -464,11 +478,120 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         self.assertIn("进行中的 H3 dry-run", race["preview"]["rows"][0]["protected_reasons"])
         with closing(studio.connect()) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
-            self.assertEqual(
-                db.execute("SELECT COUNT(*) FROM jobs WHERE shot_id = ? AND kind = 'validation'", (shot_id,)).fetchone()[0],
-                1,
-            )
+            validation = db.execute(
+                "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'validation'", (shot_id,)
+            ).fetchone()
+            self.assertIsNotNone(validation)
+            self.assertEqual(validation["plan_hash"], result["prompt_plan_hash"])
+            frozen = json.loads(validation["source_snapshot"])
+            self.assertEqual(frozen["shot"]["id"], shot_id)
+            self.assertEqual(frozen["references"], [])
             self.assertIsNotNone(db.execute("SELECT id FROM shots WHERE id = ?", (shot_id,)).fetchone())
+
+    def test_generate_dry_run_rejects_shot_change_during_adapter_without_partial_result(self) -> None:
+        self.approve_section(self.create_section("运行中改镜头"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+
+        def change_shot(*_args, **_kwargs):
+            studio.update_shot(
+                shot_id,
+                studio.ShotPatch(prompt="changed while adapter runs", status="人工修改中"),
+            )
+            return SimpleNamespace(stdout='{"ok": true}')
+
+        with patch.object(studio, "run_h3", side_effect=change_shot):
+            with self.assertRaises(HTTPException) as conflict:
+                studio.generate(shot_id, studio.GenerateRequest(confirm=False, dry_run=True))
+
+        self.assertEqual(conflict.exception.status_code, 409)
+        current = studio.require_active_shot(shot_id)
+        self.assertEqual(current["prompt"], "changed while adapter runs")
+        self.assertEqual(current["status"], "人工修改中")
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs WHERE shot_id = ?", (shot_id,)).fetchone()[0], 0)
+
+    def test_generate_dry_run_rejects_reference_change_during_adapter_without_partial_result(self) -> None:
+        self.approve_section(self.create_section("运行中改引用"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        original_status = studio.require_active_shot(shot_id)["status"]
+
+        def bind_reference(*_args, **_kwargs):
+            self.bind_managed_image(shot_id, "race-reference")
+            return SimpleNamespace(stdout='{"ok": true}')
+
+        with patch.object(studio, "run_h3", side_effect=bind_reference):
+            with self.assertRaises(HTTPException) as conflict:
+                studio.generate(shot_id, studio.GenerateRequest(confirm=False, dry_run=True))
+
+        self.assertEqual(conflict.exception.status_code, 409)
+        self.assertEqual(studio.require_active_shot(shot_id)["status"], original_status)
+        self.assertEqual(len(studio.get_shot_references(shot_id)), 1)
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs WHERE shot_id = ?", (shot_id,)).fetchone()[0], 0)
+
+    def test_batch_submit_rejects_reference_change_even_when_timestamps_are_equal(self) -> None:
+        self.approve_section(self.create_section("校验后改引用"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        with patch.object(studio, "run_h3", return_value=SimpleNamespace(stdout='{"ok": true}')):
+            studio.generate(shot_id, studio.GenerateRequest(confirm=False, dry_run=True))
+        self.bind_managed_image(shot_id, "post-validation-reference")
+        with closing(studio.connect()) as db:
+            validation_time = db.execute(
+                "SELECT updated_at FROM jobs WHERE shot_id = ? AND kind = 'validation' ORDER BY id DESC LIMIT 1",
+                (shot_id,),
+            ).fetchone()["updated_at"]
+            db.execute("UPDATE shots SET updated_at = ? WHERE id = ?", (validation_time, shot_id))
+            db.commit()
+
+        with patch.object(studio, "run_h3") as adapter:
+            with self.assertRaises(HTTPException) as conflict:
+                studio.batch_submit(studio.BatchGenerationRequest(shot_ids=[shot_id], confirm=True))
+        self.assertEqual(conflict.exception.status_code, 409)
+        adapter.assert_not_called()
+        with closing(studio.connect()) as db:
+            times = db.execute(
+                """SELECT shots.updated_at AS shot_time, jobs.updated_at AS validation_time
+                FROM shots JOIN jobs ON jobs.shot_id = shots.id
+                WHERE shots.id = ? AND jobs.kind = 'validation' ORDER BY jobs.id DESC LIMIT 1""",
+                (shot_id,),
+            ).fetchone()
+            self.assertEqual(times["shot_time"], times["validation_time"])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs WHERE shot_id = ?", (shot_id,)).fetchone()[0], 1)
+
+    def test_batch_submit_rejects_bible_change_across_timestamp_ticks(self) -> None:
+        self.approve_section(self.create_section("校验后改角色"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        with patch.object(studio, "run_h3", return_value=SimpleNamespace(stdout='{"ok": true}')):
+            studio.generate(shot_id, studio.GenerateRequest(confirm=False, dry_run=True))
+        character = self.call_content(
+            "/api/creative-planning/characters",
+            "POST",
+            CharacterCreate(
+                name="新角色", identity="调查员", appearance="短发、红衣",
+                voice="低声线", goal="找到真相",
+            ),
+        )["characters"][0]
+        self.call_content(
+            "/api/creative-planning/characters/{character_id}",
+            "PATCH",
+            character["id"],
+            CharacterUpdate(base_revision=character["revision"], status="approved", source="human:test-bible-change"),
+        )
+        with closing(studio.connect()) as db:
+            db.execute("UPDATE jobs SET updated_at = '2026-08-14T00:00:00.000001+00:00' WHERE shot_id = ?", (shot_id,))
+            db.execute("UPDATE shots SET updated_at = '2026-08-14T00:00:00+00:00' WHERE id = ?", (shot_id,))
+            db.commit()
+
+        with patch.object(studio, "run_h3") as adapter:
+            with self.assertRaises(HTTPException) as conflict:
+                studio.batch_submit(studio.BatchGenerationRequest(shot_ids=[shot_id], confirm=True))
+        self.assertEqual(conflict.exception.status_code, 409)
+        adapter.assert_not_called()
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs WHERE shot_id = ?", (shot_id,)).fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM production_bible_entries WHERE status = 'locked'").fetchone()[0], 2)
 
     def test_generate_dry_run_delete_wins_before_lease_with_controlled_conflict(self) -> None:
         section = self.approve_section(self.create_section("删除先于校验"))

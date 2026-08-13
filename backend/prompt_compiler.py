@@ -480,6 +480,14 @@ def end_validation_lease(db_path: Path, lease_id: str) -> None:
         db.commit()
 
 
+def current_plan_input(db: sqlite3.Connection, shot_id: str, project_id: str) -> dict[str, Any] | None:
+    """Read the canonical H3 input while the caller holds its write transaction."""
+    snapshot = _current_source_snapshot(db, shot_id, project_id)
+    if snapshot is None:
+        return None
+    return {"plan_hash": _json_hash(snapshot), "source_snapshot": snapshot}
+
+
 def _current_source_snapshot(db: sqlite3.Connection, shot_id: str, project_id: str) -> dict[str, Any] | None:
     shot_row = db.execute(
         "SELECT * FROM shots WHERE id = ? AND project_id = ?", (shot_id, project_id)

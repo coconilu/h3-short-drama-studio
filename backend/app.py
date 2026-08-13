@@ -36,6 +36,7 @@ try:
         approve_plan,
         begin_validation_lease,
         compile_prompt_plan,
+        current_plan_input,
         end_validation_lease,
         init_prompt_schema,
         mark_prompt_plans_stale,
@@ -64,6 +65,7 @@ except ImportError:  # Support `uvicorn app:app` when backend is the working dir
         approve_plan,
         begin_validation_lease,
         compile_prompt_plan,
+        current_plan_input,
         end_validation_lease,
         init_prompt_schema,
         mark_prompt_plans_stale,
@@ -217,6 +219,8 @@ def migrate_db(db: sqlite3.Connection) -> None:
         ("prompt_ids", "TEXT NOT NULL DEFAULT '[]'"),
         ("updated_at", "TEXT"),
         ("completed_at", "TEXT"),
+        ("plan_hash", "TEXT"),
+        ("source_snapshot", "TEXT NOT NULL DEFAULT '{}'"),
     ):
         ensure_column(db, "jobs", name, definition)
     for name, definition in (
@@ -339,7 +343,9 @@ def init_db() -> None:
               h3_project TEXT,
               prompt_ids TEXT NOT NULL DEFAULT '[]',
               updated_at TEXT,
-              completed_at TEXT
+              completed_at TEXT,
+              plan_hash TEXT,
+              source_snapshot TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS promotions (
               id TEXT PRIMARY KEY,
@@ -3184,26 +3190,37 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
             prompt_plan_hash=compiled["plan_hash"],
         )
     else:
-        project, arguments, plan = build_h3_arguments(shot, request.dry_run)
+        project, arguments, plan = build_h3_arguments(
+            shot,
+            request.dry_run,
+            prompt_plan_hash=compiled["plan_hash"],
+        )
     if request.dry_run:
         lease_id = begin_validation_lease(DB_PATH, compiled)
         try:
             completed = run_h3(arguments, timeout=90)
             with closing(connect()) as db:
                 db.execute("BEGIN IMMEDIATE")
-                if not db.execute("SELECT 1 FROM shots WHERE id = ?", (shot_id,)).fetchone():
+                current_input = current_plan_input(db, shot_id, shot["project_id"])
+                if current_input is None:
                     raise HTTPException(409, "H3 dry-run 返回时镜头已删除，未保存校验结果")
+                if current_input["plan_hash"] != compiled["plan_hash"]:
+                    raise HTTPException(409, "H3 dry-run 返回时镜头、引用素材或生产圣经已变化，未保存过期校验")
+                now = utc_now()
                 db.execute(
                     """INSERT INTO jobs
-                    (shot_id, kind, state, message, created_at, updated_at, h3_project)
-                    VALUES (?, 'validation', '校验通过', '节点图已构建，未占用 GPU', ?, ?, ?)""",
-                    (shot_id, utc_now(), utc_now(), project),
+                    (shot_id, kind, state, message, created_at, updated_at, h3_project, plan_hash, source_snapshot)
+                    VALUES (?, 'validation', '校验通过', '节点图已构建，未占用 GPU', ?, ?, ?, ?, ?)""",
+                    (
+                        shot_id, now, now, project, compiled["plan_hash"],
+                        json.dumps(compiled["source_snapshot"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    ),
                 )
                 db.execute(
                     """UPDATE shots SET
                     status = CASE WHEN status IN ('生成中', '待审片', '已定稿') THEN status ELSE '可生成' END,
                     updated_at = ? WHERE id = ?""",
-                    (utc_now(), shot_id),
+                    (now, shot_id),
                 )
                 db.commit()
             try:
@@ -3295,14 +3312,23 @@ def batch_submit(request: BatchGenerationRequest) -> dict[str, Any]:
     shots = ordered_active_shots(request.shot_ids)
     validation_issues: list[dict[str, str]] = []
     for shot in shots:
+        current = compile_prompt_plan(DB_PATH, shot["id"])
         validation = row(
-            """SELECT state, updated_at FROM jobs
+            """SELECT state, plan_hash, source_snapshot FROM jobs
             WHERE shot_id = ? AND kind = 'validation'
             ORDER BY id DESC LIMIT 1""",
             (shot["id"],),
         )
-        if not validation or validation["state"] != "校验通过" or validation["updated_at"] < shot["updated_at"]:
-            validation_issues.append({"shot_id": shot["id"], "message": "镜头配置变更后尚未通过 dry-run"})
+        if (
+            not validation
+            or validation["state"] != "校验通过"
+            or not validation.get("plan_hash")
+            or validation["plan_hash"] != current["plan_hash"]
+        ):
+            validation_issues.append({
+                "shot_id": shot["id"],
+                "message": "镜头、引用素材或生产圣经与最近成功 dry-run 不一致",
+            })
     if validation_issues:
         raise HTTPException(409, {"message": "批量提交前检查未通过", "issues": validation_issues})
 
