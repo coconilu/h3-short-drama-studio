@@ -3185,34 +3185,43 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
         )
     else:
         project, arguments, plan = build_h3_arguments(shot, request.dry_run)
-    completed = run_h3(arguments, timeout=90)
     if request.dry_run:
-        with closing(connect()) as db:
-            db.execute(
-                """INSERT INTO jobs
-                (shot_id, kind, state, message, created_at, updated_at, h3_project)
-                VALUES (?, 'validation', '校验通过', '节点图已构建，未占用 GPU', ?, ?, ?)""",
-                (shot_id, utc_now(), utc_now(), project),
-            )
-            db.execute(
-                """UPDATE shots SET
-                status = CASE WHEN status IN ('生成中', '待审片', '已定稿') THEN status ELSE '可生成' END,
-                updated_at = ? WHERE id = ?""",
-                (utc_now(), shot_id),
-            )
-            db.commit()
+        lease_id = begin_validation_lease(DB_PATH, compiled)
         try:
-            adapter_output: Any = json.loads(completed.stdout.strip())
-        except json.JSONDecodeError:
-            adapter_output = completed.stdout.strip()
-        return {
-            "ok": True,
-            "state": "校验通过",
-            "message": "节点图已构建，未占用 GPU",
-            "h3_project": project,
-            **plan,
-            "adapter_output": adapter_output,
-        }
+            completed = run_h3(arguments, timeout=90)
+            with closing(connect()) as db:
+                db.execute("BEGIN IMMEDIATE")
+                if not db.execute("SELECT 1 FROM shots WHERE id = ?", (shot_id,)).fetchone():
+                    raise HTTPException(409, "H3 dry-run 返回时镜头已删除，未保存校验结果")
+                db.execute(
+                    """INSERT INTO jobs
+                    (shot_id, kind, state, message, created_at, updated_at, h3_project)
+                    VALUES (?, 'validation', '校验通过', '节点图已构建，未占用 GPU', ?, ?, ?)""",
+                    (shot_id, utc_now(), utc_now(), project),
+                )
+                db.execute(
+                    """UPDATE shots SET
+                    status = CASE WHEN status IN ('生成中', '待审片', '已定稿') THEN status ELSE '可生成' END,
+                    updated_at = ? WHERE id = ?""",
+                    (utc_now(), shot_id),
+                )
+                db.commit()
+            try:
+                adapter_output: Any = json.loads(completed.stdout.strip())
+            except json.JSONDecodeError:
+                adapter_output = completed.stdout.strip()
+            return {
+                "ok": True,
+                "state": "校验通过",
+                "message": "节点图已构建，未占用 GPU",
+                "h3_project": project,
+                **plan,
+                "adapter_output": adapter_output,
+            }
+        finally:
+            end_validation_lease(DB_PATH, lease_id)
+
+    completed = run_h3(arguments, timeout=90)
 
     manifest = read_manifest(project)
     prompt_ids = [record.get("prompt_id") for record in manifest.get("candidates") or [] if record.get("prompt_id")]

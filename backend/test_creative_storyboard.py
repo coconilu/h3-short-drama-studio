@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -432,6 +433,104 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         with closing(studio.connect()) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
             self.assertIsNotNone(db.execute("SELECT id FROM shots WHERE id = ?", (shot_id,)).fetchone())
+
+    def test_generate_dry_run_lease_blocks_sync_delete_until_result_is_persisted(self) -> None:
+        section = self.approve_section(self.create_section("主工作台校验"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        current = self.call_content("/api/creative-planning", "GET")["chapters"][0]["sections"][0]
+        self.call_content(
+            "/api/creative-planning/sections/{section_id}/archive", "POST", section["id"],
+            RevisionBase(base_revision=current["revision"], source="human:test-generate-race"),
+        )
+        race: dict[str, object] = {}
+
+        def attempt_delete_while_adapter_runs(*_args, **_kwargs):
+            protected = self.preview()
+            race["preview"] = protected
+            before = self._storyboard_mutation_state()
+            with self.assertRaises(HTTPException) as blocked:
+                self.apply(protected)
+            race["status_code"] = blocked.exception.status_code
+            race["zero_partial_write"] = before == self._storyboard_mutation_state()
+            return SimpleNamespace(stdout='{"ok": true}')
+
+        with patch.object(studio, "run_h3", side_effect=attempt_delete_while_adapter_runs):
+            result = studio.generate(shot_id, studio.GenerateRequest(confirm=False, dry_run=True))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(race["status_code"], 409)
+        self.assertTrue(race["zero_partial_write"])
+        self.assertEqual(race["preview"]["summary"]["protected"], 1)
+        self.assertIn("进行中的 H3 dry-run", race["preview"]["rows"][0]["protected_reasons"])
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM jobs WHERE shot_id = ? AND kind = 'validation'", (shot_id,)).fetchone()[0],
+                1,
+            )
+            self.assertIsNotNone(db.execute("SELECT id FROM shots WHERE id = ?", (shot_id,)).fetchone())
+
+    def test_generate_dry_run_delete_wins_before_lease_with_controlled_conflict(self) -> None:
+        section = self.approve_section(self.create_section("删除先于校验"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        real_compile = studio.compile_prompt_plan
+        deleted: dict[str, bool] = {"done": False}
+
+        def compile_then_delete(db_path, current_shot_id):
+            plan = real_compile(db_path, current_shot_id)
+            current = self.call_content("/api/creative-planning", "GET")["chapters"][0]["sections"][0]
+            self.call_content(
+                "/api/creative-planning/sections/{section_id}/archive", "POST", section["id"],
+                RevisionBase(base_revision=current["revision"], source="human:test-delete-wins"),
+            )
+            deletion = self.preview()
+            self.assertEqual(deletion["summary"]["delete"], 1)
+            self.apply(deletion)
+            deleted["done"] = True
+            return plan
+
+        with patch.object(studio, "compile_prompt_plan", side_effect=compile_then_delete), patch.object(studio, "run_h3") as adapter:
+            with self.assertRaises(HTTPException) as conflict:
+                studio.generate(shot_id, studio.GenerateRequest(confirm=False, dry_run=True))
+
+        self.assertTrue(deleted["done"])
+        self.assertEqual(conflict.exception.status_code, 409)
+        adapter.assert_not_called()
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs WHERE shot_id = ?", (shot_id,)).fetchone()[0], 0)
+            self.assertIsNone(db.execute("SELECT id FROM shots WHERE id = ?", (shot_id,)).fetchone())
+
+    def test_generate_and_batch_adapter_failures_leave_no_validation_lease_or_result(self) -> None:
+        self.approve_section(self.create_section("单镜失败"))
+        first_shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        with patch.object(studio, "run_h3", side_effect=RuntimeError("controlled generate failure")):
+            with self.assertRaisesRegex(RuntimeError, "controlled generate failure"):
+                studio.generate(first_shot_id, studio.GenerateRequest(confirm=False, dry_run=True))
+
+        second = self.approve_section(self.create_section("批量失败"))
+        second_shot_id = next(
+            item["shot_id"]
+            for item in self.apply(self.preview())["sync"]["applied_snapshot"]
+            if item["section_id"] == second["id"]
+        )
+        with patch.object(studio, "run_h3", side_effect=RuntimeError("controlled batch failure")):
+            with self.assertRaisesRegex(RuntimeError, "controlled batch failure"):
+                studio.batch_dry_run(studio.BatchGenerationRequest(shot_ids=[second_shot_id]))
+
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE kind = 'validation' AND shot_id IN (?, ?)",
+                    (first_shot_id, second_shot_id),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM shots WHERE id IN (?, ?)", (first_shot_id, second_shot_id)).fetchone()[0],
+                2,
+            )
 
     def test_each_shot_foreign_key_relation_protects_delete_with_zero_partial_writes(self) -> None:
         relation_factories = {
