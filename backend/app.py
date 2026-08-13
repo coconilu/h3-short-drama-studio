@@ -995,6 +995,72 @@ def draft_attempt_candidate_ids(job: dict[str, Any]) -> list[str]:
     return string_list(evidence.get("submitted_candidate_ids")) or string_list(evidence.get("expected_candidate_ids"))
 
 
+def job_reconciliation_evidence(job: dict[str, Any]) -> dict[str, Any]:
+    try:
+        evidence = json.loads(job.get("reconciliation_snapshot") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def match_legacy_attempt_by_prompt_ids(
+    job: dict[str, Any], project: str, manifest: Any,
+) -> tuple[list[str], dict[str, Any], str | None]:
+    checked_at = utc_now()
+    try:
+        raw_prompt_ids = json.loads(job.get("prompt_ids") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        raw_prompt_ids = None
+    recovery: dict[str, Any] = {
+        "strategy": "exact_prompt_id_match",
+        "checked_at": checked_at,
+        "expected_prompt_ids": raw_prompt_ids if isinstance(raw_prompt_ids, list) else [],
+        "matched": [],
+        "unmatched_prompt_ids": [],
+        "ambiguous_prompt_ids": {},
+    }
+    if (
+        not isinstance(raw_prompt_ids, list)
+        or not raw_prompt_ids
+        or not all(isinstance(value, str) and value for value in raw_prompt_ids)
+        or len(raw_prompt_ids) != len(set(raw_prompt_ids))
+    ):
+        recovery["status"] = "failed"
+        return [], recovery, "旧任务 prompt_ids 缺失、重复或格式无效"
+    try:
+        manifest_record = manifest_evidence_from_payload(project, manifest)
+    except HTTPException as exc:
+        recovery["status"] = "failed"
+        recovery["manifest_error"] = str(exc.detail)
+        return [], recovery, f"旧任务 manifest 无法验证：{exc.detail}"
+    recovery["manifest_hash"] = manifest_record["manifest_hash"]
+    recovery["manifest_candidate_ids"] = manifest_record["candidate_ids"]
+    candidates = manifest.get("candidates") or []
+    recovered_ids: list[str] = []
+    for prompt_id in raw_prompt_ids:
+        matches = [
+            str(record["id"])
+            for record in candidates
+            if record.get("prompt_id") == prompt_id and record.get("id")
+        ]
+        if not matches:
+            recovery["unmatched_prompt_ids"].append(prompt_id)
+        elif len(matches) > 1:
+            recovery["ambiguous_prompt_ids"][prompt_id] = matches
+        else:
+            recovered_ids.append(matches[0])
+            recovery["matched"].append({"prompt_id": prompt_id, "candidate_id": matches[0]})
+    if recovery["unmatched_prompt_ids"] or recovery["ambiguous_prompt_ids"]:
+        recovery["status"] = "failed"
+        return [], recovery, "旧任务 prompt_ids 无法对 manifest 做完整唯一匹配"
+    if len(recovered_ids) != len(raw_prompt_ids) or len(recovered_ids) != len(set(recovered_ids)):
+        recovery["status"] = "failed"
+        return [], recovery, "旧任务恢复出的 candidate set 不完整或不唯一"
+    recovery["status"] = "matched"
+    recovery["candidate_ids"] = recovered_ids
+    return recovered_ids, recovery, None
+
+
 def draft_attempt_marker(shot_id: str, db: sqlite3.Connection | None = None) -> tuple[int, str, int] | None:
     query = """SELECT id, state, reconciliation_revision FROM jobs
     WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1"""
@@ -1296,6 +1362,7 @@ def sync_manifest_to_db(
     reconciliation_evidence: dict[str, Any] | None = None,
     expected_job_state: str | None = None,
     expected_job_revision: int | None = None,
+    include_promotions: bool = False,
 ) -> dict[str, Any]:
     records = manifest.get("candidates") or []
     tracked_ids = set(record_ids) if record_ids is not None else None
@@ -1390,7 +1457,11 @@ def sync_manifest_to_db(
                 ),
             )
 
-        promotions_to_sync = (manifest.get("promotions") or []) if tracked_ids is None else []
+        promotions_to_sync = (
+            (manifest.get("promotions") or [])
+            if tracked_ids is None or include_promotions
+            else []
+        )
         for record in promotions_to_sync:
             external_id = str(record.get("id") or "")
             if not external_id:
@@ -1531,10 +1602,10 @@ def refresh_h3_project(
     project: str,
     *,
     attempt_job: dict[str, Any] | None = None,
-    include_all: bool = False,
+    include_promotions: bool = False,
 ) -> dict[str, Any]:
     latest = attempt_job
-    if latest is None and not include_all:
+    if latest is None:
         latest = row(
             "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1",
             (shot_id,),
@@ -1549,7 +1620,7 @@ def refresh_h3_project(
             "project": project,
             "state": manual["state"],
             "message": manual["message"],
-            "prompt_ids": json.loads(manual.get("prompt_ids") or "[]"),
+            "prompt_ids": string_list(manual.get("prompt_ids")),
             "completed": 0,
             "total": 0,
         }
@@ -1575,6 +1646,8 @@ def refresh_h3_project(
             "total": len(draft_attempt_candidate_ids(latest)),
         }
     attempt_ids = draft_attempt_candidate_ids(latest) if latest else []
+    attempt_evidence = job_reconciliation_evidence(latest) if latest else {}
+    legacy_recovery_needed = latest is not None and not attempt_ids
     if latest and latest.get("retry_safe"):
         return {
             "project": project,
@@ -1585,7 +1658,53 @@ def refresh_h3_project(
             "total": 0,
         }
     run_h3(["status", "--project", project], timeout=30)
-    manifest = read_manifest(project)
+    try:
+        manifest = read_manifest(project)
+    except HTTPException as exc:
+        if not legacy_recovery_needed:
+            raise
+        recovery = {
+            "strategy": "exact_prompt_id_match",
+            "status": "failed",
+            "checked_at": utc_now(),
+            "expected_prompt_ids": string_list(latest.get("prompt_ids")),
+            "manifest_error": str(exc.detail),
+        }
+        attempt_evidence["legacy_attempt_recovery"] = recovery
+        resolved = update_reconciliation_job(
+            latest,
+            "待人工对账",
+            f"旧任务 candidate set 无法安全恢复：{exc.detail}；禁止全量 manifest 同步",
+            attempt_evidence,
+            completed=True,
+        )
+        return {
+            "project": project,
+            "state": resolved["state"],
+            "message": resolved["message"],
+            "prompt_ids": string_list(resolved.get("prompt_ids")),
+            "completed": 0,
+            "total": len(draft_attempt_candidate_ids(resolved)),
+        }
+    if legacy_recovery_needed:
+        attempt_ids, recovery, recovery_error = match_legacy_attempt_by_prompt_ids(latest, project, manifest)
+        attempt_evidence["legacy_attempt_recovery"] = recovery
+        if recovery_error:
+            resolved = update_reconciliation_job(
+                latest,
+                "待人工对账",
+                f"旧任务 candidate set 无法安全恢复：{recovery_error}；禁止全量 manifest 同步",
+                attempt_evidence,
+                completed=True,
+            )
+            return {
+                "project": project,
+                "state": resolved["state"],
+                "message": resolved["message"],
+                "prompt_ids": string_list(resolved.get("prompt_ids")),
+                "completed": 0,
+                "total": len(draft_attempt_candidate_ids(resolved)),
+            }
     attempt_id_set = set(attempt_ids)
     relevant_records = [
         record for record in manifest.get("candidates") or []
@@ -1615,19 +1734,16 @@ def refresh_h3_project(
         manifest = read_manifest(project)
     if latest and attempt_ids:
         try:
-            evidence = json.loads(latest.get("reconciliation_snapshot") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            evidence = {}
-        try:
             return sync_manifest_to_db(
                 shot_id,
                 project,
                 manifest,
                 job_id=int(latest["id"]),
                 record_ids=attempt_ids,
-                reconciliation_evidence=evidence if isinstance(evidence, dict) else {},
+                reconciliation_evidence=attempt_evidence,
                 expected_job_state=str(latest["state"]),
                 expected_job_revision=int(latest.get("reconciliation_revision") or 0),
+                include_promotions=include_promotions,
             )
         except ReconciliationConflict:
             current = row("SELECT * FROM jobs WHERE id = ?", (latest["id"],)) or latest
@@ -3958,7 +4074,7 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
         db.commit()
 
     reconciled = reconcile_generation_job(row("SELECT * FROM jobs WHERE id = ?", (submitting_job_id,)) or {})
-    prompt_ids = json.loads(reconciled.get("prompt_ids") or "[]")
+    prompt_ids = string_list(reconciled.get("prompt_ids"))
     return {
         "ok": True,
         "state": reconciled["state"],
@@ -4092,7 +4208,7 @@ def sync_shot(shot_id: str) -> dict[str, Any]:
             "ok": False,
             "state": latest["state"],
             "message": latest["message"],
-            "prompt_ids": json.loads(latest.get("prompt_ids") or "[]"),
+            "prompt_ids": string_list(latest.get("prompt_ids")),
         }
     if latest and latest["state"] == "提交中":
         lease = row("SELECT id FROM h3_generation_leases WHERE shot_id = ?", (shot_id,))
@@ -4101,7 +4217,7 @@ def sync_shot(shot_id: str) -> dict[str, Any]:
                 "ok": True,
                 "state": latest["state"],
                 "message": latest["message"],
-                "prompt_ids": json.loads(latest.get("prompt_ids") or "[]"),
+                "prompt_ids": string_list(latest.get("prompt_ids")),
             }
     if latest and latest["state"] in RECONCILING_JOB_STATES:
         reconciled = reconcile_generation_job(latest)
@@ -4109,7 +4225,7 @@ def sync_shot(shot_id: str) -> dict[str, Any]:
             "ok": reconciled["state"] not in {"待人工对账", "提交状态未知"},
             "state": reconciled["state"],
             "message": reconciled["message"],
-            "prompt_ids": json.loads(reconciled.get("prompt_ids") or "[]"),
+            "prompt_ids": string_list(reconciled.get("prompt_ids")),
         }
     return {"ok": True, **refresh_h3_project(shot_id, project, attempt_job=latest)}
 
@@ -4223,7 +4339,7 @@ def select_candidate(shot_id: str, request: ReviewRequest) -> dict[str, Any]:
 def finalize_promotion(shot_id: str, request: FinalizePromotionRequest) -> dict[str, Any]:
     require_active_shot(shot_id)
     project = h3_project_for_shot(shot_id)
-    refresh_h3_project(shot_id, project, include_all=True)
+    refresh_h3_project(shot_id, project, include_promotions=True)
     promotion = row(
         "SELECT * FROM promotions WHERE id = ? AND shot_id = ?",
         (request.promotion_id, shot_id),
