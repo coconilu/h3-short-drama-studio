@@ -248,6 +248,34 @@ def _frame_plan(seconds: float) -> tuple[float, int, float]:
     return adapter_seconds, frames, round(frames / 24, 3)
 
 
+def _source_snapshot(
+    db: sqlite3.Connection,
+    shot: dict[str, Any],
+    bible_public: list[dict[str, Any]],
+    references_public: list[dict[str, Any]],
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "shot": {
+            key: shot.get(key)
+            for key in ("id", "project_id", "prompt", "dialogue", "sound", "width", "height", "seconds", "candidate_count", "strategy")
+        },
+        "bible": bible_public,
+        "references": references_public,
+    }
+    if db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'creative_storyboard_links'"
+    ).fetchone():
+        source = db.execute(
+            """SELECT links.section_id, links.last_synced_revision, sections.title AS section_title,
+            sections.revision AS current_section_revision
+            FROM creative_storyboard_links links JOIN creative_sections sections ON sections.id = links.section_id
+            WHERE links.project_id = ? AND links.shot_id = ?""",
+            (shot["project_id"], shot["id"]),
+        ).fetchone()
+        snapshot["storyboard_source"] = dict(source) if source else None
+    return snapshot
+
+
 def compile_prompt_plan(db_path: Path, shot_id: str) -> dict[str, Any]:
     with closing(connect(db_path)) as db:
         project = _active_project(db)
@@ -353,26 +381,7 @@ def compile_prompt_plan(db_path: Path, shot_id: str) -> dict[str, Any]:
             }
             for item in references
         ]
-        source_snapshot = {
-            "shot": {
-                key: shot.get(key)
-                for key in ("id", "project_id", "prompt", "dialogue", "sound", "width", "height", "seconds", "candidate_count", "strategy")
-            },
-            "bible": bible_public,
-            "references": references_public,
-        }
-        if db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'creative_storyboard_links'"
-        ).fetchone():
-            storyboard_source = db.execute(
-                """SELECT links.section_id, links.last_synced_revision, sections.title AS section_title,
-                sections.revision AS current_section_revision
-                FROM creative_storyboard_links links
-                JOIN creative_sections sections ON sections.id = links.section_id
-                WHERE links.project_id = ? AND links.shot_id = ?""",
-                (project["id"], shot_id),
-            ).fetchone()
-            source_snapshot["storyboard_source"] = dict(storyboard_source) if storyboard_source else None
+        source_snapshot = _source_snapshot(db, shot, bible_public, references_public)
         plan_hash = _json_hash(source_snapshot)
         stored = db.execute(
             """SELECT status, validated_at, approved_at FROM h3_prompt_plans
@@ -429,19 +438,93 @@ def public_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in plan.items() if not key.startswith("_") and key != "source_snapshot"}
 
 
-def record_validation(db_path: Path, plan: dict[str, Any], adapter_output: Any) -> None:
+def _current_source_snapshot(db: sqlite3.Connection, shot_id: str, project_id: str) -> dict[str, Any] | None:
+    shot_row = db.execute(
+        "SELECT * FROM shots WHERE id = ? AND project_id = ?", (shot_id, project_id)
+    ).fetchone()
+    if not shot_row:
+        return None
+    shot = dict(shot_row)
+    bible, _ = _effective_bible(db, shot_id, project_id)
+    references = _merge_references(_explicit_references(db, shot_id), bible)
+    bible_public = [
+        {
+            "id": entry["id"],
+            "entry_type": entry["entry_type"],
+            "name": entry["name"],
+            "revision": entry["revision"],
+            "apply_globally": entry["apply_globally"],
+            "asset_ids": [asset["id"] for asset in entry["assets"]],
+            "source_type": entry.get("source_type", "manual"),
+            "source_id": entry.get("source_id"),
+            "source_revision": entry.get("source_revision"),
+        }
+        for entry in bible
+    ]
+    references_public = [
+        {
+            "id": item["id"], "asset_id": item["asset_id"], "asset_name": item["asset"].get("name"),
+            "media_type": item["reference_type"], "role": item["role"], "tag": item["tag"],
+            "audio_tag": item.get("audio_tag"), "source": item["source"], "source_label": item["source_label"],
+            "checksum_sha256": item["asset"].get("checksum_sha256"),
+        }
+        for item in references
+    ]
+    return _source_snapshot(db, shot, bible_public, references_public)
+
+
+def record_validation(db_path: Path, plan: dict[str, Any], adapter_output: Any) -> bool:
     now = utc_now()
     with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        shot_id = str(plan["shot"]["id"])
+        project_id = str(plan["source_snapshot"]["shot"]["project_id"])
         existing = db.execute(
-            "SELECT id, status FROM h3_prompt_plans WHERE shot_id = ? AND plan_hash = ?",
-            (plan["shot"]["id"], plan["plan_hash"]),
+            "SELECT id, status FROM h3_prompt_plans WHERE shot_id = ? AND project_id = ? AND plan_hash = ?",
+            (shot_id, project_id, plan["plan_hash"]),
         ).fetchone()
+        current_snapshot = _current_source_snapshot(db, shot_id, project_id)
+        current_hash = _json_hash(current_snapshot) if current_snapshot else None
+        if existing and existing["status"] == "superseded":
+            db.commit()
+            return False
+        if current_hash != plan["plan_hash"]:
+            if existing:
+                cursor = db.execute(
+                    """UPDATE h3_prompt_plans SET status = 'superseded', stale_reasons = ?, superseded_at = ?
+                    WHERE id = ? AND status IN ('validated', 'approved')""",
+                    (json.dumps(["H3 dry-run 返回时输入已变化"], ensure_ascii=False), now, existing["id"]),
+                )
+                if cursor.rowcount == 0:
+                    db.commit()
+                    return False
+            else:
+                db.execute(
+                    """INSERT INTO h3_prompt_plans
+                    (id, shot_id, project_id, plan_hash, status, mode, creative_prompt, compiled_prompt,
+                     source_snapshot, references_snapshot, bible_snapshot, warnings, adapter_output,
+                     created_at, validated_at, stale_reasons, superseded_at)
+                    VALUES (?, ?, ?, ?, 'superseded', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        f"prompt-plan-{uuid.uuid4().hex[:12]}", shot_id, project_id, plan["plan_hash"],
+                        plan["mode"], plan["shot"]["prompt"], plan["compiled_prompt"],
+                        json.dumps(plan["source_snapshot"], ensure_ascii=False), json.dumps(plan["references"], ensure_ascii=False),
+                        json.dumps(plan["bible"], ensure_ascii=False), json.dumps(plan["warnings"], ensure_ascii=False),
+                        json.dumps(adapter_output, ensure_ascii=False), now, now,
+                        json.dumps(["H3 dry-run 返回时输入已变化"], ensure_ascii=False), now,
+                    ),
+                )
+            db.commit()
+            return False
         if existing:
-            db.execute(
-                """UPDATE h3_prompt_plans SET status = CASE WHEN status = 'approved' THEN status ELSE 'validated' END,
-                adapter_output = ?, validated_at = ? WHERE id = ?""",
+            cursor = db.execute(
+                """UPDATE h3_prompt_plans SET adapter_output = ?, validated_at = ?
+                WHERE id = ? AND status IN ('validated', 'approved')""",
                 (json.dumps(adapter_output, ensure_ascii=False), now, existing["id"]),
             )
+            if cursor.rowcount != 1:
+                db.commit()
+                return False
         else:
             db.execute(
                 """INSERT INTO h3_prompt_plans
@@ -450,7 +533,7 @@ def record_validation(db_path: Path, plan: dict[str, Any], adapter_output: Any) 
                  created_at, validated_at)
                 VALUES (?, ?, ?, ?, 'validated', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    f"prompt-plan-{uuid.uuid4().hex[:12]}", plan["shot"]["id"], plan["source_snapshot"]["shot"]["project_id"],
+                    f"prompt-plan-{uuid.uuid4().hex[:12]}", shot_id, project_id,
                     plan["plan_hash"], plan["mode"], plan["shot"]["prompt"], plan["compiled_prompt"],
                     json.dumps(plan["source_snapshot"], ensure_ascii=False), json.dumps(plan["references"], ensure_ascii=False),
                     json.dumps(plan["bible"], ensure_ascii=False), json.dumps(plan["warnings"], ensure_ascii=False),
@@ -458,6 +541,7 @@ def record_validation(db_path: Path, plan: dict[str, Any], adapter_output: Any) 
                 ),
             )
         db.commit()
+        return True
 
 
 def approve_plan(db_path: Path, shot_id: str, plan_hash: str) -> None:

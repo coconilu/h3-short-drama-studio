@@ -488,6 +488,44 @@ class ContentPlanningContractTests(unittest.TestCase):
         self.assertEqual(chapter_error.exception.status_code, 409)
         self.assertEqual(self.mutation_state(), before_chapter_merge)
 
+    def test_section_merge_preserves_all_structured_fields_in_story_order(self) -> None:
+        chapter = self.call(
+            "/api/creative-planning/chapters", "POST", ChapterCreate(title="第一章", summary="合并合同"),
+        )["chapters"][0]
+        workspace = self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", chapter["id"],
+            SectionCreate(
+                title="先发生", summary="摘要一", content="正文一", scene="场景一", action="动作一",
+                dialogue="共享对白", sound="声音一", visual="视觉一", planned_seconds=3,
+            ),
+        )
+        workspace = self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", chapter["id"],
+            SectionCreate(
+                title="后发生", summary="摘要二", content="正文二", scene="", action="动作二",
+                dialogue="共享对白", sound="", visual="视觉二", planned_seconds=4,
+            ),
+        )
+        chapter = workspace["chapters"][0]
+        first, second = chapter["sections"]
+        merged = self.call(
+            "/api/creative-planning/sections/{section_id}/merge", "POST", first["id"],
+            MergeRequest(
+                target_id=second["id"], base_revisions={item["id"]: item["revision"] for item in chapter["sections"]},
+                parent_base_revision=chapter["revision"], source="human:test-structured-merge",
+            ),
+        )["chapters"][0]["sections"][0]
+        self.assertEqual(merged["summary"], "摘要一\n\n摘要二")
+        self.assertEqual(merged["content"], "正文一\n\n正文二")
+        self.assertEqual(merged["scene"], "场景一")
+        self.assertEqual(merged["action"], "动作一\n\n动作二")
+        self.assertEqual(merged["dialogue"], "共享对白")
+        self.assertEqual(merged["sound"], "声音一")
+        self.assertEqual(merged["visual"], "视觉一\n\n视觉二")
+        self.assertEqual(merged["planned_seconds"], 7)
+        self.assertEqual(merged["status"], "draft")
+        self.assertIn("重新检查", merged["review_note"])
+
     def test_archived_proposal_character_chapter_and_section_keep_reachable_history(self) -> None:
         proposal_workspace = self.call(
             "/api/creative-planning/proposals", "POST",

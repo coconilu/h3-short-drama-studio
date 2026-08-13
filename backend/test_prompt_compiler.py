@@ -142,6 +142,42 @@ class PromptCompilerTests(unittest.TestCase):
         self.assertFalse(plan["ready"])
         self.assertTrue(any("2–15 秒" in item for item in plan["blocking"]))
 
+    def test_late_validation_never_revives_superseded_plan(self) -> None:
+        original = compile_prompt_plan(self.db_path, "p1-S01-001")
+        self.assertTrue(record_validation(self.db_path, original, {"attempt": "initial"}))
+        approve_plan(self.db_path, "p1-S01-001", original["plan_hash"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            from backend.prompt_compiler import mark_prompt_plans_stale
+            mark_prompt_plans_stale(db, "p1", "镜头输入在 dry-run 期间变化", shot_ids=["p1-S01-001"])
+            db.commit()
+
+        self.assertFalse(record_validation(self.db_path, original, {"attempt": "late"}))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                "SELECT * FROM h3_prompt_plans WHERE plan_hash = ?", (original["plan_hash"],)
+            ).fetchone()
+        self.assertEqual(row["status"], "superseded")
+        self.assertIn("镜头输入在 dry-run 期间变化", row["stale_reasons"])
+        self.assertNotIn("late", row["adapter_output"])
+
+    def test_validation_that_returns_after_input_change_is_historical_only(self) -> None:
+        original = compile_prompt_plan(self.db_path, "p1-S01-001")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("UPDATE shots SET prompt = 'changed during dry-run' WHERE id = 'p1-S01-001'")
+            db.commit()
+        self.assertFalse(record_validation(self.db_path, original, {"attempt": "late"}))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                "SELECT * FROM h3_prompt_plans WHERE plan_hash = ?", (original["plan_hash"],)
+            ).fetchone()
+        self.assertEqual(row["status"], "superseded")
+        self.assertIn("输入已变化", row["stale_reasons"])
+        self.assertEqual(compile_prompt_plan(self.db_path, "p1-S01-001")["status"], "preview")
+
 
 if __name__ == "__main__":
     unittest.main()

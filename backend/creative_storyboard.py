@@ -183,13 +183,36 @@ def _field_diffs(
 
 
 def _evidence_reasons(db: sqlite3.Connection, shot_id: str) -> list[str]:
-    checks = (
-        ("candidates", "SELECT COUNT(*) FROM candidates WHERE shot_id = ?", "候选片段"),
-        ("promotions", "SELECT COUNT(*) FROM promotions WHERE shot_id = ?", "成片版本"),
-        ("delivery_plan_items", "SELECT COUNT(*) FROM delivery_plan_items WHERE shot_id = ?", "交付清单"),
-        ("production_batch_items", "SELECT COUNT(*) FROM production_batch_items WHERE shot_id = ?", "生产批次"),
-        ("jobs", "SELECT COUNT(*) FROM jobs WHERE shot_id = ?", "生成记录"),
-    )
+    labels = {
+        "candidates": "候选片段",
+        "promotions": "成片版本",
+        "jobs": "生成记录",
+        "shot_references": "镜头参考素材",
+        "delivery_plan_items": "交付清单",
+        "production_batch_items": "生产批次",
+        "h3_prompt_plans": "H3 计划历史",
+        "production_bible_shots": "生产圣经镜头绑定",
+        "script_storyboard_links": "历史剧本分镜映射",
+        "candidate_reviews": "候选审片证据",
+    }
+    # Audit every declared FK to shots instead of maintaining a partial hand-written list.
+    # A future production table therefore fails closed until its relation is handled explicitly.
+    checks: list[tuple[str, str, str]] = []
+    for table_row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").fetchall():
+        table = str(table_row["name"])
+        if table == "creative_storyboard_links":
+            continue
+        for foreign_key in db.execute(f'PRAGMA foreign_key_list("{table}")').fetchall():
+            if str(foreign_key["table"]) != "shots":
+                continue
+            column = str(foreign_key["from"])
+            checks.append(
+                (
+                    table,
+                    f'SELECT COUNT(*) FROM "{table}" WHERE "{column}" = ?',
+                    labels.get(table, f"生产关系 {table}"),
+                )
+            )
     reasons: list[str] = []
     for table, query, label in checks:
         if _table_exists(db, table) and int(db.execute(query, (shot_id,)).fetchone()[0] or 0) > 0:
@@ -218,9 +241,6 @@ def _build_preview(
         ORDER BY chapters.ordinal, sections.ordinal, sections.id""",
         (project["id"],),
     ).fetchall()
-    if not sections:
-        raise HTTPException(422, "当前项目没有可同步的小节")
-
     links = {
         row["section_id"]: row
         for row in db.execute(
@@ -231,6 +251,8 @@ def _build_preview(
         row["id"]: row
         for row in db.execute("SELECT * FROM shots WHERE project_id = ?", (project["id"],)).fetchall()
     }
+    if not sections and not links:
+        raise HTTPException(422, "当前项目没有可同步的小节或受管分镜映射")
     linked_shot_ids = {str(link["shot_id"]) for link in links.values()}
     managed_slots = sorted(
         int(shots[shot_id]["ordinal"])

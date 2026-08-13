@@ -369,6 +369,95 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         self.assertEqual(len(first_links), 1)
         self.assertEqual(first_links[0]["section_id"], first_section["id"])
 
+    def test_last_archived_section_still_previews_and_confirms_delete_idempotently(self) -> None:
+        section = self.approve_section(self.create_section("唯一小节"))
+        applied = self.apply(self.preview())
+        shot_id = applied["sync"]["applied_snapshot"][0]["shot_id"]
+        current = self.call_content("/api/creative-planning", "GET")["chapters"][0]["sections"][0]
+        self.call_content(
+            "/api/creative-planning/sections/{section_id}/archive", "POST", current["id"],
+            RevisionBase(base_revision=current["revision"], source="human:test-archive-last"),
+        )
+        deletion = self.preview()
+        self.assertEqual(deletion["summary"]["delete"], 1)
+        first = self.apply(deletion)
+        second = self.apply(deletion)
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(second["idempotent"])
+        with closing(studio.connect()) as db:
+            self.assertIsNone(db.execute("SELECT id FROM shots WHERE id = ?", (shot_id,)).fetchone())
+            self.assertIsNone(db.execute("SELECT id FROM creative_storyboard_links WHERE section_id = ?", (section["id"],)).fetchone())
+
+    def test_each_shot_foreign_key_relation_protects_delete_with_zero_partial_writes(self) -> None:
+        relation_factories = {
+            "h3_prompt_plans": lambda db, shot_id: db.execute(
+                """INSERT INTO h3_prompt_plans
+                (id, shot_id, project_id, plan_hash, status, mode, creative_prompt, compiled_prompt,
+                 source_snapshot, references_snapshot, bible_snapshot, warnings, adapter_output, created_at, validated_at)
+                VALUES ('protect-plan', ?, ?, ?, 'validated', 'FL2VA', '', '', '{}', '[]', '[]', '[]', '{}', 'now', 'now')""",
+                (shot_id, self.project["id"], "f" * 64),
+            ),
+            "shot_references": lambda db, shot_id: (
+                db.execute(
+                    """INSERT INTO assets
+                    (id, project_id, kind, name, description, preview, locked, source, managed_path, media_type)
+                    VALUES ('protect-asset', ?, '角色参考', '保护素材', '', '', 0, 'managed', 'protect.png', 'image')""",
+                    (self.project["id"],),
+                ),
+                db.execute(
+                    """INSERT INTO shot_references
+                    (id, shot_id, asset_id, reference_type, ordinal, role, created_at, updated_at)
+                    VALUES ('protect-reference', ?, 'protect-asset', 'image', 1, 'identity', 'now', 'now')""",
+                    (shot_id,),
+                ),
+            ),
+            "production_bible_shots": lambda db, shot_id: (
+                db.execute(
+                    """INSERT INTO production_bible_entries
+                    (id, project_id, entry_type, name, summary, canonical_description, prompt_fragment,
+                     negative_prompt, continuity_rules, apply_globally, status, revision, archived, created_at, updated_at)
+                    VALUES ('protect-bible', ?, 'character', '保护设定', '', '设定', 'prompt', '', '', 0,
+                            'locked', 1, 0, 'now', 'now')""",
+                    (self.project["id"],),
+                ),
+                db.execute(
+                    "INSERT INTO production_bible_shots VALUES ('protect-bible', ?, 'continuity', '', 'now')", (shot_id,)
+                ),
+            ),
+        }
+        for table, make_relation in relation_factories.items():
+            with self.subTest(table=table):
+                # Each subtest uses a fresh project/database so evidence classes cannot mask one another.
+                self.tearDown()
+                self.setUp()
+                section = self.approve_section(self.create_section(f"保护 {table}"))
+                shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+                with closing(studio.connect()) as db:
+                    make_relation(db, shot_id)
+                    db.commit()
+                current = self.call_content("/api/creative-planning", "GET")["chapters"][0]["sections"][0]
+                self.call_content(
+                    "/api/creative-planning/sections/{section_id}/archive", "POST", current["id"],
+                    RevisionBase(base_revision=current["revision"], source="human:test-protect"),
+                )
+                before = self._storyboard_mutation_state()
+                protected = self.preview()
+                self.assertEqual(protected["summary"]["protected"], 1)
+                self.assertTrue(protected["rows"][0]["protected_reasons"])
+                with self.assertRaises(HTTPException) as blocked:
+                    self.apply(protected)
+                self.assertEqual(blocked.exception.status_code, 409)
+                self.assertEqual(self._storyboard_mutation_state(), before)
+
+    def _storyboard_mutation_state(self) -> dict:
+        with closing(studio.connect()) as db:
+            return {
+                "shots": [tuple(row) for row in db.execute("SELECT * FROM shots ORDER BY id").fetchall()],
+                "links": [tuple(row) for row in db.execute("SELECT * FROM creative_storyboard_links ORDER BY id").fetchall()],
+                "syncs": [tuple(row) for row in db.execute("SELECT * FROM creative_storyboard_syncs ORDER BY id").fetchall()],
+                "plans": [tuple(row) for row in db.execute("SELECT * FROM h3_prompt_plans ORDER BY id").fetchall()],
+            }
+
 
 if __name__ == "__main__":
     unittest.main()

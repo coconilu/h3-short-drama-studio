@@ -711,6 +711,17 @@ def _verify_parent_revision(record: sqlite3.Row, expected: int | None, label: st
         raise HTTPException(409, f"{label}父级已在其他操作中更新，请刷新后重试")
 
 
+def _merge_section_value(first: sqlite3.Row, second: sqlite3.Row, field: str) -> str:
+    """Preserve both section values in narrative order without duplicating identical text."""
+    ordered = sorted((first, second), key=lambda item: (int(item["ordinal"]), str(item["id"])))
+    parts: list[str] = []
+    for item in ordered:
+        value = str(item[field] or "").strip()
+        if value and value not in parts:
+            parts.append(value)
+    return "\n\n".join(parts)
+
+
 def _shift_ordinals(
     db: sqlite3.Connection,
     table: str,
@@ -1310,15 +1321,19 @@ def create_content_router(db_path: Path) -> APIRouter:
                 raise HTTPException(422, "小节不能合并到自身")
             if source["chapter_id"] != target["chapter_id"]:
                 raise HTTPException(422, "只能合并同一章节内的小节")
-            combined = "\n\n".join(part for part in (target["summary"], source["summary"]) if part.strip())
-            combined_content = "\n\n".join(part for part in (target["content"], source["content"]) if part.strip())
             _advance(
                 db, "creative_sections", "section", target["id"], project["id"], target["revision"], payload.source,
                 {
-                    "summary": combined,
-                    "content": combined_content,
+                    "summary": _merge_section_value(target, source, "summary"),
+                    "content": _merge_section_value(target, source, "content"),
+                    "scene": _merge_section_value(target, source, "scene"),
+                    "action": _merge_section_value(target, source, "action"),
+                    "dialogue": _merge_section_value(target, source, "dialogue"),
+                    "sound": _merge_section_value(target, source, "sound"),
+                    "visual": _merge_section_value(target, source, "visual"),
                     "planned_seconds": float(target["planned_seconds"]) + float(source["planned_seconds"]),
                     "status": "draft",
+                    "review_note": "由两个小节合并生成，请重新检查全部结构化字段并批准",
                     "approved_at": None,
                 },
             )

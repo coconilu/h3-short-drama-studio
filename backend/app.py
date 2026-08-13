@@ -3112,7 +3112,8 @@ def dry_run_prompt_plan(shot_id: str, request: PromptPlanRequest) -> dict[str, A
         adapter_output: Any = json.loads(completed.stdout.strip())
     except json.JSONDecodeError:
         adapter_output = completed.stdout.strip()
-    record_validation(DB_PATH, compiled, adapter_output)
+    if not record_validation(DB_PATH, compiled, adapter_output):
+        raise HTTPException(409, "H3 dry-run 返回时输入或计划状态已变化；结果仅保留为历史，请重新检查")
     current = public_plan(compile_prompt_plan(DB_PATH, shot_id))
     return {
         **current,

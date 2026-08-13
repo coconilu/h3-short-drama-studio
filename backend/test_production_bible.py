@@ -16,6 +16,7 @@ from backend.production_bible import (
     ShotLinkRequest,
     create_bible_router,
     init_bible_schema,
+    sync_creative_character_rules,
 )
 
 
@@ -151,6 +152,59 @@ class ProductionBibleTests(unittest.TestCase):
             entry["id"], RevisionRequest(base_revision=updated["revision"])
         )
         self.assertEqual(archived["summary"]["entry_count"], 0)
+
+    def test_creative_character_entries_reject_every_manual_mutation_and_repair_tampering(self) -> None:
+        character = {
+            "id": "character-derived", "project_id": "p1", "name": "林夏", "identity": "调查员",
+            "appearance": "短发、红雨衣", "voice": "低声线、普通话", "status": "approved", "revision": 3,
+        }
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            sync_creative_character_rules(db, character)
+            db.commit()
+        entry_id = "creative-character-derived-character"
+        requests = (
+            ("/api/bible/entries/{entry_id}", "PATCH", BibleEntryPatch(base_revision=1, summary="污染")),
+            ("/api/bible/entries/{entry_id}/lock", "POST", RevisionRequest(base_revision=1)),
+            ("/api/bible/entries/{entry_id}/archive", "POST", RevisionRequest(base_revision=1)),
+            ("/api/bible/entries/{entry_id}/assets/link", "POST", AssetLinkRequest(base_revision=1, asset_id="a1")),
+            ("/api/bible/entries/{entry_id}/assets/unlink", "POST", AssetLinkRequest(base_revision=1, asset_id="a1")),
+            ("/api/bible/entries/{entry_id}/shots/link", "POST", ShotLinkRequest(base_revision=1, shot_id="p1-S01-001")),
+            ("/api/bible/entries/{entry_id}/shots/unlink", "POST", ShotLinkRequest(base_revision=1, shot_id="p1-S01-001")),
+        )
+        for path, method, payload in requests:
+            with self.subTest(path=path):
+                with self.assertRaises(HTTPException) as blocked:
+                    self.endpoint(path, method)(entry_id, payload)
+                self.assertEqual(blocked.exception.status_code, 409)
+
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute(
+                "UPDATE production_bible_entries SET status = 'draft', prompt_fragment = '污染' WHERE id = ?",
+                (entry_id,),
+            )
+            db.execute(
+                "INSERT INTO production_bible_shots VALUES (?, 'p1-S01-001', 'continuity', '', 'now')", (entry_id,)
+            )
+            sync_creative_character_rules(db, character)
+            db.commit()
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            repaired = db.execute("SELECT * FROM production_bible_entries WHERE id = ?", (entry_id,)).fetchone()
+            links = db.execute("SELECT COUNT(*) FROM production_bible_shots WHERE entry_id = ?", (entry_id,)).fetchone()[0]
+        self.assertEqual(repaired["status"], "locked")
+        self.assertEqual(repaired["prompt_fragment"], "短发、红雨衣")
+        self.assertEqual(links, 0)
+
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            sync_creative_character_rules(db, character)  # restart-time resync is a no-op but remains usable.
+            db.commit()
+        workspace = self.endpoint("/api/bible", "GET")()
+        derived = next(item for item in workspace["entries"] if item["id"] == entry_id)
+        self.assertEqual(derived["status"], "locked")
+        self.assertTrue(derived["apply_globally"])
 
 
 if __name__ == "__main__":

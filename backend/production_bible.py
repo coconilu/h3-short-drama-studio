@@ -158,6 +158,11 @@ def _entry_for_project(db: sqlite3.Connection, entry_id: str, project_id: str) -
     return entry
 
 
+def _require_manual_entry(entry: sqlite3.Row) -> None:
+    if entry["source_type"] == "creative_character":
+        raise HTTPException(409, "该条目由已批准角色卡派生；请回到创作规划修改角色卡")
+
+
 def _entry_snapshot(db: sqlite3.Connection, entry_id: str) -> dict[str, Any]:
     entry = db.execute("SELECT * FROM production_bible_entries WHERE id = ?", (entry_id,)).fetchone()
     if not entry:
@@ -241,13 +246,38 @@ def sync_creative_character_rules(db: sqlite3.Connection, character: sqlite3.Row
     for entry_type, name, canonical, prompt, continuity in definitions:
         entry_id = f"creative-{item['id']}-{entry_type}"
         existing = db.execute("SELECT * FROM production_bible_entries WHERE id = ?", (entry_id,)).fetchone()
-        if existing and int(existing["source_revision"] or 0) == int(item["revision"]) and not existing["archived"]:
+        expected = {
+            "project_id": item["project_id"],
+            "entry_type": entry_type,
+            "name": name,
+            "summary": f"来自已批准角色卡“{item['name']}”",
+            "canonical_description": canonical,
+            "prompt_fragment": prompt,
+            "negative_prompt": "",
+            "continuity_rules": continuity,
+            "apply_globally": 1,
+            "status": "locked",
+            "archived": 0,
+            "source_type": "creative_character",
+            "source_id": item["id"],
+            "source_revision": int(item["revision"]),
+        }
+        bindings = 0
+        if existing:
+            bindings = int(db.execute(
+                "SELECT COUNT(*) FROM production_bible_assets WHERE entry_id = ?", (entry_id,)
+            ).fetchone()[0]) + int(db.execute(
+                "SELECT COUNT(*) FROM production_bible_shots WHERE entry_id = ?", (entry_id,)
+            ).fetchone()[0])
+        if existing and not bindings and all(existing[key] == value for key, value in expected.items()):
             changed.append(entry_id)
             continue
         if existing:
+            db.execute("DELETE FROM production_bible_assets WHERE entry_id = ?", (entry_id,))
+            db.execute("DELETE FROM production_bible_shots WHERE entry_id = ?", (entry_id,))
             db.execute(
                 """UPDATE production_bible_entries SET name = ?, summary = ?, canonical_description = ?,
-                prompt_fragment = ?, continuity_rules = ?, apply_globally = 1, status = 'locked',
+                prompt_fragment = ?, negative_prompt = '', continuity_rules = ?, apply_globally = 1, status = 'locked',
                 archived = 0, source_type = 'creative_character', source_id = ?, source_revision = ?,
                 revision = revision + 1, updated_at = ? WHERE id = ? AND project_id = ?""",
                 (
@@ -446,7 +476,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
     def update_entry(entry_id: str, payload: BibleEntryPatch) -> dict[str, Any]:
         with closing(connect(db_path)) as db:
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             updates = payload.model_dump(exclude_none=True)
             base_revision = updates.pop("base_revision")
             if updates:
@@ -462,6 +493,7 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             project = _active_project(db)
             entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             if not entry["canonical_description"].strip() or not entry["prompt_fragment"].strip():
                 raise HTTPException(422, "锁定前必须填写标准设定与 H3 提示词片段")
             _advance_revision(db, entry_id, project["id"], payload.base_revision, "human:lock", status="locked")
@@ -472,7 +504,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
     def archive_entry(entry_id: str, payload: RevisionRequest) -> dict[str, Any]:
         with closing(connect(db_path)) as db:
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             cursor = db.execute(
                 """UPDATE production_bible_entries SET archived = 1, revision = revision + 1,
                 status = 'draft', updated_at = ? WHERE id = ? AND project_id = ? AND revision = ?""",
@@ -489,7 +522,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             asset = db.execute(
                 """SELECT * FROM assets WHERE id = ? AND project_id = ? AND archived = 0
                 AND source = 'managed' AND managed_path IS NOT NULL""",
@@ -517,7 +551,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             cursor = db.execute(
                 "DELETE FROM production_bible_assets WHERE entry_id = ? AND asset_id = ?",
                 (entry_id, payload.asset_id),
@@ -533,7 +568,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             shot = db.execute(
                 "SELECT id FROM shots WHERE id = ? AND project_id = ?",
                 (payload.shot_id, project["id"]),
@@ -556,7 +592,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             cursor = db.execute(
                 "DELETE FROM production_bible_shots WHERE entry_id = ? AND shot_id = ?",
                 (entry_id, payload.shot_id),
