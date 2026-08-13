@@ -201,6 +201,27 @@ export type CreativeRevisionHistory = {
   }>
 }
 
+export type CreativeArchiveEntry = {
+  id: string
+  entity_type: 'proposal' | 'character' | 'chapter' | 'section'
+  title: string
+  status: 'archived'
+  revision: number
+  updated_at: string
+  archived_at: string
+  source: string
+  history_url: string
+}
+
+export type CreativeArchive = {
+  project: { id: string; title: string; episode: string }
+  entries: CreativeArchiveEntry[]
+  summary: {
+    total: number
+    by_type: Record<CreativeArchiveEntry['entity_type'], number>
+  }
+}
+
 export type ProjectSummary = {
   id: string
   title: string

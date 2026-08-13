@@ -23,6 +23,7 @@ import {
 } from 'lucide-react'
 import type {
   CreativeBrief,
+  CreativeArchive,
   CreativeChapter,
   CreativeCharacter,
   CreativePlanningWorkspace,
@@ -131,6 +132,8 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
   setNotice: (message: string) => void
 }) {
   const [workspace, setWorkspace] = useState<CreativePlanningWorkspace | null>(null)
+  const [archiveView, setArchiveView] = useState<CreativeArchive | null>(null)
+  const [showArchive, setShowArchive] = useState(false)
   const [brief, setBrief] = useState<CreativeBrief | null>(null)
   const [editor, setEditor] = useState<Editor | null>(null)
   const [history, setHistory] = useState<CreativeRevisionHistory | null>(null)
@@ -139,9 +142,13 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
 
   const load = useCallback(async () => {
     try {
-      const data = await planningApi<CreativePlanningWorkspace>('/api/creative-planning')
+      const [data, archived] = await Promise.all([
+        planningApi<CreativePlanningWorkspace>('/api/creative-planning'),
+        planningApi<CreativeArchive>('/api/creative-planning/archive'),
+      ])
       setWorkspace(data)
       setBrief(data.brief)
+      setArchiveView(archived)
       setError('')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '创作规划加载失败')
@@ -156,6 +163,7 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
       const data = await planningApi<CreativePlanningWorkspace>(path, { method, body: JSON.stringify(body) })
       setWorkspace(data)
       setBrief(data.brief)
+      try { setArchiveView(await planningApi<CreativeArchive>('/api/creative-planning/archive')) } catch { /* mutation already succeeded */ }
       setError('')
       return data
     } catch (reason) {
@@ -214,19 +222,34 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
     catch (reason) { setNotice(reason instanceof Error ? reason.message : '无法读取版本历史') }
   }
 
-  const reorder = async (kind: 'chapter' | 'section', items: Array<{ id: string }>, index: number, offset: -1 | 1, chapterId?: string) => {
+  const revisions = (items: Array<{ id: string; revision: number }>) => Object.fromEntries(items.map((item) => [item.id, item.revision]))
+
+  const reorder = async (kind: 'chapter' | 'section', items: Array<{ id: string; revision: number }>, index: number, offset: -1 | 1, chapterId?: string) => {
     const target = index + offset
     if (target < 0 || target >= items.length) return
     const ids = items.map((item) => item.id)
     ;[ids[index], ids[target]] = [ids[target], ids[index]]
     const path = kind === 'chapter' ? '/api/creative-planning/chapters/order' : `/api/creative-planning/chapters/${chapterId}/sections/order`
-    await mutate(path, 'PUT', { ids, source: 'human:ui-reorder' })
+    const parent = kind === 'section' ? workspace?.chapters.find((chapter) => chapter.id === chapterId) : undefined
+    await mutate(path, 'PUT', {
+      ids,
+      base_revisions: revisions(items),
+      parent_base_revision: parent?.revision,
+      source: 'human:ui-reorder',
+    })
   }
 
   const splitChapter = async (chapter: CreativeChapter, section: CreativeSection) => {
     const title = window.prompt('新章节标题', `${chapter.title}（续）`)
     if (!title?.trim()) return
-    const result = await mutate(`/api/creative-planning/chapters/${chapter.id}/split`, 'POST', { section_id: section.id, new_title: title, source: 'human:ui-split' })
+    if (!workspace) return
+    const result = await mutate(`/api/creative-planning/chapters/${chapter.id}/split`, 'POST', {
+      section_id: section.id,
+      new_title: title,
+      base_revisions: revisions(workspace.chapters),
+      child_base_revisions: revisions(chapter.sections),
+      source: 'human:ui-split',
+    })
     if (result) setNotice(`已从“${section.title}”起拆为新章节`)
   }
 
@@ -238,13 +261,30 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
     if (before === null) return
     const after = window.prompt('写入新小节的摘要', section.summary.slice(divider))
     if (after === null) return
-    const result = await mutate(`/api/creative-planning/sections/${section.id}/split`, 'POST', { new_title: title, summary_before: before, summary_after: after, source: 'human:ui-split' })
+    const parent = workspace?.chapters.find((chapter) => chapter.id === section.chapter_id)
+    if (!parent) return
+    const result = await mutate(`/api/creative-planning/sections/${section.id}/split`, 'POST', {
+      new_title: title,
+      summary_before: before,
+      summary_after: after,
+      base_revisions: revisions(parent.sections),
+      parent_base_revision: parent.revision,
+      source: 'human:ui-split',
+    })
     if (result) setNotice(`“${section.title}”已拆分为两个可独立维护的小节`)
   }
 
   const mergeEntity = async (kind: 'chapter' | 'section', source: CreativeChapter | CreativeSection, target: CreativeChapter | CreativeSection) => {
     if (!window.confirm(`把“${source.title}”合并到“${target.title}”？源条目会归档。`)) return
-    const result = await mutate(`/api/creative-planning/${kind === 'chapter' ? 'chapters' : 'sections'}/${source.id}/merge`, 'POST', { target_id: target.id, source: 'human:ui-merge' })
+    if (!workspace) return
+    const parent = kind === 'section' ? workspace.chapters.find((chapter) => chapter.id === (source as CreativeSection).chapter_id) : undefined
+    const result = await mutate(`/api/creative-planning/${kind === 'chapter' ? 'chapters' : 'sections'}/${source.id}/merge`, 'POST', {
+      target_id: target.id,
+      base_revisions: revisions(kind === 'chapter' ? workspace.chapters : parent?.sections || []),
+      child_base_revisions: kind === 'chapter' ? revisions((source as CreativeChapter).sections) : {},
+      parent_base_revision: parent?.revision,
+      source: 'human:ui-merge',
+    })
     if (result) setNotice(`已合并${entityLabel[kind]}并保留两个条目的修订历史`)
   }
 
@@ -255,7 +295,7 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
   return <main className="creative-planning">
     <section className="planning-hero">
       <div><span className="eyebrow">前期创作 · 版本化内容模型</span><h1>创作规划</h1><p>先把主题、剧情、角色与章节结构定清楚，再进入剧本打磨。这里的每次保存都会留下不可变修订。</p></div>
-      <div className="planning-hero-actions"><span className={workspace.summary.ready ? 'ready' : ''}>{workspace.summary.ready ? <Check size={16} /> : <CircleDashed size={16} />}{workspace.summary.ready ? '规划底座已就绪' : '继续完成规划门禁'}</span><button className="button secondary" onClick={onOpenScript}>进入剧本开发<ChevronRight size={16} /></button></div>
+      <div className="planning-hero-actions"><span className={workspace.summary.ready ? 'ready' : ''}>{workspace.summary.ready ? <Check size={16} /> : <CircleDashed size={16} />}{workspace.summary.ready ? '规划底座已就绪' : '继续完成规划门禁'}</span><button className={`button secondary ${showArchive ? 'active' : ''}`} onClick={() => setShowArchive((value) => !value)}><Archive size={15} />归档内容 {archiveView?.summary.total || 0}</button><button className="button secondary" onClick={onOpenScript}>进入剧本开发<ChevronRight size={16} /></button></div>
     </section>
 
     <section className="planning-progress">
@@ -263,6 +303,14 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
     </section>
 
     {error && <button className="planning-error" onClick={() => setError('')}>{error}<X size={14} /></button>}
+
+    {showArchive && <section className="planning-section planning-archive-section">
+      <header><div><span>ARCHIVE</span><div><h2>归档内容</h2><p>归档条目只读保留；可从这里继续查看全部不可变修订。</p></div></div><span className="archive-count">{archiveView?.summary.total || 0} 项</span></header>
+      <div className="planning-archive-list">
+        {archiveView?.entries.map((entry) => <article key={`${entry.entity_type}-${entry.id}`}><span>{entityLabel[entry.entity_type]}</span><div><strong>{entry.title}</strong><small>状态：已归档 · {formatTime(entry.archived_at)}</small></div><code>{entry.source}</code><em>R{entry.revision}</em><button onClick={() => showHistory(entry.entity_type, entry.id)}><History size={14} />版本历史</button></article>)}
+        {!archiveView?.entries.length && <div className="archive-empty"><Archive size={22} /><strong>还没有归档内容</strong><span>归档的提案、角色、章节和小节会出现在这里。</span></div>}
+      </div>
+    </section>}
 
     <section className="planning-section brief-section">
       <header><div><span>01</span><div><h2>创作简报</h2><p>约束所有后续提案，批准后仍可继续修订。</p></div></div><button className="history-button" onClick={() => showHistory('brief', brief.project_id)}><History size={15} />R{brief.revision} · 历史</button></header>

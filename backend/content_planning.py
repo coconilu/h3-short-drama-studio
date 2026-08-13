@@ -220,12 +220,16 @@ class SectionUpdate(RevisionBase):
 
 class OrderUpdate(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=500)
+    base_revisions: dict[str, int] = Field(min_length=1, max_length=500)
+    parent_base_revision: int | None = Field(None, ge=1)
     source: str = Field("human:reorder", min_length=2, max_length=120)
 
 
 class ChapterSplit(BaseModel):
     section_id: str
     new_title: str = Field(min_length=1, max_length=160)
+    base_revisions: dict[str, int] = Field(min_length=1, max_length=500)
+    child_base_revisions: dict[str, int] = Field(min_length=2, max_length=500)
     source: str = Field("human:split-chapter", min_length=2, max_length=120)
 
 
@@ -233,11 +237,16 @@ class SectionSplit(BaseModel):
     new_title: str = Field(min_length=1, max_length=160)
     summary_before: str = Field(max_length=6000)
     summary_after: str = Field(max_length=6000)
+    base_revisions: dict[str, int] = Field(min_length=1, max_length=500)
+    parent_base_revision: int = Field(ge=1)
     source: str = Field("human:split-section", min_length=2, max_length=120)
 
 
 class MergeRequest(BaseModel):
     target_id: str
+    base_revisions: dict[str, int] = Field(min_length=2, max_length=500)
+    child_base_revisions: dict[str, int] = Field(default_factory=dict, max_length=500)
+    parent_base_revision: int | None = Field(None, ge=1)
     source: str = Field("human:merge", min_length=2, max_length=120)
 
 
@@ -612,6 +621,20 @@ def _normalize_order(
         _save_revision(db, project_id, entity_type, entity_id, source)
 
 
+def _verify_revision_map(records: list[sqlite3.Row], expected: dict[str, int], label: str) -> None:
+    current = {str(record["id"]): int(record["revision"]) for record in records}
+    normalized = {str(entity_id): int(revision) for entity_id, revision in expected.items()}
+    if current != normalized:
+        raise HTTPException(409, f"{label}已在其他操作中更新，请刷新后重试")
+
+
+def _verify_parent_revision(record: sqlite3.Row, expected: int | None, label: str) -> None:
+    if expected is None:
+        raise HTTPException(422, f"{label}操作缺少父级修订前置条件")
+    if int(record["revision"]) != int(expected):
+        raise HTTPException(409, f"{label}父级已在其他操作中更新，请刷新后重试")
+
+
 def _shift_ordinals(
     db: sqlite3.Connection,
     table: str,
@@ -642,6 +665,49 @@ def create_content_router(db_path: Path) -> APIRouter:
     @router.get("")
     def get_workspace() -> dict[str, Any]:
         return _workspace(db_path)
+
+    @router.get("/archive")
+    def get_archive() -> dict[str, Any]:
+        with closing(connect(db_path)) as db:
+            project = _active_project(db)
+            specs = (
+                ("proposal", "creative_proposals", "title"),
+                ("character", "creative_characters", "name"),
+                ("chapter", "creative_chapters", "title"),
+                ("section", "creative_sections", "title"),
+            )
+            entries: list[dict[str, Any]] = []
+            for entity_type, table, title_column in specs:
+                archived = db.execute(
+                    f"""SELECT id, {title_column} AS title, status, revision, updated_at
+                    FROM {table} WHERE project_id = ? AND status = 'archived' ORDER BY updated_at DESC""",
+                    (project["id"],),
+                ).fetchall()
+                for record in archived:
+                    latest = db.execute(
+                        """SELECT source, created_at FROM creative_revisions
+                        WHERE project_id = ? AND entity_type = ? AND entity_id = ? AND revision = ?""",
+                        (project["id"], entity_type, record["id"], record["revision"]),
+                    ).fetchone()
+                    entries.append({
+                        **dict(record),
+                        "entity_type": entity_type,
+                        "source": latest["source"] if latest else "unknown",
+                        "archived_at": latest["created_at"] if latest else record["updated_at"],
+                        "history_url": f"/api/creative-planning/history/{entity_type}/{record['id']}",
+                    })
+            entries.sort(key=lambda item: item["archived_at"], reverse=True)
+            return {
+                "project": {"id": project["id"], "title": project["title"], "episode": project["episode"]},
+                "entries": entries,
+                "summary": {
+                    "total": len(entries),
+                    "by_type": {
+                        entity_type: sum(item["entity_type"] == entity_type for item in entries)
+                        for entity_type in ("proposal", "character", "chapter", "section")
+                    },
+                },
+            }
 
     @router.put("/brief")
     def update_brief(payload: BriefUpdate) -> dict[str, Any]:
@@ -842,6 +908,12 @@ def create_content_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
+            chapters = db.execute(
+                """SELECT id, revision FROM creative_chapters
+                WHERE project_id = ? AND status <> 'archived' ORDER BY ordinal""",
+                (project["id"],),
+            ).fetchall()
+            _verify_revision_map(chapters, payload.base_revisions, "章节排序")
             _normalize_order(db, "creative_chapters", "chapter", project["id"], payload.ids, payload.source)
             db.commit()
         return _workspace(db_path)
@@ -908,6 +980,13 @@ def create_content_router(db_path: Path) -> APIRouter:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
             chapter = _row_for_project(db, "creative_chapters", chapter_id, project["id"])
+            sections = db.execute(
+                """SELECT id, revision FROM creative_sections
+                WHERE chapter_id = ? AND status <> 'archived' ORDER BY ordinal""",
+                (chapter_id,),
+            ).fetchall()
+            _verify_parent_revision(chapter, payload.parent_base_revision, "小节排序")
+            _verify_revision_map(sections, payload.base_revisions, "小节排序")
             _normalize_order(
                 db, "creative_sections", "section", project["id"], payload.ids, payload.source, chapter_id=chapter_id,
             )
@@ -924,11 +1003,20 @@ def create_content_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            chapter = _row_for_project(db, "creative_chapters", chapter_id, project["id"])
+            chapters = db.execute(
+                """SELECT * FROM creative_chapters
+                WHERE project_id = ? AND status <> 'archived' ORDER BY ordinal""",
+                (project["id"],),
+            ).fetchall()
+            _verify_revision_map(chapters, payload.base_revisions, "章节拆分")
+            chapter = next((record for record in chapters if record["id"] == chapter_id), None)
+            if not chapter:
+                raise HTTPException(404, "创作内容不存在或不属于当前项目")
             sections = db.execute(
                 "SELECT * FROM creative_sections WHERE chapter_id = ? AND status <> 'archived' ORDER BY ordinal",
                 (chapter_id,),
             ).fetchall()
+            _verify_revision_map(sections, payload.child_base_revisions, "章节拆分涉及的小节")
             split_index = next((index for index, section in enumerate(sections) if section["id"] == payload.section_id), -1)
             if split_index <= 0:
                 raise HTTPException(422, "请选择当前章节第二个或更后面的小节作为拆分起点")
@@ -967,8 +1055,16 @@ def create_content_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            source = _row_for_project(db, "creative_chapters", chapter_id, project["id"])
-            target = _row_for_project(db, "creative_chapters", payload.target_id, project["id"])
+            chapters = db.execute(
+                """SELECT * FROM creative_chapters
+                WHERE project_id = ? AND status <> 'archived' ORDER BY ordinal""",
+                (project["id"],),
+            ).fetchall()
+            _verify_revision_map(chapters, payload.base_revisions, "章节合并")
+            source = next((record for record in chapters if record["id"] == chapter_id), None)
+            target = next((record for record in chapters if record["id"] == payload.target_id), None)
+            if not source or not target:
+                raise HTTPException(404, "创作内容不存在或不属于当前项目")
             if source["id"] == target["id"]:
                 raise HTTPException(422, "章节不能合并到自身")
             start = int(db.execute(
@@ -979,6 +1075,7 @@ def create_content_router(db_path: Path) -> APIRouter:
                 "SELECT * FROM creative_sections WHERE chapter_id = ? AND status <> 'archived' ORDER BY ordinal",
                 (source["id"],),
             ).fetchall()
+            _verify_revision_map(source_sections, payload.child_base_revisions, "章节合并涉及的小节")
             for offset, section in enumerate(source_sections, start=1):
                 db.execute(
                     """UPDATE creative_sections SET chapter_id = ?, ordinal = ?, revision = revision + 1,
@@ -1011,7 +1108,16 @@ def create_content_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            section = _row_for_project(db, "creative_sections", section_id, project["id"])
+            section_row = _row_for_project(db, "creative_sections", section_id, project["id"])
+            chapter = _row_for_project(db, "creative_chapters", section_row["chapter_id"], project["id"])
+            sections = db.execute(
+                """SELECT * FROM creative_sections
+                WHERE chapter_id = ? AND status <> 'archived' ORDER BY ordinal""",
+                (chapter["id"],),
+            ).fetchall()
+            _verify_parent_revision(chapter, payload.parent_base_revision, "小节拆分")
+            _verify_revision_map(sections, payload.base_revisions, "小节拆分")
+            section = next(record for record in sections if record["id"] == section_id)
             _shift_ordinals(
                 db, "creative_sections", "section", project["id"], f"{payload.source}:reorder",
                 ordinal_after=int(section["ordinal"]), chapter_id=section["chapter_id"],
@@ -1048,8 +1154,19 @@ def create_content_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            source = _row_for_project(db, "creative_sections", section_id, project["id"])
-            target = _row_for_project(db, "creative_sections", payload.target_id, project["id"])
+            source_row = _row_for_project(db, "creative_sections", section_id, project["id"])
+            chapter = _row_for_project(db, "creative_chapters", source_row["chapter_id"], project["id"])
+            sections = db.execute(
+                """SELECT * FROM creative_sections
+                WHERE chapter_id = ? AND status <> 'archived' ORDER BY ordinal""",
+                (chapter["id"],),
+            ).fetchall()
+            _verify_parent_revision(chapter, payload.parent_base_revision, "小节合并")
+            _verify_revision_map(sections, payload.base_revisions, "小节合并")
+            source = next((record for record in sections if record["id"] == section_id), None)
+            target = next((record for record in sections if record["id"] == payload.target_id), None)
+            if not source or not target:
+                raise HTTPException(404, "创作内容不存在或不属于当前项目")
             if source["id"] == target["id"]:
                 raise HTTPException(422, "小节不能合并到自身")
             if source["chapter_id"] != target["chapter_id"]:

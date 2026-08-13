@@ -7,6 +7,8 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
+from fastapi import HTTPException
+
 from backend import app as studio
 from backend.content_planning import (
     BriefUpdate,
@@ -63,6 +65,30 @@ class ContentPlanningContractTests(unittest.TestCase):
 
     def workspace(self):
         return self.call("/api/creative-planning", "GET")
+
+    def mutation_state(self) -> dict[str, object]:
+        with closing(studio.connect()) as db:
+            chapters = [
+                dict(item)
+                for item in db.execute(
+                    """SELECT id, ordinal, title, summary, status, revision FROM creative_chapters
+                    WHERE project_id = ? ORDER BY id""",
+                    (self.empty_project["id"],),
+                ).fetchall()
+            ]
+            sections = [
+                dict(item)
+                for item in db.execute(
+                    """SELECT id, chapter_id, ordinal, title, summary, status, revision FROM creative_sections
+                    WHERE project_id = ? ORDER BY id""",
+                    (self.empty_project["id"],),
+                ).fetchall()
+            ]
+            revisions = int(db.execute(
+                "SELECT COUNT(*) FROM creative_revisions WHERE project_id = ?",
+                (self.empty_project["id"],),
+            ).fetchone()[0])
+        return {"chapters": chapters, "sections": sections, "revision_count": revisions}
 
     def test_empty_project_brief_multiple_proposals_single_final_and_immutable_history(self) -> None:
         initial = self.workspace()
@@ -218,7 +244,12 @@ class ContentPlanningContractTests(unittest.TestCase):
             "/api/creative-planning/chapters/{chapter_id}/sections/order",
             "PUT",
             chapter["id"],
-            OrderUpdate(ids=reordered_ids, source="human:test-section-order"),
+            OrderUpdate(
+                ids=reordered_ids,
+                base_revisions={item["id"]: item["revision"] for item in chapter["sections"]},
+                parent_base_revision=chapter["revision"],
+                source="human:test-section-order",
+            ),
         )
         self.assertEqual([item["id"] for item in reordered["chapters"][0]["sections"]], reordered_ids)
 
@@ -231,6 +262,8 @@ class ContentPlanningContractTests(unittest.TestCase):
                 new_title="楼层熄灭",
                 summary_before="楼层显示跳过十二。",
                 summary_after="显示屏突然熄灭。",
+                base_revisions={item["id"]: item["revision"] for item in reordered["chapters"][0]["sections"]},
+                parent_base_revision=reordered["chapters"][0]["revision"],
                 source="human:test-section-split",
             ),
         )
@@ -242,7 +275,12 @@ class ContentPlanningContractTests(unittest.TestCase):
             "/api/creative-planning/sections/{section_id}/merge",
             "POST",
             split_new["id"],
-            MergeRequest(target_id=merge_target["id"], source="human:test-section-merge"),
+            MergeRequest(
+                target_id=merge_target["id"],
+                base_revisions={item["id"]: item["revision"] for item in sections},
+                parent_base_revision=split_sections["chapters"][0]["revision"],
+                source="human:test-section-merge",
+            ),
         )
         self.assertEqual(len(merged_sections["chapters"][0]["sections"]), 3)
         self.assertIn("突然熄灭", merged_sections["chapters"][0]["sections"][0]["summary"])
@@ -255,6 +293,8 @@ class ContentPlanningContractTests(unittest.TestCase):
             ChapterSplit(
                 section_id=chapter["sections"][1]["id"],
                 new_title="深入禁区",
+                base_revisions={item["id"]: item["revision"] for item in merged_sections["chapters"]},
+                child_base_revisions={item["id"]: item["revision"] for item in chapter["sections"]},
                 source="human:test-chapter-split",
             ),
         )
@@ -274,14 +314,24 @@ class ContentPlanningContractTests(unittest.TestCase):
         chapter_reordered = self.call(
             "/api/creative-planning/chapters/order",
             "PUT",
-            OrderUpdate(ids=[second_chapter["id"], first_chapter["id"]], source="human:test-chapter-order"),
+            OrderUpdate(
+                ids=[second_chapter["id"], first_chapter["id"]],
+                base_revisions={item["id"]: item["revision"] for item in chapter_split["chapters"]},
+                source="human:test-chapter-order",
+            ),
         )
         self.assertEqual([item["id"] for item in chapter_reordered["chapters"]], [second_chapter["id"], first_chapter["id"]])
+        reordered_first = next(item for item in chapter_reordered["chapters"] if item["id"] == first_chapter["id"])
         after_merge = self.call(
             "/api/creative-planning/chapters/{chapter_id}/merge",
             "POST",
             first_chapter["id"],
-            MergeRequest(target_id=second_chapter["id"], source="human:test-chapter-merge"),
+            MergeRequest(
+                target_id=second_chapter["id"],
+                base_revisions={item["id"]: item["revision"] for item in chapter_reordered["chapters"]},
+                child_base_revisions={item["id"]: item["revision"] for item in reordered_first["sections"]},
+                source="human:test-chapter-merge",
+            ),
         )
         self.assertEqual(len(after_merge["chapters"]), 1)
         persisted_title = after_merge["chapters"][0]["title"]
@@ -293,6 +343,219 @@ class ContentPlanningContractTests(unittest.TestCase):
         self.assertTrue(legacy_workspace["chapters"])
         studio.set_active_project(self.empty_project["id"])
         self.assertEqual(self.workspace()["chapters"][0]["title"], persisted_title)
+
+    def test_stale_reorder_is_409_and_leaves_content_status_order_and_revisions_unchanged(self) -> None:
+        self.call("/api/creative-planning/chapters", "POST", ChapterCreate(title="第一章", summary="旧摘要"))
+        stale = self.call("/api/creative-planning/chapters", "POST", ChapterCreate(title="第二章", summary="稳定摘要"))
+        first, second = stale["chapters"]
+        self.call(
+            "/api/creative-planning/chapters/{chapter_id}", "PATCH", first["id"],
+            ChapterUpdate(base_revision=first["revision"], summary="R2 新摘要", source="human:newer-tab"),
+        )
+        before = self.mutation_state()
+        with self.assertRaises(HTTPException) as stale_error:
+            self.call(
+                "/api/creative-planning/chapters/order", "PUT",
+                OrderUpdate(
+                    ids=[second["id"], first["id"]],
+                    base_revisions={item["id"]: item["revision"] for item in stale["chapters"]},
+                    source="human:stale-tab",
+                ),
+            )
+        self.assertEqual(stale_error.exception.status_code, 409)
+        self.assertEqual(self.mutation_state(), before)
+
+    def test_stale_section_split_is_409_and_cannot_overwrite_newer_summary(self) -> None:
+        chapter = self.call(
+            "/api/creative-planning/chapters", "POST", ChapterCreate(title="第一章", summary="章节"),
+        )["chapters"][0]
+        self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", chapter["id"],
+            SectionCreate(title="起点", summary="R1 旧摘要", planned_seconds=8),
+        )
+        stale = self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", chapter["id"],
+            SectionCreate(title="转折", summary="稳定摘要", planned_seconds=8),
+        )["chapters"][0]
+        source = stale["sections"][0]
+        self.call(
+            "/api/creative-planning/sections/{section_id}", "PATCH", source["id"],
+            SectionUpdate(base_revision=source["revision"], summary="R2 newer summary", source="human:newer-tab"),
+        )
+        current = self.workspace()["chapters"][0]
+        before = self.mutation_state()
+        with self.assertRaises(HTTPException) as stale_error:
+            self.call(
+                "/api/creative-planning/sections/{section_id}/split", "POST", source["id"],
+                SectionSplit(
+                    new_title="被阻止的新节",
+                    summary_before="R1 旧摘要",
+                    summary_after="旧标签页内容",
+                    base_revisions={item["id"]: item["revision"] for item in stale["sections"]},
+                    parent_base_revision=current["revision"],
+                    source="human:stale-tab",
+                ),
+            )
+        self.assertEqual(stale_error.exception.status_code, 409)
+        self.assertEqual(self.mutation_state(), before)
+        self.assertEqual(self.workspace()["chapters"][0]["sections"][0]["summary"], "R2 newer summary")
+
+    def test_stale_chapter_split_is_409_and_moves_no_sections(self) -> None:
+        chapter = self.call(
+            "/api/creative-planning/chapters", "POST", ChapterCreate(title="第一章", summary="章节"),
+        )["chapters"][0]
+        self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", chapter["id"],
+            SectionCreate(title="起点", summary="第一节"),
+        )
+        stale = self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", chapter["id"],
+            SectionCreate(title="转折", summary="R1 旧摘要"),
+        )
+        stale_chapter = stale["chapters"][0]
+        moved = stale_chapter["sections"][1]
+        self.call(
+            "/api/creative-planning/sections/{section_id}", "PATCH", moved["id"],
+            SectionUpdate(base_revision=moved["revision"], summary="R2 新摘要", source="human:newer-tab"),
+        )
+        before = self.mutation_state()
+        with self.assertRaises(HTTPException) as stale_error:
+            self.call(
+                "/api/creative-planning/chapters/{chapter_id}/split", "POST", stale_chapter["id"],
+                ChapterSplit(
+                    section_id=moved["id"],
+                    new_title="被阻止的新章",
+                    base_revisions={item["id"]: item["revision"] for item in stale["chapters"]},
+                    child_base_revisions={item["id"]: item["revision"] for item in stale_chapter["sections"]},
+                    source="human:stale-tab",
+                ),
+            )
+        self.assertEqual(stale_error.exception.status_code, 409)
+        self.assertEqual(self.mutation_state(), before)
+
+    def test_stale_section_and_chapter_merge_are_409_and_archive_nothing(self) -> None:
+        first = self.call(
+            "/api/creative-planning/chapters", "POST", ChapterCreate(title="第一章", summary="一"),
+        )["chapters"][0]
+        self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", first["id"],
+            SectionCreate(title="起点", summary="R1 目标"),
+        )
+        stale_sections = self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", first["id"],
+            SectionCreate(title="来源", summary="待合并"),
+        )["chapters"][0]
+        target, source = stale_sections["sections"]
+        self.call(
+            "/api/creative-planning/sections/{section_id}", "PATCH", target["id"],
+            SectionUpdate(base_revision=target["revision"], summary="R2 目标", source="human:newer-tab"),
+        )
+        current_parent = self.workspace()["chapters"][0]
+        before_section_merge = self.mutation_state()
+        with self.assertRaises(HTTPException) as section_error:
+            self.call(
+                "/api/creative-planning/sections/{section_id}/merge", "POST", source["id"],
+                MergeRequest(
+                    target_id=target["id"],
+                    base_revisions={item["id"]: item["revision"] for item in stale_sections["sections"]},
+                    parent_base_revision=current_parent["revision"],
+                    source="human:stale-tab",
+                ),
+            )
+        self.assertEqual(section_error.exception.status_code, 409)
+        self.assertEqual(self.mutation_state(), before_section_merge)
+
+        stale_chapters = self.call(
+            "/api/creative-planning/chapters", "POST", ChapterCreate(title="第二章", summary="R1 第二章"),
+        )
+        source_chapter = stale_chapters["chapters"][0]
+        target_chapter = stale_chapters["chapters"][1]
+        self.call(
+            "/api/creative-planning/chapters/{chapter_id}", "PATCH", target_chapter["id"],
+            ChapterUpdate(base_revision=target_chapter["revision"], summary="R2 第二章", source="human:newer-tab"),
+        )
+        before_chapter_merge = self.mutation_state()
+        with self.assertRaises(HTTPException) as chapter_error:
+            self.call(
+                "/api/creative-planning/chapters/{chapter_id}/merge", "POST", source_chapter["id"],
+                MergeRequest(
+                    target_id=target_chapter["id"],
+                    base_revisions={item["id"]: item["revision"] for item in stale_chapters["chapters"]},
+                    child_base_revisions={item["id"]: item["revision"] for item in source_chapter["sections"]},
+                    source="human:stale-tab",
+                ),
+            )
+        self.assertEqual(chapter_error.exception.status_code, 409)
+        self.assertEqual(self.mutation_state(), before_chapter_merge)
+
+    def test_archived_proposal_character_chapter_and_section_keep_reachable_history(self) -> None:
+        proposal_workspace = self.call(
+            "/api/creative-planning/proposals", "POST",
+            ProposalCreate(title="待归档提案", synopsis="归档后仍可查", source="human:archive-test"),
+        )
+        proposal = next(item for item in proposal_workspace["proposals"] if item["title"] == "待归档提案")
+        self.call(
+            "/api/creative-planning/proposals/{proposal_id}/archive", "POST", proposal["id"],
+            RevisionBase(base_revision=proposal["revision"], source="human:archive-proposal"),
+        )
+
+        character = self.call(
+            "/api/creative-planning/characters", "POST",
+            CharacterCreate(name="归档角色", identity="测试角色", source="human:archive-test"),
+        )["characters"][0]
+        self.call(
+            "/api/creative-planning/characters/{character_id}/archive", "POST", character["id"],
+            RevisionBase(base_revision=character["revision"], source="human:archive-character"),
+        )
+
+        section_chapter = self.call(
+            "/api/creative-planning/chapters", "POST", ChapterCreate(title="保留章节", summary="保留"),
+        )["chapters"][0]
+        section_workspace = self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", section_chapter["id"],
+            SectionCreate(title="单独归档小节", summary="小节历史"),
+        )
+        section = section_workspace["chapters"][0]["sections"][0]
+        self.call(
+            "/api/creative-planning/sections/{section_id}/archive", "POST", section["id"],
+            RevisionBase(base_revision=section["revision"], source="human:archive-section"),
+        )
+
+        chapter = self.call(
+            "/api/creative-planning/chapters", "POST", ChapterCreate(title="归档章节", summary="章节历史"),
+        )["chapters"][-1]
+        chapter_workspace = self.call(
+            "/api/creative-planning/chapters/{chapter_id}/sections", "POST", chapter["id"],
+            SectionCreate(title="随章节归档", summary="级联归档历史"),
+        )
+        chapter = next(item for item in chapter_workspace["chapters"] if item["id"] == chapter["id"])
+        self.call(
+            "/api/creative-planning/chapters/{chapter_id}/archive", "POST", chapter["id"],
+            RevisionBase(base_revision=chapter["revision"], source="human:archive-chapter"),
+        )
+
+        archive = self.call("/api/creative-planning/archive", "GET")
+        expected = {
+            ("proposal", proposal["id"]),
+            ("character", character["id"]),
+            ("chapter", chapter["id"]),
+            ("section", section["id"]),
+        }
+        actual = {(item["entity_type"], item["id"]) for item in archive["entries"]}
+        self.assertTrue(expected.issubset(actual))
+        self.assertGreaterEqual(archive["summary"]["by_type"]["section"], 2)
+        for entity_type, entity_id in expected:
+            with self.subTest(entity_type=entity_type):
+                entry = next(item for item in archive["entries"] if item["entity_type"] == entity_type and item["id"] == entity_id)
+                self.assertEqual(entry["status"], "archived")
+                self.assertTrue(entry["title"])
+                self.assertTrue(entry["archived_at"])
+                self.assertTrue(entry["source"].startswith("human:archive"))
+                history = self.call(
+                    "/api/creative-planning/history/{entity_type}/{entity_id}", "GET", entity_type, entity_id,
+                )
+                self.assertEqual(history["revisions"][0]["snapshot"]["status"], "archived")
+                self.assertEqual(history["revisions"][0]["source"], entry["source"])
 
     def test_legacy_production_evidence_survives_idempotent_migration_and_is_archived(self) -> None:
         studio.set_active_project(self.legacy_project["id"])
