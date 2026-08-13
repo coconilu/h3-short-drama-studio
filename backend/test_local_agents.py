@@ -183,32 +183,37 @@ class LocalAgentContractTests(unittest.TestCase):
         cases = (
             (
                 "providers-empty",
-                {"providers": [], "models": {"fake-kimi-model": {"provider": "fake"}}, "defaultModel": "fake-kimi-model"},
+                {"providers": [], "models": {"fake-kimi-model": {"provider": "fake", "model": "upstream"}}, "defaultModel": "fake-kimi-model"},
                 "", False, "unavailable",
             ),
-            ("models-empty", {"providers": {"fake": {}}, "models": {}}, "", False, "unavailable"),
+            ("models-empty", {"providers": {"fake": {"type": "test"}}, "models": {}}, "", False, "unavailable"),
             (
                 "valid-default",
-                {"providers": {"fake": {}}, "models": {"fake-kimi-model": {"provider": "fake"}}, "defaultModel": "fake-kimi-model"},
+                {"providers": {"fake": {"type": "test"}}, "models": {"fake-kimi-model": {"provider": "fake", "model": "upstream"}}, "defaultModel": "fake-kimi-model"},
                 "", True, "verified",
             ),
             (
                 "no-default",
-                {"providers": {"fake": {}}, "models": {"fake-kimi-model": {"provider": "fake"}}},
+                {"providers": {"fake": {"type": "test"}}, "models": {"fake-kimi-model": {"provider": "fake", "model": "upstream"}}},
                 "", True, "unverified",
             ),
             (
                 "name-only-in-url-and-description",
                 {
-                    "providers": {"fake": {"baseUrl": "https://fake-kimi-model.invalid"}},
-                    "models": {"different-model": {"provider": "fake", "description": "fake-kimi-model"}},
+                    "providers": {"fake": {"type": "test", "baseUrl": "https://fake-kimi-model.invalid"}},
+                    "models": {"different-model": {"provider": "fake", "model": "upstream", "description": "fake-kimi-model"}},
                 },
                 "fake-kimi-model", False, "unavailable",
             ),
             (
                 "exact-alias",
-                {"providers": {"fake": {}}, "models": {"fake-kimi-model": {"provider": "fake"}}},
+                {"providers": {"fake": {"type": "test"}}, "models": {"fake-kimi-model": {"provider": "fake", "model": "upstream"}}},
                 "fake-kimi-model", True, "verified",
+            ),
+            (
+                "upstream-model-name-is-not-alias",
+                {"providers": {"fake": {"type": "test"}}, "models": {"fake-kimi-model": {"provider": "fake", "model": "upstream"}}},
+                "upstream", False, "unavailable",
             ),
         )
         for name, config, configured_model, expected_callable, expected_model_state in cases:
@@ -229,6 +234,40 @@ class LocalAgentContractTests(unittest.TestCase):
                 self.assertEqual(status["callable_state"], "unverified" if expected_callable else "unavailable")
                 if name == "no-default":
                     self.assertIn("未声明默认模型", status["action_hint"])
+
+    def test_kimi_provider_json_probe_rejects_malformed_records_and_orphan_models(self) -> None:
+        valid_provider = {"fake": {"type": "test"}}
+        valid_model = {"fake-model": {"provider": "fake", "model": "upstream-model"}}
+        cases = {
+            "providers-null": {"providers": None, "models": valid_model},
+            "provider-null-record": {"providers": {"fake": None}, "models": valid_model},
+            "provider-scalar-record": {"providers": {"fake": "test"}, "models": valid_model},
+            "provider-type-null": {"providers": {"fake": {"type": None}}, "models": valid_model},
+            "provider-id-malformed": {"providers": {"fake": {"type": "test", "id": 7}}, "models": valid_model},
+            "models-null": {"providers": valid_provider, "models": None},
+            "model-null-record": {"providers": valid_provider, "models": {"fake-model": None}},
+            "model-scalar-record": {"providers": valid_provider, "models": {"fake-model": "upstream"}},
+            "model-provider-scalar": {"providers": valid_provider, "models": {"fake-model": {"provider": 7, "model": "upstream"}}},
+            "model-name-null": {"providers": valid_provider, "models": {"fake-model": {"provider": "fake", "model": None}}},
+            "model-alias-malformed": {"providers": valid_provider, "models": {"fake-model": {"provider": "fake", "model": "upstream", "aliases": ["ok", 7]}}},
+            "orphan-provider-reference": {"providers": valid_provider, "models": {"fake-model": {"provider": "missing", "model": "upstream"}}},
+        }
+        for name, config in cases.items():
+            with self.subTest(name=name):
+                with closing(studio.connect()) as db:
+                    db.execute("UPDATE local_agent_providers SET model = '' WHERE id = 'kimi'")
+                    db.commit()
+
+                def fake_probe(_executable: str, args: list[str], _adapter: str, _timeout: int):
+                    if args == ["--version"]:
+                        return subprocess.CompletedProcess(args, 0, "fake-local-agent 1.0\n", "")
+                    return subprocess.CompletedProcess(args, 0, json.dumps(config), "")
+
+                with patch("backend.local_agents._probe_command", side_effect=fake_probe):
+                    status = probe_provider(studio.DB_PATH, "kimi")
+                self.assertFalse(status["callable"])
+                self.assertEqual(status["model_state"], "unavailable")
+                self.assertEqual(status["callable_state"], "unavailable")
 
     def test_cached_provider_status_does_not_run_probe_commands(self) -> None:
         with patch("backend.local_agents._probe_command", side_effect=AssertionError("probe must stay idle")):

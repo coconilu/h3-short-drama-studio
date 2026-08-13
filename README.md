@@ -526,7 +526,7 @@ Tauri WebView2 打开工作台
 
 ## 分层创作本地 Agent（Issue #3）
 
-“系统设置 → 本地 Agent”分别维护 Codex CLI 与 Kimi Code CLI 的可执行文件、模型和超时配置。探测会分开显示 CLI 安装、认证配置、模型配置和实际可调用性：Codex 使用 `login status`，Kimi 会严格解析 `provider list --json`，并只接受结构化字段中的精确模型别名/ID；空模型配置需要可解析的默认模型，否则会诚实标记为“未验证”。两者都不发送生成请求或消耗模型额度。配置不包含 API Key、Token 或其他明文密钥。
+“系统设置 → 本地 Agent”分别维护 Codex CLI 与 Kimi Code CLI 的可执行文件、模型和超时配置。探测会分开显示 CLI 安装、认证配置、模型配置和实际可调用性：Codex 使用 `login status`，Kimi 会严格解析 `provider list --json`，验证 provider/model 记录类型和引用关系，并只接受结构化字段中的精确模型别名/ID；空模型配置需要可解析的默认模型，否则会诚实标记为“未验证”。两者都不发送生成请求或消耗模型额度。配置不包含 API Key、Token 或其他明文密钥。
 
 | 创作层级 | 结构化输出 | 人工确认后的写入 |
 |---|---|---|

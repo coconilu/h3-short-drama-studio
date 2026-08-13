@@ -284,24 +284,55 @@ def _probe_command(executable: str, args: list[str], adapter: str, timeout_secon
     )
 
 
-def _structural_ids(value: Any, *, fields: tuple[str, ...]) -> set[str]:
+def _structural_ids(
+    value: Any, *, record_kind: Literal["provider", "model"], provider_ids: set[str] | None = None
+) -> set[str]:
+    """Parse identifiers only from records that conform to Kimi's provider-list contract."""
     identifiers: set[str] = set()
     if isinstance(value, dict):
-        identifiers.update(str(key).strip() for key in value if str(key).strip())
-        records = value.values()
+        records = list(value.items())
     elif isinstance(value, list):
-        records = value
+        records = [(None, record) for record in value]
     else:
-        return identifiers
-    for record in records:
+        raise ValueError(f"Kimi {record_kind} 集合必须是对象或数组")
+    for mapping_key, record in records:
+        record_identifiers: set[str] = set()
         if not isinstance(record, dict):
-            continue
-        for field in fields:
+            raise ValueError(f"Kimi {record_kind} 记录必须是对象")
+        if mapping_key is not None:
+            if not isinstance(mapping_key, str) or not mapping_key.strip():
+                raise ValueError(f"Kimi {record_kind} 映射键必须是非空字符串")
+            record_identifiers.add(mapping_key.strip())
+        for field in ("id", "alias"):
+            if field not in record:
+                continue
             candidate = record.get(field)
-            if isinstance(candidate, str) and candidate.strip():
-                identifiers.add(candidate.strip())
-            elif isinstance(candidate, list):
-                identifiers.update(str(item).strip() for item in candidate if isinstance(item, str) and item.strip())
+            if not isinstance(candidate, str) or not candidate.strip():
+                raise ValueError(f"Kimi {record_kind}.{field} 必须是非空字符串")
+            record_identifiers.add(candidate.strip())
+        if "aliases" in record:
+            aliases = record["aliases"]
+            if not isinstance(aliases, list) or not aliases or any(
+                not isinstance(alias, str) or not alias.strip() for alias in aliases
+            ):
+                raise ValueError(f"Kimi {record_kind}.aliases 必须是非空字符串数组")
+            record_identifiers.update(alias.strip() for alias in aliases)
+        if mapping_key is None and not record_identifiers:
+            raise ValueError(f"Kimi {record_kind} 数组记录必须声明 id 或 alias")
+        if record_kind == "provider":
+            provider_type = record.get("type")
+            if not isinstance(provider_type, str) or not provider_type.strip():
+                raise ValueError("Kimi provider.type 必须是非空字符串")
+        else:
+            provider_reference = record.get("provider")
+            model_name = record.get("model")
+            if not isinstance(provider_reference, str) or not provider_reference.strip():
+                raise ValueError("Kimi model.provider 必须是非空字符串")
+            if provider_ids is None or provider_reference.strip() not in provider_ids:
+                raise ValueError(f"Kimi model.provider 指向未知提供方：{provider_reference}")
+            if not isinstance(model_name, str) or not model_name.strip():
+                raise ValueError("Kimi model.model 必须是非空字符串")
+        identifiers.update(record_identifiers)
     return identifiers
 
 
@@ -313,11 +344,17 @@ def _parse_kimi_provider_config(raw: str, configured_model: str) -> tuple[bool, 
         return False, "unavailable", "Kimi provider list --json 返回了无效 JSON"
     if not isinstance(payload, dict):
         return False, "unavailable", "Kimi provider 配置必须是 JSON 对象"
-    provider_ids = _structural_ids(payload.get("providers"), fields=("id", "alias", "aliases"))
+    try:
+        provider_ids = _structural_ids(payload.get("providers"), record_kind="provider")
+    except ValueError as exc:
+        return False, "unavailable", str(exc)
     if not provider_ids:
         return False, "unavailable", "Kimi provider 配置中没有可用提供方"
     models = payload.get("models")
-    model_ids = _structural_ids(models, fields=("id", "alias", "aliases", "model"))
+    try:
+        model_ids = _structural_ids(models, record_kind="model", provider_ids=provider_ids)
+    except ValueError as exc:
+        return False, "unavailable", str(exc)
     if not model_ids:
         return False, "unavailable", "Kimi provider 配置中没有可用模型"
 
