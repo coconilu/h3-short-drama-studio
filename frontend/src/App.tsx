@@ -606,7 +606,7 @@ function App() {
         {activePage === 'global-queue' && <GlobalQueuePage workbench={workbench} onOpenProject={switchProject} />}
         {activePage === 'settings' && <SettingsPage settings={settings} health={health} onSave={saveSettings} onTest={testConnection} onRestartApi={restartApi} />}
 
-        {activePage === 'planning' && <CreativePlanning key={project.id} projectId={project.id} setNotice={setNotice} onOpenScript={() => setActivePage('script')} />}
+        {activePage === 'planning' && <CreativePlanning key={project.id} projectId={project.id} setNotice={setNotice} onOpenScript={() => setActivePage('script')} onOpenStoryboard={async () => { await refresh(); setActivePage('storyboard') }} />}
         {activePage === 'script' && <ScriptStudio project={project} setNotice={setNotice} onProjectRefresh={refresh} onOpenStoryboard={() => setActivePage('storyboard')} />}
         {activePage === 'bible' && <ProductionBible key={project.id} projectId={project.id} assets={assets} setNotice={setNotice} />}
         {activePage === 'compiler' && <PromptCompiler key={project.id} projectId={project.id} setNotice={setNotice} onOpenStoryboard={(shotId) => { setSelectedShotId(shotId); setActivePage('storyboard') }} />}
@@ -840,7 +840,7 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
               <button className={`batch-check ${batchSelection.has(shot.id) ? 'checked' : ''}`} aria-label={`${batchSelection.has(shot.id) ? '取消选择' : '选择'} ${displayShotId(shot.id)}`} onClick={(event) => { event.stopPropagation(); changeBatchSelection(shot.id) }}>{batchSelection.has(shot.id) && <Check size={13} />}</button>
               <div className="shot-code"><strong>{displayShotId(shot.id)}</strong><span>{shot.scene_code}</span></div>
               <ShotThumbnail shot={shot} />
-              <div className="shot-copy"><strong>{shot.title}</strong><p>{shot.description}</p>{shot.dialogue && <em>{shot.dialogue}</em>}</div>
+              <div className="shot-copy"><strong>{shot.title}</strong><p>{shot.description}</p>{shot.dialogue && <em>{shot.dialogue}</em>}{shot.sound && <small>声音：{shot.sound}</small>}{shot.source_mapping ? <small className="shot-source">来源：小节“{shot.source_mapping.section_title}” · 同步 R{shot.source_mapping.last_synced_revision}</small> : <small className="shot-source manual">历史手工分镜 · 无小节映射</small>}</div>
               <div className="shot-spec"><span>{shot.width}×{shot.height}</span><span>{shot.seconds} 秒</span><span>{shot.candidate_count} 条候选</span></div>
               <StatusPill status={shot.status} />
               <ChevronRight size={16} />
@@ -852,6 +852,7 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
         <div className="inspector-title"><div><span>镜头检查器</span><strong>{displayShotId(selectedShot.id)}</strong></div><button title="保存" onClick={() => onUpdate(draft.id, draft)}><Save size={18} /></button></div>
         <label>镜头标题<input value={draft.title} onChange={(event) => { setDraft({ ...draft, title: event.target.value }); setDryRun(null) }} /></label>
         <label>画面提示词<textarea rows={6} value={draft.prompt} onChange={(event) => { setDraft({ ...draft, prompt: event.target.value }); setDryRun(null) }} /></label>
+        <label>声音提示<textarea rows={3} value={draft.sound || ''} onChange={(event) => { setDraft({ ...draft, sound: event.target.value }); setDryRun(null) }} /></label>
         <div className="reference-section">
           <div className="label-line"><span>生成路线与参考</span><button className="text-action" onClick={() => setPickerOpen(true)}><Link2 size={13} />绑定素材</button></div>
           <div className={`generation-route ${references.length ? 'reference' : 'text-only'}`}><span>{references.length ? 'REF2VA · 多模态参考' : 'FL2VA · 纯文本生成'}</span><p>{references.length ? '提示词与已排序的图片、视频或音频共同驱动生成。' : '无需任何素材；仅使用下面的画面提示词生成视频与音频。'}</p></div>

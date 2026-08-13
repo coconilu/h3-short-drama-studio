@@ -172,8 +172,9 @@ export function PromptCompiler({ projectId, setNotice, onOpenStoryboard }: Props
           <div><span>候选策略</span><strong>{selected.spec.candidate_count} 条 × {selected.spec.steps} 步</strong></div>
         </div>
 
-        {(selected.blocking.length > 0 || selected.warnings.length > 0 || error) && <div className="compiler-alerts">
+        {(selected.stale || selected.blocking.length > 0 || selected.warnings.length > 0 || error) && <div className="compiler-alerts">
           {error && <div className="blocking"><AlertTriangle size={16} /><span>{error}</span></div>}
+          {selected.stale_reasons.map((item) => <div className="blocking" key={`stale-${item}`}><RefreshCw size={16} /><span>已批准计划已过期：{item}。请重新 dry-run 并批准。</span></div>)}
           {selected.blocking.map((item) => <div className="blocking" key={item}><AlertTriangle size={16} /><span>{item}</span></div>)}
           {selected.warnings.map((item) => <div className="warning" key={item}><AlertTriangle size={16} /><span>{item}</span></div>)}
         </div>}
@@ -185,9 +186,11 @@ export function PromptCompiler({ projectId, setNotice, onOpenStoryboard }: Props
               <label>原始镜头提示词 <em>只读 · 不覆盖</em></label>
               <p>{selected.shot.prompt || '尚未填写'}</p>
               {selected.shot.dialogue && <blockquote>对白：{selected.shot.dialogue}</blockquote>}
+              {selected.shot.sound && <blockquote>声音：{selected.shot.sound}</blockquote>}
+              {selected.storyboard_source && <small>分镜来源：小节“{selected.storyboard_source.section_title}” · 已同步 R{selected.storyboard_source.last_synced_revision} · 当前 R{selected.storyboard_source.current_section_revision}</small>}
             </div>
             <div className="compiler-evidence-list">
-              {selected.bible.map((entry) => <div key={entry.id}><ShieldCheck size={16} /><span><strong>{entry.name}</strong><small>{entry.entry_type} · 修订 {entry.revision} · {entry.apply_globally ? '全局' : '本镜头'}</small></span><em>{entry.asset_ids.length ? `${entry.asset_ids.length} 素材` : '纯文本'}</em></div>)}
+              {selected.bible.map((entry) => <div key={entry.id}><ShieldCheck size={16} /><span><strong>{entry.name}</strong><small>{entry.entry_type} · 修订 {entry.revision} · {entry.apply_globally ? '全局' : '本镜头'}{entry.source_type === 'creative_character' ? ` · 来源角色卡 R${entry.source_revision}` : ''}</small></span><em>{entry.asset_ids.length ? `${entry.asset_ids.length} 素材` : '纯文本'}</em></div>)}
               {!selected.bible.length && <p className="compiler-muted">没有进入编译的锁定生产圣经条目</p>}
             </div>
           </section>

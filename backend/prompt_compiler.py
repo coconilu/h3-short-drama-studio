@@ -79,6 +79,46 @@ def init_prompt_schema(db: sqlite3.Connection) -> None:
           ON h3_prompt_plans(shot_id, created_at DESC);
         """
     )
+    columns = {row[1] for row in db.execute("PRAGMA table_info(h3_prompt_plans)").fetchall()}
+    if "stale_reasons" not in columns:
+        db.execute("ALTER TABLE h3_prompt_plans ADD COLUMN stale_reasons TEXT NOT NULL DEFAULT '[]'")
+    if "superseded_at" not in columns:
+        db.execute("ALTER TABLE h3_prompt_plans ADD COLUMN superseded_at TEXT")
+
+
+def mark_prompt_plans_stale(
+    db: sqlite3.Connection,
+    project_id: str,
+    reason: str,
+    *,
+    shot_ids: list[str] | None = None,
+) -> int:
+    """Supersede currently approved H3 plans and retain a human-readable cause."""
+    if not db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'h3_prompt_plans'"
+    ).fetchone():
+        return 0
+    if shot_ids is not None and not shot_ids:
+        return 0
+    query = "SELECT id, stale_reasons FROM h3_prompt_plans WHERE project_id = ? AND status = 'approved'"
+    params: list[Any] = [project_id]
+    if shot_ids is not None:
+        query += f" AND shot_id IN ({','.join('?' for _ in shot_ids)})"
+        params.extend(shot_ids)
+    rows = db.execute(query, params).fetchall()
+    now = utc_now()
+    for row in rows:
+        try:
+            reasons = json.loads(row["stale_reasons"] or "[]")
+        except (TypeError, ValueError):
+            reasons = []
+        reasons = list(dict.fromkeys([*reasons, reason.strip()]))
+        db.execute(
+            """UPDATE h3_prompt_plans SET status = 'superseded', stale_reasons = ?, superseded_at = ?
+            WHERE id = ? AND status = 'approved'""",
+            (json.dumps(reasons, ensure_ascii=False), now, row["id"]),
+        )
+    return len(rows)
 
 
 def _active_project(db: sqlite3.Connection) -> dict[str, Any]:
@@ -279,6 +319,9 @@ def compile_prompt_plan(db_path: Path, shot_id: str) -> dict[str, Any]:
                     "revision": entry["revision"],
                     "apply_globally": entry["apply_globally"],
                     "asset_ids": [asset["id"] for asset in entry["assets"]],
+                    "source_type": entry.get("source_type", "manual"),
+                    "source_id": entry.get("source_id"),
+                    "source_revision": entry.get("source_revision"),
                 }
             )
 
@@ -290,6 +333,8 @@ def compile_prompt_plan(db_path: Path, shot_id: str) -> dict[str, Any]:
         sections.append({"id": "shot", "label": "镜头动作与运镜", "content": shot["prompt"].strip()})
         if shot.get("dialogue", "").strip():
             sections.append({"id": "dialogue", "label": "对白与声音", "content": f"The spoken Mandarin dialogue must be exactly: “{shot['dialogue'].strip()}”. Keep natural timing and synchronized ambience."})
+        if shot.get("sound", "").strip():
+            sections.append({"id": "sound", "label": "声音提示", "content": f"Sound direction: {shot['sound'].strip()}"})
         if continuity_parts:
             sections.append({"id": "continuity", "label": "跨镜连续性", "content": "\n".join(continuity_parts)})
         exclusions = [*negative_parts, "no cuts, no subtitles, no text overlays, no logos, no duplicated people, no extra limbs"]
@@ -311,30 +356,58 @@ def compile_prompt_plan(db_path: Path, shot_id: str) -> dict[str, Any]:
         source_snapshot = {
             "shot": {
                 key: shot.get(key)
-                for key in ("id", "project_id", "prompt", "dialogue", "width", "height", "seconds", "candidate_count", "strategy")
+                for key in ("id", "project_id", "prompt", "dialogue", "sound", "width", "height", "seconds", "candidate_count", "strategy")
             },
             "bible": bible_public,
             "references": references_public,
         }
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'creative_storyboard_links'"
+        ).fetchone():
+            storyboard_source = db.execute(
+                """SELECT links.section_id, links.last_synced_revision, sections.title AS section_title,
+                sections.revision AS current_section_revision
+                FROM creative_storyboard_links links
+                JOIN creative_sections sections ON sections.id = links.section_id
+                WHERE links.project_id = ? AND links.shot_id = ?""",
+                (project["id"], shot_id),
+            ).fetchone()
+            source_snapshot["storyboard_source"] = dict(storyboard_source) if storyboard_source else None
         plan_hash = _json_hash(source_snapshot)
         stored = db.execute(
             """SELECT status, validated_at, approved_at FROM h3_prompt_plans
             WHERE shot_id = ? AND plan_hash = ? ORDER BY created_at DESC LIMIT 1""",
             (shot_id, plan_hash),
         ).fetchone()
+        stale = db.execute(
+            """SELECT plan_hash, stale_reasons, superseded_at FROM h3_prompt_plans
+            WHERE shot_id = ? AND project_id = ? AND status = 'superseded'
+              AND approved_at IS NOT NULL AND stale_reasons <> '[]'
+            ORDER BY superseded_at DESC, approved_at DESC LIMIT 1""",
+            (shot_id, project["id"]),
+        ).fetchone()
+        try:
+            stale_reasons = json.loads(stale["stale_reasons"] or "[]") if stale else []
+        except (TypeError, ValueError):
+            stale_reasons = []
         return {
-            "shot": {key: shot.get(key) for key in ("id", "ordinal", "scene_code", "title", "description", "dialogue", "prompt", "width", "height", "seconds", "candidate_count", "strategy")},
+            "shot": {key: shot.get(key) for key in ("id", "ordinal", "scene_code", "title", "description", "dialogue", "sound", "prompt", "width", "height", "seconds", "candidate_count", "strategy")},
             "plan_hash": plan_hash,
             "ready": not blocking,
             "status": stored["status"] if stored else "preview",
             "validated_at": stored["validated_at"] if stored else None,
             "approved_at": stored["approved_at"] if stored else None,
+            "stale": bool(stale_reasons) and (stored is None or stored["status"] != "approved"),
+            "stale_reasons": stale_reasons,
+            "stale_plan_hash": stale["plan_hash"] if stale else None,
+            "superseded_at": stale["superseded_at"] if stale else None,
             "mode": mode,
             "sections": sections,
             "compiled_prompt": compiled_prompt,
             "references": references_public,
             "reference_counts": counts,
             "bible": bible_public,
+            "storyboard_source": source_snapshot.get("storyboard_source"),
             "blocking": blocking,
             "warnings": list(dict.fromkeys(warnings)),
             "spec": {
@@ -399,12 +472,19 @@ def approve_plan(db_path: Path, shot_id: str, plan_hash: str) -> None:
         ).fetchone()
         if not plan:
             raise HTTPException(409, "当前编译计划尚未通过 H3 dry-run，不能批准")
-        db.execute(
-            "UPDATE h3_prompt_plans SET status = 'superseded' WHERE shot_id = ? AND status = 'approved' AND id <> ?",
+        previous = db.execute(
+            "SELECT id FROM h3_prompt_plans WHERE shot_id = ? AND status = 'approved' AND id <> ?",
             (shot_id, plan["id"]),
-        )
+        ).fetchall()
+        for item in previous:
+            db.execute(
+                """UPDATE h3_prompt_plans SET status = 'superseded', stale_reasons = ?, superseded_at = ?
+                WHERE id = ?""",
+                (json.dumps(["已批准新的 H3 计划"], ensure_ascii=False), now, item["id"]),
+            )
         db.execute(
-            "UPDATE h3_prompt_plans SET status = 'approved', approved_at = ? WHERE id = ?",
+            """UPDATE h3_prompt_plans SET status = 'approved', approved_at = ?, stale_reasons = '[]',
+            superseded_at = NULL WHERE id = ?""",
             (now, plan["id"]),
         )
         db.commit()

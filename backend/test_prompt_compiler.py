@@ -74,7 +74,10 @@ class PromptCompilerTests(unittest.TestCase):
             init_bible_schema(db)
             init_prompt_schema(db)
             db.execute(
-                """INSERT INTO production_bible_entries VALUES
+                """INSERT INTO production_bible_entries
+                (id, project_id, entry_type, name, summary, canonical_description, prompt_fragment,
+                 negative_prompt, continuity_rules, apply_globally, status, revision, archived, created_at, updated_at)
+                VALUES
                 ('char-1', 'p1', 'character', '林夏', '红雨衣女性', '二十多岁东亚女性，红色雨衣',
                  '<Picture 9> young East Asian woman in a wet red raincoat', 'no costume changes',
                  '脸型、发型和雨衣必须跨镜一致', 0, 'locked', 2, 0, 'now', 'now'),

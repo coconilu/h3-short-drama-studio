@@ -27,14 +27,16 @@ from pydantic import BaseModel, Field
 
 try:
     from .content_planning import create_content_router, init_content_schema
+    from .creative_storyboard import create_storyboard_router, init_storyboard_schema
     from .local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from .delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
     from .project_archive import create_archive_router, init_archive_schema
-    from .production_bible import create_bible_router, init_bible_schema
+    from .production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from .prompt_compiler import (
         approve_plan,
         compile_prompt_plan,
         init_prompt_schema,
+        mark_prompt_plans_stale,
         project_prompt_status,
         public_plan,
         record_validation,
@@ -51,14 +53,16 @@ try:
     from .runtime_control import request_supervisor_action, supervisor_status
 except ImportError:  # Support `uvicorn app:app` when backend is the working directory.
     from content_planning import create_content_router, init_content_schema
+    from creative_storyboard import create_storyboard_router, init_storyboard_schema
     from local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
     from project_archive import create_archive_router, init_archive_schema
-    from production_bible import create_bible_router, init_bible_schema
+    from production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from prompt_compiler import (
         approve_plan,
         compile_prompt_plan,
         init_prompt_schema,
+        mark_prompt_plans_stale,
         project_prompt_status,
         public_plan,
         record_validation,
@@ -172,6 +176,7 @@ def migrate_db(db: sqlite3.Connection) -> None:
     for name, definition in (
         ("subtitle_enabled", "INTEGER NOT NULL DEFAULT 1"),
         ("subtitle_start_seconds", "REAL"),
+        ("sound", "TEXT NOT NULL DEFAULT ''"),
     ):
         ensure_column(db, "shots", name, definition)
     for name, definition in (
@@ -422,11 +427,16 @@ def init_db() -> None:
         init_script_schema(db)
         init_bible_schema(db)
         init_prompt_schema(db)
+        init_storyboard_schema(db)
         init_production_schema(db)
         init_review_schema(db)
         init_delivery_schema(db)
         init_archive_schema(db)
         migrate_db(db)
+        for character in db.execute(
+            "SELECT * FROM creative_characters WHERE status = 'approved'"
+        ).fetchall():
+            sync_creative_character_rules(db, character)
         existing = db.execute("SELECT COUNT(*) AS count FROM projects").fetchone()["count"]
         if existing:
             active_project = db.execute(
@@ -1100,6 +1110,7 @@ class ShotPatch(BaseModel):
     title: str | None = None
     description: str | None = None
     dialogue: str | None = None
+    sound: str | None = None
     prompt: str | None = None
     status: str | None = None
     width: int | None = Field(None, ge=256, le=1344)
@@ -1235,6 +1246,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(create_content_router(DB_PATH))
+app.include_router(create_storyboard_router(DB_PATH))
 app.include_router(create_local_agent_router(DB_PATH))
 app.include_router(create_script_router(DB_PATH, ROOT))
 app.include_router(create_bible_router(DB_PATH))
@@ -1466,7 +1478,19 @@ def get_workbench() -> dict[str, Any]:
 def project_detail(project: dict[str, Any]) -> dict[str, Any]:
     project = dict(project)
     project["shots"] = rows("SELECT * FROM shots WHERE project_id = ? ORDER BY ordinal", (project["id"],))
+    source_mappings = {
+        item["shot_id"]: item
+        for item in rows(
+            """SELECT links.shot_id, links.section_id, links.last_synced_revision,
+            sections.title AS section_title, sections.revision AS current_section_revision
+            FROM creative_storyboard_links links
+            JOIN creative_sections sections ON sections.id = links.section_id
+            WHERE links.project_id = ?""",
+            (project["id"],),
+        )
+    }
     for shot in project["shots"]:
+        shot["source_mapping"] = source_mappings.get(shot["id"])
         final_output = row(
             "SELECT * FROM promotions WHERE shot_id = ? AND selected = 1 ORDER BY selected_at DESC LIMIT 1",
             (shot["id"],),
@@ -1700,6 +1724,7 @@ def bind_shot_reference(shot_id: str, payload: ReferenceCreate) -> list[dict[str
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "该素材已经绑定到这个镜头") from exc
+        mark_prompt_plans_stale(db, shot["project_id"], "镜头参考素材已绑定", shot_ids=[shot_id])
         db.commit()
     return reference_rows(shot_id)
 
@@ -1714,6 +1739,8 @@ def update_shot_reference(shot_id: str, reference_id: str, payload: ReferencePat
         raise HTTPException(400, f"{reference['reference_type']} 不支持角色：{payload.role}")
     with closing(connect()) as db:
         db.execute("UPDATE shot_references SET role = ?, updated_at = ? WHERE id = ?", (payload.role, utc_now(), reference_id))
+        shot = db.execute("SELECT project_id FROM shots WHERE id = ?", (shot_id,)).fetchone()
+        mark_prompt_plans_stale(db, shot["project_id"], "镜头参考素材角色已变化", shot_ids=[shot_id])
         db.commit()
     return reference_rows(shot_id)
 
@@ -1734,6 +1761,8 @@ def reorder_shot_references(shot_id: str, payload: ReferenceOrder) -> list[dict[
                 "UPDATE shot_references SET ordinal = ?, updated_at = ? WHERE id = ? AND shot_id = ?",
                 (ordinal, utc_now(), reference_id, shot_id),
             )
+        shot = db.execute("SELECT project_id FROM shots WHERE id = ?", (shot_id,)).fetchone()
+        mark_prompt_plans_stale(db, shot["project_id"], "镜头参考素材顺序已变化", shot_ids=[shot_id])
         db.commit()
     return reference_rows(shot_id)
 
@@ -1747,6 +1776,8 @@ def unbind_shot_reference(shot_id: str, reference_id: str) -> list[dict[str, Any
     with closing(connect()) as db:
         db.execute("DELETE FROM shot_references WHERE id = ? AND shot_id = ?", (reference_id, shot_id))
         normalize_reference_ordinals(db, shot_id, reference["reference_type"])
+        shot = db.execute("SELECT project_id FROM shots WHERE id = ?", (shot_id,)).fetchone()
+        mark_prompt_plans_stale(db, shot["project_id"], "镜头参考素材已解绑", shot_ids=[shot_id])
         db.commit()
     return reference_rows(shot_id)
 
@@ -2922,7 +2953,7 @@ def download_production_acceptance() -> Response:
 
 @app.patch("/api/shots/{shot_id}")
 def update_shot(shot_id: str, patch: ShotPatch) -> dict[str, Any]:
-    require_active_shot(shot_id)
+    shot = require_active_shot(shot_id)
     values = patch.model_dump(exclude_none=True)
     if values.get("width") and values["width"] % 32:
         raise HTTPException(400, "宽度必须能被 32 整除")
@@ -2939,6 +2970,8 @@ def update_shot(shot_id: str, patch: ShotPatch) -> dict[str, Any]:
         cursor = db.execute(f"UPDATE shots SET {assignments} WHERE id = ?", (*values.values(), shot_id))
         if cursor.rowcount == 0:
             raise HTTPException(404, "镜头不存在")
+        if set(values) - {"status", "updated_at"}:
+            mark_prompt_plans_stale(db, shot["project_id"], f"镜头“{shot['title']}”字段已手工修改", shot_ids=[shot_id])
         db.commit()
     return row("SELECT * FROM shots WHERE id = ?", (shot_id,))
 

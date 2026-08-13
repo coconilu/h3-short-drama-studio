@@ -7,6 +7,7 @@ import {
   BookOpenText,
   Bot,
   Check,
+  Clapperboard,
   ChevronRight,
   CircleDashed,
   Clock3,
@@ -22,6 +23,7 @@ import {
   Sparkles,
   UserRound,
   UsersRound,
+  Undo2,
   X,
 } from 'lucide-react'
 import type {
@@ -36,6 +38,8 @@ import type {
   CreativeProposal,
   CreativeRevisionHistory,
   CreativeSection,
+  CreativeStoryboardPreview,
+  CreativeStoryboardRow,
   LocalAgentProvider,
 } from './types'
 
@@ -83,7 +87,7 @@ const emptyEditor = (kind: EntityKind, parentId?: string): Editor => {
   if (kind === 'proposal') return { kind, mode: 'create', data: { title: '', synopsis: '', core_conflict: '', ending: '' } }
   if (kind === 'character') return { kind, mode: 'create', data: { name: '', identity: '', goal: '', obstacle: '', personality: '', appearance: '', voice: '', relationships: '', reference_notes: '' } }
   if (kind === 'chapter') return { kind, mode: 'create', data: { title: '', summary: '', pacing_goal: '', planned_seconds: 0 } }
-  return { kind, mode: 'create', parentId, data: { title: '', summary: '', content: '', pacing_goal: '', planned_seconds: 0 } }
+  return { kind, mode: 'create', parentId, data: { title: '', summary: '', content: '', scene: '', action: '', dialogue: '', sound: '', visual: '', pacing_goal: '', planned_seconds: 0 } }
 }
 
 const editEntity = (kind: EntityKind, entity: EditableEntity): Editor => {
@@ -136,13 +140,47 @@ function EntityEditor({ editor, busy, onChange, onClose, onSubmit }: {
       <label>参考素材说明<textarea rows={2} value={String(editor.data.reference_notes || '')} onChange={(event) => set('reference_notes', event.target.value)} /></label>
     </>}
     {(editor.kind === 'chapter' || editor.kind === 'section') && <>
-      <div className="planning-form-grid"><label>{editor.kind === 'chapter' ? '章节标题' : '小节标题'}<input required value={String(editor.data.title || '')} onChange={(event) => set('title', event.target.value)} /></label><label>状态<select value={String(editor.data.status || 'draft')} onChange={(event) => set('status', event.target.value)}><option value="draft">草稿</option><option value="approved">已批准</option></select></label></div>
+      <div className="planning-form-grid"><label>{editor.kind === 'chapter' ? '章节标题' : '小节标题'}<input required value={String(editor.data.title || '')} onChange={(event) => set('title', event.target.value)} /></label>{editor.kind === 'chapter' ? <label>状态<select value={String(editor.data.status || 'draft')} onChange={(event) => set('status', event.target.value)}><option value="draft">草稿</option><option value="approved">已批准</option></select></label> : <label>审阅状态<input readOnly value={editor.data.status === 'approved' ? '已批准；修改后自动退回草稿' : '草稿；保存后可单独批准'} /></label>}</div>
       <label>摘要<textarea required rows={5} value={String(editor.data.summary || '')} onChange={(event) => set('summary', event.target.value)} /></label>
-      {editor.kind === 'section' && <label>小节正文<textarea rows={12} value={String(editor.data.content || '')} onChange={(event) => set('content', event.target.value)} placeholder="动作、对白与场景正文；可人工维护，也可先让 Agent 生成候选。" /></label>}
+      {editor.kind === 'section' && <>
+        <div className="structured-script-grid"><label>场景<textarea required rows={3} value={String(editor.data.scene || '')} onChange={(event) => set('scene', event.target.value)} placeholder="时间、地点、人物和场景状态" /></label><label>动作<textarea required rows={3} value={String(editor.data.action || '')} onChange={(event) => set('action', event.target.value)} placeholder="人物动作、表演节奏与事件变化" /></label><label>对白<textarea rows={3} value={String(editor.data.dialogue || '')} onChange={(event) => set('dialogue', event.target.value)} placeholder="允许无对白；填写需要原样说出的台词" /></label><label>声音提示<textarea required rows={3} value={String(editor.data.sound || '')} onChange={(event) => set('sound', event.target.value)} placeholder="环境声、音效、音乐和声音节奏" /></label><label className="wide">视觉意图<textarea required rows={4} value={String(editor.data.visual || '')} onChange={(event) => set('visual', event.target.value)} placeholder="构图、光线、镜头运动、人物位置和画面重点" /></label></div>
+        <label>创作正文 / 备注<textarea rows={7} value={String(editor.data.content || '')} onChange={(event) => set('content', event.target.value)} placeholder="保留完整正文或创作备注；正式分镜使用上面的结构化字段。" /></label>
+      </>}
       <div className="planning-form-grid"><label>节奏目标<input value={String(editor.data.pacing_goal || '')} onChange={(event) => set('pacing_goal', event.target.value)} /></label><label>预计时长（秒）<input type="number" min="0" step="0.1" value={Number(editor.data.planned_seconds || 0)} onChange={(event) => set('planned_seconds', Number(event.target.value))} /></label></div>
     </>}
     <footer><span>保存会生成新的只读修订，来源标记为 human:ui。</span><div><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存修订</button></div></footer>
   </form></div>
+}
+
+const storyboardActionLabel: Record<CreativeStoryboardRow['action'], string> = {
+  create: '新增', update: '修改', delete: '删除', reorder: '重排', unchanged: '不变',
+  protected: '删除受阻', preserve: '保留手工分镜',
+}
+
+function CreativeStoryboardDialog({ preview, busy, onClose, onApply }: {
+  preview: CreativeStoryboardPreview
+  busy: boolean
+  onClose: () => void
+  onApply: () => void
+}) {
+  return <div className="modal-backdrop planning-modal-backdrop"><section className="planning-history creative-storyboard-dialog" role="dialog" aria-modal="true" aria-label="小节同步到分镜差异">
+    <header><div><span className="eyebrow">STORYBOARD SYNC GATE</span><h2>逐镜逐字段差异</h2><p>预览不会写入分镜；确认后才应用稳定映射。</p></div><button onClick={onClose} aria-label="关闭"><X /></button></header>
+    <div className="creative-sync-summary">
+      {(['create', 'update', 'delete', 'reorder', 'unchanged', 'protected', 'preserve'] as const).map((action) => <span className={`sync-${action}`} key={action}><strong>{preview.summary[action]}</strong>{storyboardActionLabel[action]}</span>)}
+    </div>
+    {preview.blockers.length > 0 && <div className="creative-sync-blockers">{preview.blockers.map((item) => <p key={item}><AlertTriangle size={14} />{item}</p>)}</div>}
+    <div className="creative-sync-list">
+      {preview.rows.map((row, index) => <article className={`creative-sync-row action-${row.action}`} key={`${row.section?.id || row.shot_id}-${index}`}>
+        <div className="creative-sync-row-head"><span>{storyboardActionLabel[row.action]}</span><strong>{row.section?.chapter_title ? `${row.section.chapter_title} / ` : ''}{row.section?.title || row.current?.title || row.shot_id}</strong><small>{row.section ? `小节 ${row.section.id} · R${row.section.revision || '—'}` : '历史手工分镜 · 无伪造来源'}</small></div>
+        {row.protected_reasons.length > 0 && <p className="creative-sync-protection"><ShieldCheck size={13} />{row.protected_reasons.join('、')}</p>}
+        <div className="creative-sync-field-table" role="table" aria-label={`${row.section?.title || row.shot_id}字段差异`}>
+          <div role="row"><strong>字段</strong><strong>当前分镜</strong><strong>小节建议值</strong><strong>处理</strong></div>
+          {row.field_diffs.map((diff) => <div role="row" className={diff.changed ? 'changed' : ''} key={diff.field}><span>{diff.label}</span><p>{diff.before === null || diff.before === '' ? '（空）' : String(diff.before)}</p><p>{diff.after === null || diff.after === '' ? '（空）' : String(diff.after)}</p><em>{diff.changed ? storyboardActionLabel[row.action] : '保留'}</em></div>)}
+        </div>
+      </article>)}
+    </div>
+    <footer><p><ShieldCheck size={13} />手工分镜保持原样；已有候选或交付证据的删除会阻断整次同步。</p><div><button className="button secondary" onClick={onClose}>取消预览</button><button className="button primary" disabled={busy || !preview.can_apply} onClick={onApply}>{busy ? <LoaderCircle className="spin" size={15} /> : <Clapperboard size={15} />}确认并同步</button></div></footer>
+  </section></div>
 }
 
 function AgentComposer({ target, providers, busy, onClose, onSubmit }: {
@@ -180,9 +218,10 @@ function AgentReview({ run, provider, busy, onClose, onAction }: {
   </section></div>
 }
 
-export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
+export function CreativePlanning({ projectId, onOpenScript, onOpenStoryboard, setNotice }: {
   projectId: string
   onOpenScript: () => void
+  onOpenStoryboard: () => void | Promise<void>
   setNotice: (message: string) => void
 }) {
   const [workspace, setWorkspace] = useState<CreativePlanningWorkspace | null>(null)
@@ -196,6 +235,7 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
   const [agentRuns, setAgentRuns] = useState<CreativeAgentRun[]>([])
   const [agentTarget, setAgentTarget] = useState<AgentTarget | null>(null)
   const [reviewRun, setReviewRun] = useState<CreativeAgentRun | null>(null)
+  const [syncPreview, setSyncPreview] = useState<CreativeStoryboardPreview | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
@@ -293,6 +333,7 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
     event.preventDefault()
     if (!editor) return
     const data: Record<string, string | number> = { ...editor.data, source: 'human:ui' }
+    if (editor.kind === 'section') delete data.status
     let path = ''
     let method = editor.mode === 'create' ? 'POST' : 'PATCH'
     if (editor.mode === 'edit') data.base_revision = Number(editor.data.revision)
@@ -310,6 +351,44 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
   const finalize = async (proposal: CreativeProposal) => {
     const result = await mutate(`/api/creative-planning/proposals/${proposal.id}/finalize`, 'POST', { base_revision: proposal.revision, source: 'human:ui-finalize' })
     if (result) setNotice(`“${proposal.title}”已定案；其他提案自动回到草稿`)
+  }
+
+  const reviewSection = async (section: CreativeSection, decision: 'approve' | 'return') => {
+    const note = decision === 'return' ? window.prompt('请填写退回修改意见') : ''
+    if (decision === 'return' && !note?.trim()) return
+    const result = await mutate(`/api/creative-planning/sections/${section.id}/${decision}`, 'POST', {
+      base_revision: section.revision,
+      note: note || '',
+      source: `human:ui-${decision}`,
+    })
+    if (result) setNotice(decision === 'approve' ? `“${section.title}”已批准，可进入分镜同步` : `“${section.title}”已退回草稿`)
+  }
+
+  const previewStoryboard = async () => {
+    setBusy(true)
+    try {
+      setSyncPreview(await planningApi<CreativeStoryboardPreview>('/api/creative-planning/storyboard-sync/preview', {
+        method: 'POST', body: JSON.stringify({}),
+      }))
+    } catch (reason) {
+      setNotice(reason instanceof Error ? reason.message : '无法预览分镜差异')
+    } finally { setBusy(false) }
+  }
+
+  const applyStoryboard = async () => {
+    if (!syncPreview) return
+    setBusy(true)
+    try {
+      const result = await planningApi<{ idempotent: boolean }>('/api/creative-planning/storyboard-sync/apply', {
+        method: 'POST',
+        body: JSON.stringify({ plan_hash: syncPreview.plan_hash, confirm: true, confirmed_by: 'human:ui' }),
+      })
+      setSyncPreview(null)
+      setNotice(result.idempotent ? '该同步已应用过，分镜没有重复创建' : '已确认同步；稳定小节来源映射已写入分镜')
+      await onOpenStoryboard()
+    } catch (reason) {
+      setNotice(reason instanceof Error ? reason.message : '分镜同步失败')
+    } finally { setBusy(false) }
   }
 
   const archive = async (kind: EntityKind, item: EditableEntity) => {
@@ -497,12 +576,12 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
     </section>
 
     <section className="planning-section structure-section">
-      <header><div><span>04</span><div><h2>章节与小节</h2><p>两级结构均可编辑、排序、拆分、合并或归档。</p></div></div><div className="structure-summary"><span><GitBranch size={14} />{workspace.summary.chapter_count} 章 / {workspace.summary.section_count} 节</span><span><Clock3 size={14} />{plannedSeconds.toFixed(1)} 秒</span><button className="button secondary" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'outline', title: '完整章节大纲' })}><Sparkles size={15} />Agent 大纲</button><button className="button secondary" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'chapter', title: '新增章节' })}><Sparkles size={15} />Agent 新章</button><button className="button secondary" onClick={() => setEditor(emptyEditor('chapter'))}><Plus size={15} />新增章节</button></div></header>
+      <header><div><span>04</span><div><h2>章节、小节与分镜门禁</h2><p>先维护结构化剧本并逐节批准，再检查逐镜差异后同步。</p></div></div><div className="structure-summary"><span><GitBranch size={14} />{workspace.summary.chapter_count} 章 / {workspace.summary.section_count} 节</span><span><Clock3 size={14} />{plannedSeconds.toFixed(1)} 秒</span><button className="button primary" disabled={busy || workspace.summary.section_count === 0} onClick={previewStoryboard}><Clapperboard size={15} />检查分镜差异</button><button className="button secondary" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'outline', title: '完整章节大纲' })}><Sparkles size={15} />Agent 大纲</button><button className="button secondary" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'chapter', title: '新增章节' })}><Sparkles size={15} />Agent 新章</button><button className="button secondary" onClick={() => setEditor(emptyEditor('chapter'))}><Plus size={15} />新增章节</button></div></header>
       <div className="chapter-list">
         {workspace.chapters.map((chapter, chapterIndex) => <article className="chapter-card" key={chapter.id}>
           <header><span className="chapter-index">CH {String(chapterIndex + 1).padStart(2, '0')}</span><div><h3>{chapter.title}</h3><p>{chapter.summary || '章节摘要待补充'}</p><small>{chapter.pacing_goal || '节奏目标待补充'} · {chapter.planned_seconds.toFixed(1)} 秒 · R{chapter.revision}</small></div><div className="chapter-actions"><button title="Agent 修改章节" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'chapter', title: chapter.title, targetId: chapter.id })}><Sparkles size={14} /></button><button disabled={chapterIndex === 0} title="上移章节" onClick={() => reorder('chapter', workspace.chapters, chapterIndex, -1)}><ArrowUp size={14} /></button><button disabled={chapterIndex === workspace.chapters.length - 1} title="下移章节" onClick={() => reorder('chapter', workspace.chapters, chapterIndex, 1)}><ArrowDown size={14} /></button>{chapterIndex > 0 && <button title="并入上一章" onClick={() => mergeEntity('chapter', chapter, workspace.chapters[chapterIndex - 1])}><Merge size={14} /></button>}<button title="历史" onClick={() => showHistory('chapter', chapter.id)}><History size={14} /></button><button title="编辑" onClick={() => setEditor(editEntity('chapter', chapter))}><Pencil size={14} /></button><button title="归档章节" onClick={() => archive('chapter', chapter)}><Archive size={14} /></button></div></header>
           <div className="section-list">
-            {chapter.sections.map((section, sectionIndex) => <div className="section-row" key={section.id}><span className="section-number">{chapterIndex + 1}.{sectionIndex + 1}</span><div><strong>{section.title}</strong><p>{section.summary || '小节摘要待补充'}</p>{section.content && <p className="section-content-preview">{section.content}</p>}<small>{section.pacing_goal || '节奏待补充'} · {section.planned_seconds.toFixed(1)} 秒 · R{section.revision} · {section.status === 'approved' ? '已批准' : '草稿'}</small></div><div className="section-actions"><button title="Agent 修改小节" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'section', title: section.title, targetId: section.id })}><Sparkles size={13} /></button><button title="Agent 修改正文" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'body', title: `${section.title}正文`, targetId: section.id })}><BookOpenText size={13} /></button><button disabled={sectionIndex === 0} title="上移小节" onClick={() => reorder('section', chapter.sections, sectionIndex, -1, chapter.id)}><ArrowUp size={13} /></button><button disabled={sectionIndex === chapter.sections.length - 1} title="下移小节" onClick={() => reorder('section', chapter.sections, sectionIndex, 1, chapter.id)}><ArrowDown size={13} /></button>{sectionIndex > 0 && <button title="从这里拆为新章" onClick={() => splitChapter(chapter, section)}><Scissors size={13} /></button>}<button title="拆分小节" onClick={() => splitSection(section)}><GitBranch size={13} /></button>{sectionIndex > 0 && <button title="并入上一小节" onClick={() => mergeEntity('section', section, chapter.sections[sectionIndex - 1])}><Merge size={13} /></button>}<button title="版本历史" onClick={() => showHistory('section', section.id)}><History size={13} /></button><button title="编辑" onClick={() => setEditor(editEntity('section', section))}><Pencil size={13} /></button><button title="归档" onClick={() => archive('section', section)}><Archive size={13} /></button></div></div>)}
+            {chapter.sections.map((section, sectionIndex) => <div className={`section-row structured-section-row ${section.status}`} key={section.id}><span className="section-number">{chapterIndex + 1}.{sectionIndex + 1}</span><div><div className="section-title-line"><strong>{section.title}</strong><em>{section.status === 'approved' ? '已批准' : '待批准'}</em></div><p>{section.summary || '小节摘要待补充'}</p><div className="structured-section-preview"><span><b>场景</b>{section.scene || '待补充'}</span><span><b>动作</b>{section.action || '待补充'}</span><span><b>对白</b>{section.dialogue || '无对白'}</span><span><b>声音</b>{section.sound || '待补充'}</span><span><b>视觉</b>{section.visual || '待补充'}</span></div>{section.review_note && <p className="section-review-note"><Undo2 size={13} />{section.review_note}</p>}<small>{section.pacing_goal || '节奏待补充'} · {section.planned_seconds.toFixed(1)} 秒 · R{section.revision}{section.approved_at ? ` · 批准于 ${formatTime(section.approved_at)}` : ''}</small></div><div className="section-actions">{section.status === 'approved' ? <button title="退回修改" onClick={() => reviewSection(section, 'return')}><Undo2 size={13} /></button> : <button className="approve-section" title="批准结构化剧本" onClick={() => reviewSection(section, 'approve')}><Check size={13} /></button>}<button title="Agent 修改小节" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'section', title: section.title, targetId: section.id })}><Sparkles size={13} /></button><button title="Agent 修改正文" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'body', title: `${section.title}正文`, targetId: section.id })}><BookOpenText size={13} /></button><button disabled={sectionIndex === 0} title="上移小节" onClick={() => reorder('section', chapter.sections, sectionIndex, -1, chapter.id)}><ArrowUp size={13} /></button><button disabled={sectionIndex === chapter.sections.length - 1} title="下移小节" onClick={() => reorder('section', chapter.sections, sectionIndex, 1, chapter.id)}><ArrowDown size={13} /></button>{sectionIndex > 0 && <button title="从这里拆为新章" onClick={() => splitChapter(chapter, section)}><Scissors size={13} /></button>}<button title="拆分小节" onClick={() => splitSection(section)}><GitBranch size={13} /></button>{sectionIndex > 0 && <button title="并入上一小节" onClick={() => mergeEntity('section', section, chapter.sections[sectionIndex - 1])}><Merge size={13} /></button>}<button title="版本历史" onClick={() => showHistory('section', section.id)}><History size={13} /></button><button title="编辑" onClick={() => setEditor(editEntity('section', section))}><Pencil size={13} /></button><button title="归档" onClick={() => archive('section', section)}><Archive size={13} /></button></div></div>)}
             <div className="add-section-actions"><button className="add-section" disabled={Boolean(activeAgentRun)} onClick={() => setAgentTarget({ scope: 'section', title: `为“${chapter.title}”新增小节`, parentId: chapter.id })}><Sparkles size={14} />Agent 新增小节</button><button className="add-section" onClick={() => setEditor(emptyEditor('section', chapter.id))}><Plus size={14} />人工新增小节</button></div>
           </div>
         </article>)}
@@ -510,11 +589,12 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
       </div>
     </section>
 
-    <section className="planning-handoff"><Sparkles size={20} /><div><strong>规划完成后进入剧本开发</strong><p>本页面支持人工编辑与本地 Agent 提案；两条路径都不生成分镜，也不会提交 GPU。</p></div><button className="button primary" onClick={onOpenScript}>进入小节剧本打磨<ChevronRight size={16} /></button></section>
+    <section className="planning-handoff"><Sparkles size={20} /><div><strong>批准是内容与生产之间的明确门禁</strong><p>人工或 Agent 修改后先重新批准，再预览同步差异；整个过程不会提交 GPU。</p></div><button className="button primary" onClick={onOpenScript}>进入小节剧本打磨<ChevronRight size={16} /></button></section>
 
     {editor && <EntityEditor editor={editor} busy={busy} onChange={(data) => setEditor({ ...editor, data })} onClose={() => setEditor(null)} onSubmit={submitEditor} />}
     {history && <VersionHistory history={history} onClose={() => setHistory(null)} />}
     {agentTarget && <AgentComposer target={agentTarget} providers={providers} busy={busy} onClose={() => setAgentTarget(null)} onSubmit={submitAgent} />}
     {reviewRun && <AgentReview run={reviewRun} provider={providers.find((provider) => provider.id === reviewRun.provider_id)} busy={busy} onClose={() => setReviewRun(null)} onAction={(action) => mutateAgentRun(reviewRun, action)} />}
+    {syncPreview && <CreativeStoryboardDialog preview={syncPreview} busy={busy} onClose={() => setSyncPreview(null)} onApply={applyStoryboard} />}
   </main>
 }
