@@ -1150,6 +1150,7 @@ class ProjectCreate(BaseModel):
 class GenerateRequest(BaseModel):
     confirm: bool = False
     dry_run: bool = True
+    expected_validation_hash: str | None = Field(None, min_length=64, max_length=64)
 
 
 class BatchGenerationRequest(BaseModel):
@@ -3092,6 +3093,23 @@ def build_h3_arguments(
     return project, arguments, plan
 
 
+def normalized_h3_input(arguments: list[str]) -> dict[str, Any]:
+    """Freeze the exact adapter contract shared by dry-run and GPU submission."""
+    normalized_arguments = list(arguments)
+    if normalized_arguments and normalized_arguments[-1] == "--dry-run":
+        normalized_arguments.pop()
+    return {
+        "adapter": "h3-video-draft-refine",
+        "entrypoint": str(H3_SCRIPT),
+        "arguments": normalized_arguments,
+    }
+
+
+def h3_input_hash(snapshot: dict[str, Any]) -> str:
+    payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @app.get("/api/prompt-plans")
 def list_prompt_plans() -> list[dict[str, Any]]:
     return project_prompt_status(DB_PATH)
@@ -3181,20 +3199,16 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
             raise HTTPException(409, f"该镜头已有活动任务：{active['state']}")
 
     compiled = compile_prompt_plan(DB_PATH, shot_id)
-    if compiled["status"] == "approved":
-        project, arguments, plan = build_h3_arguments(
-            shot,
-            request.dry_run,
-            compiled_prompt_override=compiled["compiled_prompt"],
-            references_override=compiled["_references"],
-            prompt_plan_hash=compiled["plan_hash"],
-        )
-    else:
-        project, arguments, plan = build_h3_arguments(
-            shot,
-            request.dry_run,
-            prompt_plan_hash=compiled["plan_hash"],
-        )
+    project, arguments, plan = build_h3_arguments(
+        shot,
+        request.dry_run,
+        compiled_prompt_override=compiled["compiled_prompt"],
+        references_override=compiled["_references"],
+        prompt_plan_hash=compiled["plan_hash"],
+    )
+    input_snapshot = normalized_h3_input(arguments)
+    validation_hash = h3_input_hash(input_snapshot)
+    plan["validation_input_hash"] = validation_hash
     if request.dry_run:
         lease_id = begin_validation_lease(DB_PATH, compiled)
         try:
@@ -3212,8 +3226,8 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
                     (shot_id, kind, state, message, created_at, updated_at, h3_project, plan_hash, source_snapshot)
                     VALUES (?, 'validation', '校验通过', '节点图已构建，未占用 GPU', ?, ?, ?, ?, ?)""",
                     (
-                        shot_id, now, now, project, compiled["plan_hash"],
-                        json.dumps(compiled["source_snapshot"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                        shot_id, now, now, project, validation_hash,
+                        json.dumps(input_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                     ),
                 )
                 db.execute(
@@ -3238,7 +3252,38 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
         finally:
             end_validation_lease(DB_PATH, lease_id)
 
-    completed = run_h3(arguments, timeout=90)
+    with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        current_input = current_plan_input(db, shot_id, shot["project_id"])
+        if current_input is None or current_input["plan_hash"] != compiled["plan_hash"]:
+            raise HTTPException(409, "镜头、引用素材或生产圣经已变化，请重新 dry-run")
+        current_shot = db.execute(
+            "SELECT * FROM shots WHERE id = ? AND project_id = ?", (shot_id, shot["project_id"])
+        ).fetchone()
+        project, arguments, plan = build_h3_arguments(
+            dict(current_shot),
+            False,
+            compiled_prompt_override=compiled["compiled_prompt"],
+            references_override=compiled["_references"],
+            prompt_plan_hash=compiled["plan_hash"],
+        )
+        input_snapshot = normalized_h3_input(arguments)
+        validation_hash = h3_input_hash(input_snapshot)
+        credential = db.execute(
+            """SELECT state, plan_hash FROM jobs
+            WHERE shot_id = ? AND kind = 'validation' ORDER BY id DESC LIMIT 1""",
+            (shot_id,),
+        ).fetchone()
+        expected_hash = request.expected_validation_hash or (credential["plan_hash"] if credential else None)
+        if (
+            not credential
+            or credential["state"] != "校验通过"
+            or credential["plan_hash"] != expected_hash
+            or validation_hash != expected_hash
+        ):
+            raise HTTPException(409, "当前 H3 适配器输入未通过最近一次 dry-run，禁止提交 GPU")
+        completed = run_h3(arguments, timeout=90)
+        db.commit()
 
     manifest = read_manifest(project)
     prompt_ids = [record.get("prompt_id") for record in manifest.get("candidates") or [] if record.get("prompt_id")]
@@ -3311,8 +3356,17 @@ def batch_submit(request: BatchGenerationRequest) -> dict[str, Any]:
         raise HTTPException(400, "批量提交 GPU 前必须显式确认")
     shots = ordered_active_shots(request.shot_ids)
     validation_issues: list[dict[str, str]] = []
+    validation_credentials: dict[str, str] = {}
     for shot in shots:
         current = compile_prompt_plan(DB_PATH, shot["id"])
+        _, arguments, _ = build_h3_arguments(
+            shot,
+            True,
+            compiled_prompt_override=current["compiled_prompt"],
+            references_override=current["_references"],
+            prompt_plan_hash=current["plan_hash"],
+        )
+        current_validation_hash = h3_input_hash(normalized_h3_input(arguments))
         validation = row(
             """SELECT state, plan_hash, source_snapshot FROM jobs
             WHERE shot_id = ? AND kind = 'validation'
@@ -3323,19 +3377,28 @@ def batch_submit(request: BatchGenerationRequest) -> dict[str, Any]:
             not validation
             or validation["state"] != "校验通过"
             or not validation.get("plan_hash")
-            or validation["plan_hash"] != current["plan_hash"]
+            or validation["plan_hash"] != current_validation_hash
         ):
             validation_issues.append({
                 "shot_id": shot["id"],
                 "message": "镜头、引用素材或生产圣经与最近成功 dry-run 不一致",
             })
+        else:
+            validation_credentials[shot["id"]] = validation["plan_hash"]
     if validation_issues:
         raise HTTPException(409, {"message": "批量提交前检查未通过", "issues": validation_issues})
 
     results: list[dict[str, Any]] = []
     for shot in shots:
         try:
-            result = generate(shot["id"], GenerateRequest(confirm=True, dry_run=False))
+            result = generate(
+                shot["id"],
+                GenerateRequest(
+                    confirm=True,
+                    dry_run=False,
+                    expected_validation_hash=validation_credentials[shot["id"]],
+                ),
+            )
             results.append({
                 "shot_id": shot["id"],
                 "title": shot["title"],

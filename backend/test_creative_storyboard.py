@@ -143,6 +143,79 @@ class CreativeStoryboardContractTests(unittest.TestCase):
             db.commit()
         studio.bind_shot_reference(shot_id, studio.ReferenceCreate(asset_id=asset_id, role="identity"))
 
+    def insert_locked_bible(self, entry_id: str, *, asset_id: str | None = None) -> None:
+        with closing(studio.connect()) as db:
+            db.execute(
+                """INSERT INTO production_bible_entries
+                (id, project_id, entry_type, name, summary, canonical_description, prompt_fragment,
+                 negative_prompt, continuity_rules, apply_globally, status, revision, archived, created_at, updated_at)
+                VALUES (?, ?, 'character', ?, '', ?, ?, '', ?, 1, 'locked', 1, 0, 'now', 'now')""",
+                (
+                    entry_id,
+                    self.project["id"],
+                    entry_id,
+                    f"Canonical facts for {entry_id}",
+                    f"Prompt facts for {entry_id}",
+                    f"Continuity for {entry_id}",
+                ),
+            )
+            if asset_id:
+                asset_path = studio.ASSET_ROOT / f"{asset_id}.png"
+                asset_path.write_bytes(f"fake-{asset_id}".encode())
+                db.execute(
+                    """INSERT INTO assets
+                    (id, project_id, kind, name, description, preview, locked, source, managed_path, media_type)
+                    VALUES (?, ?, '角色参考', ?, '', '', 0, 'managed', ?, 'image')""",
+                    (asset_id, self.project["id"], asset_id, str(asset_path)),
+                )
+                db.execute(
+                    "INSERT INTO production_bible_assets VALUES (?, ?, 'identity', 1, 'now')",
+                    (entry_id, asset_id),
+                )
+            db.commit()
+
+    def capture_generate_validation(
+        self, shot_id: str, *, verify_gpu_command: bool = False
+    ) -> tuple[list[str], dict, dict]:
+        captured: list[str] = []
+
+        def capture(arguments, **_kwargs):
+            captured.extend(arguments)
+            return SimpleNamespace(stdout='{"ok": true}')
+
+        with patch.object(studio, "run_h3", side_effect=capture):
+            result = studio.generate(shot_id, studio.GenerateRequest(confirm=False, dry_run=True))
+        with closing(studio.connect()) as db:
+            job = dict(db.execute(
+                "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'validation' ORDER BY id DESC LIMIT 1",
+                (shot_id,),
+            ).fetchone())
+        snapshot = json.loads(job["source_snapshot"])
+        self.assertEqual(snapshot, studio.normalized_h3_input(captured))
+        self.assertEqual(job["plan_hash"], studio.h3_input_hash(snapshot))
+        self.assertEqual(job["plan_hash"], result["validation_input_hash"])
+        if verify_gpu_command:
+            gpu_arguments: list[str] = []
+
+            def capture_gpu(arguments, **_kwargs):
+                gpu_arguments.extend(arguments)
+                return SimpleNamespace(stdout='{"ok": true}')
+
+            with (
+                patch.object(studio, "run_h3", side_effect=capture_gpu),
+                patch.object(studio, "read_manifest", return_value={"candidates": [], "promotions": []}),
+            ):
+                studio.generate(
+                    shot_id,
+                    studio.GenerateRequest(
+                        confirm=True,
+                        dry_run=False,
+                        expected_validation_hash=job["plan_hash"],
+                    ),
+                )
+            self.assertEqual(snapshot, studio.normalized_h3_input(gpu_arguments))
+        return captured, snapshot, result
+
     def test_structured_section_approve_return_and_immutable_versions(self) -> None:
         section = self.create_section("门口迟疑")
         approved = self.approve_section(section)
@@ -482,11 +555,101 @@ class CreativeStoryboardContractTests(unittest.TestCase):
                 "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'validation'", (shot_id,)
             ).fetchone()
             self.assertIsNotNone(validation)
-            self.assertEqual(validation["plan_hash"], result["prompt_plan_hash"])
+            self.assertEqual(validation["plan_hash"], result["validation_input_hash"])
             frozen = json.loads(validation["source_snapshot"])
-            self.assertEqual(frozen["shot"]["id"], shot_id)
-            self.assertEqual(frozen["references"], [])
+            self.assertEqual(validation["plan_hash"], studio.h3_input_hash(frozen))
+            self.assertEqual(frozen["arguments"][0], "draft")
+            self.assertNotIn("--dry-run", frozen["arguments"])
             self.assertIsNotNone(db.execute("SELECT id FROM shots WHERE id = ?", (shot_id,)).fetchone())
+
+    def test_validation_snapshot_matches_all_actual_adapter_input_variants(self) -> None:
+        sections = [self.approve_section(self.create_section(title)) for title in (
+            "未批准计划", "全局文字圣经", "圣经媒体引用", "已批准计划",
+        )]
+        applied = self.apply(self.preview())["sync"]["applied_snapshot"]
+        shots = {item["section_id"]: item["shot_id"] for item in applied}
+
+        unapproved_args, _, _ = self.capture_generate_validation(
+            shots[sections[0]["id"]], verify_gpu_command=True
+        )
+        self.assertNotIn("--ref-image", unapproved_args)
+        self.assertIn("no cuts, no subtitles", unapproved_args[unapproved_args.index("--prompt") + 1])
+
+        self.insert_locked_bible("global-text-bible")
+        text_args, _, _ = self.capture_generate_validation(
+            shots[sections[1]["id"]], verify_gpu_command=True
+        )
+        self.assertIn("Canonical facts for global-text-bible", text_args[text_args.index("--prompt") + 1])
+        self.assertNotIn("--ref-image", text_args)
+
+        self.insert_locked_bible("global-media-bible", asset_id="bible-media-image")
+        media_args, _, _ = self.capture_generate_validation(
+            shots[sections[2]["id"]], verify_gpu_command=True
+        )
+        self.assertIn("--ref-image", media_args)
+        self.assertEqual(
+            Path(media_args[media_args.index("--ref-image") + 1]).name,
+            "bible-media-image.png",
+        )
+
+        approved_shot_id = shots[sections[3]["id"]]
+        approved_plan = compile_prompt_plan(studio.DB_PATH, approved_shot_id)
+        self.assertTrue(record_validation(studio.DB_PATH, approved_plan, {"ok": True}))
+        approve_plan(studio.DB_PATH, approved_shot_id, approved_plan["plan_hash"])
+        approved_args, _, approved_result = self.capture_generate_validation(
+            approved_shot_id, verify_gpu_command=True
+        )
+        self.assertIn("--ref-image", approved_args)
+        self.assertEqual(approved_result["prompt_plan_hash"], approved_plan["plan_hash"])
+
+    def test_batch_expected_credentials_survive_gate_and_block_late_source_changes(self) -> None:
+        sections = [self.approve_section(self.create_section(title)) for title in (
+            "门禁后改镜头", "门禁后改引用", "门禁后改圣经",
+        )]
+        applied = self.apply(self.preview())["sync"]["applied_snapshot"]
+        shots = {item["section_id"]: item["shot_id"] for item in applied}
+        shot_ids = [shots[section["id"]] for section in sections]
+        with patch.object(studio, "run_h3", return_value=SimpleNamespace(stdout='{"ok": true}')):
+            validation = studio.batch_dry_run(studio.BatchGenerationRequest(shot_ids=shot_ids))
+        self.assertTrue(validation["ok"])
+        with closing(studio.connect()) as db:
+            before_jobs = db.execute(
+                "SELECT COUNT(*) FROM jobs WHERE shot_id IN (?, ?, ?)", tuple(shot_ids)
+            ).fetchone()[0]
+            before_candidates = db.execute(
+                "SELECT COUNT(*) FROM candidates WHERE shot_id IN (?, ?, ?)", tuple(shot_ids)
+            ).fetchone()[0]
+
+        real_generate = studio.generate
+
+        def mutate_after_batch_gate(current_shot_id, request):
+            if current_shot_id == shot_ids[0]:
+                studio.update_shot(current_shot_id, studio.ShotPatch(prompt="late changed shot prompt"))
+            elif current_shot_id == shot_ids[1]:
+                self.bind_managed_image(current_shot_id, "late-reference")
+            else:
+                self.insert_locked_bible("late-global-bible")
+            return real_generate(current_shot_id, request)
+
+        with patch.object(studio, "generate", side_effect=mutate_after_batch_gate), patch.object(studio, "run_h3") as adapter:
+            submitted = studio.batch_submit(studio.BatchGenerationRequest(shot_ids=shot_ids, confirm=True))
+
+        self.assertFalse(submitted["ok"])
+        self.assertEqual(submitted["failed_count"], 3)
+        adapter.assert_not_called()
+        with closing(studio.connect()) as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM jobs WHERE shot_id IN (?, ?, ?)", tuple(shot_ids)).fetchone()[0],
+                before_jobs,
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM candidates WHERE shot_id IN (?, ?, ?)", tuple(shot_ids)).fetchone()[0],
+                before_candidates,
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM jobs WHERE kind = 'draft' AND shot_id IN (?, ?, ?)", tuple(shot_ids)).fetchone()[0],
+                0,
+            )
 
     def test_generate_dry_run_rejects_shot_change_during_adapter_without_partial_result(self) -> None:
         self.approve_section(self.create_section("运行中改镜头"))
