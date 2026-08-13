@@ -245,6 +245,11 @@ def migrate_db(db: sqlite3.Connection) -> None:
     db.execute("UPDATE candidates SET source = 'mock' WHERE source IS NULL OR source = ''")
     db.execute("UPDATE candidates SET status = 'completed' WHERE status IS NULL OR status = ''")
     db.execute("UPDATE jobs SET updated_at = created_at WHERE updated_at IS NULL")
+    # ``retry_safe`` is an audited proof that no external submission occurred.
+    # Predicted IDs from older releases are evidence only and never ownership.
+    db.execute(
+        "UPDATE jobs SET candidate_ids = '[]' WHERE kind = 'draft' AND retry_safe = 1 AND candidate_ids != '[]'"
+    )
     db.execute("UPDATE assets SET source = 'mock' WHERE source IS NULL OR source = ''")
     db.execute("UPDATE assets SET created_at = ? WHERE created_at IS NULL", (utc_now(),))
     completed_projects = db.execute(
@@ -984,6 +989,8 @@ def string_list(value: Any) -> list[str]:
 
 
 def draft_attempt_candidate_ids(job: dict[str, Any]) -> list[str]:
+    if job.get("retry_safe"):
+        return []
     persisted = string_list(job.get("candidate_ids"))
     if persisted:
         return persisted
@@ -993,7 +1000,7 @@ def draft_attempt_candidate_ids(job: dict[str, Any]) -> list[str]:
         return []
     if not isinstance(evidence, dict):
         return []
-    return string_list(evidence.get("submitted_candidate_ids")) or string_list(evidence.get("expected_candidate_ids"))
+    return string_list(evidence.get("submitted_candidate_ids"))
 
 
 def job_reconciliation_evidence(job: dict[str, Any]) -> dict[str, Any]:
@@ -1136,12 +1143,12 @@ def recover_legacy_draft_job(
             expected_job_revision=int(job.get("reconciliation_revision") or 0),
             preserve_terminal_state=str(job["state"]) in DRAFT_TERMINAL_STATES,
         )
-        persisted = row("SELECT candidate_ids FROM jobs WHERE id = ?", (job["id"],))
-        reserved_candidate_ids.update(string_list(persisted.get("candidate_ids") if persisted else None))
+        persisted = row("SELECT candidate_ids, retry_safe FROM jobs WHERE id = ?", (job["id"],))
+        reserved_candidate_ids.update(draft_attempt_candidate_ids(persisted or {}))
         return result
     except ReconciliationConflict:
         current = row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
-        reserved_candidate_ids.update(string_list(current.get("candidate_ids")))
+        reserved_candidate_ids.update(draft_attempt_candidate_ids(current))
         return legacy_recovery_result(project, current)
 
 
@@ -1157,11 +1164,11 @@ def recover_all_legacy_draft_jobs(
     reserved_candidate_ids = {
         candidate_id
         for job in rows(
-            """SELECT candidate_ids FROM jobs WHERE shot_id = ? AND kind = 'draft'
-            AND candidate_ids IS NOT NULL AND candidate_ids NOT IN ('', '[]')""",
+            """SELECT candidate_ids, retry_safe FROM jobs WHERE shot_id = ? AND kind = 'draft'
+            AND retry_safe = 0 AND candidate_ids IS NOT NULL AND candidate_ids NOT IN ('', '[]')""",
             (shot_id,),
         )
-        for candidate_id in string_list(job.get("candidate_ids"))
+        for candidate_id in draft_attempt_candidate_ids(job)
     }
     return [
         recover_legacy_draft_job(job, project, manifest, reserved_candidate_ids)
@@ -1224,12 +1231,14 @@ def update_reconciliation_job(
         db.execute("BEGIN IMMEDIATE")
         cursor = db.execute(
             """UPDATE jobs SET state = ?, message = ?, reconciliation_snapshot = ?, retry_safe = ?,
+            candidate_ids = CASE WHEN ? = 1 THEN '[]' ELSE candidate_ids END,
             updated_at = ?, completed_at = ?, reconciliation_revision = reconciliation_revision + 1
             WHERE id = ? AND state = ? AND reconciliation_revision = ?""",
             (
                 state,
                 message,
                 json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                int(retry_safe),
                 int(retry_safe),
                 now,
                 now if completed else None,
@@ -1908,11 +1917,11 @@ def refresh_h3_project(
         reserved_ids = {
             candidate_id
             for job in rows(
-                """SELECT candidate_ids FROM jobs WHERE shot_id = ? AND kind = 'draft'
-                AND candidate_ids IS NOT NULL AND candidate_ids NOT IN ('', '[]')""",
+                """SELECT candidate_ids, retry_safe FROM jobs WHERE shot_id = ? AND kind = 'draft'
+                AND retry_safe = 0 AND candidate_ids IS NOT NULL AND candidate_ids NOT IN ('', '[]')""",
                 (shot_id,),
             )
-            for candidate_id in string_list(job.get("candidate_ids"))
+            for candidate_id in draft_attempt_candidate_ids(job)
         }
         result = recover_legacy_draft_job(latest, project, manifest, reserved_ids)
         return result
@@ -2684,6 +2693,8 @@ def get_jobs() -> list[dict[str, Any]]:
         try:
             item["candidate_ids"] = json.loads(item.get("candidate_ids") or "[]")
         except json.JSONDecodeError:
+            item["candidate_ids"] = []
+        if item.get("retry_safe"):
             item["candidate_ids"] = []
     return result
 
@@ -4228,7 +4239,7 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
-                json.dumps(expected_candidate_ids),
+                json.dumps([]),
             ),
         )
         submitting_job_id = int(cursor.lastrowid)
@@ -4255,9 +4266,18 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
             )
             db.execute(
                 """UPDATE jobs SET state = ?, message = ?, updated_at = ?, completed_at = ?, retry_safe = ?,
+                candidate_ids = CASE WHEN ? = 1 THEN '[]' ELSE candidate_ids END,
                 reconciliation_revision = reconciliation_revision + 1
                 WHERE id = ? AND state = '提交中' AND reconciliation_revision = 0""",
-                (next_state, message, now, completed_at, retry_safe, submitting_job_id),
+                (
+                    next_state,
+                    message,
+                    now,
+                    completed_at,
+                    retry_safe,
+                    int(not process_started),
+                    submitting_job_id,
+                ),
             )
             db.execute("DELETE FROM h3_generation_leases WHERE id = ?", (generation_lease_id,))
             db.commit()
@@ -4277,15 +4297,18 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
         evidence["adapter_returned_success"] = True
         evidence["adapter_completed_at"] = utc_now()
         evidence["adapter_evidence"] = adapter_evidence
+        evidence["submitted_candidate_ids"] = adapter_evidence.get("candidate_ids") or []
+        evidence["submitted_prompt_ids"] = adapter_evidence.get("prompt_ids") or []
         db.execute(
             """UPDATE jobs SET state = '已提交待对账',
             message = 'H3 适配器已返回，正在核对 manifest 与 ComfyUI 证据',
-            reconciliation_snapshot = ?, prompt_ids = ?, updated_at = ?,
+            reconciliation_snapshot = ?, prompt_ids = ?, candidate_ids = ?, updated_at = ?,
             reconciliation_revision = reconciliation_revision + 1
             WHERE id = ? AND state = '提交中' AND reconciliation_revision = 0""",
             (
                 json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                 json.dumps(adapter_evidence.get("prompt_ids") or []),
+                json.dumps(adapter_evidence.get("candidate_ids") or []),
                 utc_now(),
                 submitting_job_id,
             ),
