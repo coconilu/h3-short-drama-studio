@@ -194,6 +194,7 @@ def _evidence_reasons(db: sqlite3.Connection, shot_id: str) -> list[str]:
         "production_bible_shots": "生产圣经镜头绑定",
         "script_storyboard_links": "历史剧本分镜映射",
         "candidate_reviews": "候选审片证据",
+        "h3_validation_leases": "进行中的 H3 dry-run",
     }
     # Audit every declared FK to shots instead of maintaining a partial hand-written list.
     # A future production table therefore fails closed until its relation is handled explicitly.

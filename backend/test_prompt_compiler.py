@@ -11,7 +11,9 @@ from fastapi import HTTPException
 from backend.production_bible import init_bible_schema
 from backend.prompt_compiler import (
     approve_plan,
+    begin_validation_lease,
     compile_prompt_plan,
+    end_validation_lease,
     init_prompt_schema,
     record_validation,
 )
@@ -177,6 +179,30 @@ class PromptCompilerTests(unittest.TestCase):
         self.assertEqual(row["status"], "superseded")
         self.assertIn("输入已变化", row["stale_reasons"])
         self.assertEqual(compile_prompt_plan(self.db_path, "p1-S01-001")["status"], "preview")
+
+    def test_late_validation_after_shot_delete_is_controlled_and_writes_nothing(self) -> None:
+        original = compile_prompt_plan(self.db_path, "p1-S01-001")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("PRAGMA foreign_keys = ON")
+            db.execute("DELETE FROM shots WHERE id = 'p1-S01-001'")
+            db.commit()
+        self.assertFalse(record_validation(self.db_path, original, {"attempt": "too-late"}))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_prompt_plans").fetchone()[0], 0)
+
+    def test_validation_lease_is_unique_and_released_explicitly(self) -> None:
+        plan = compile_prompt_plan(self.db_path, "p1-S01-001")
+        lease_id = begin_validation_lease(self.db_path, plan)
+        with self.assertRaises(HTTPException) as duplicate:
+            begin_validation_lease(self.db_path, plan)
+        self.assertEqual(duplicate.exception.status_code, 409)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("DELETE FROM shots WHERE id = 'p1-S01-001'")
+        end_validation_lease(self.db_path, lease_id)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
 
 
 if __name__ == "__main__":

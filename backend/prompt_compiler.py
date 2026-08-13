@@ -77,8 +77,20 @@ def init_prompt_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_h3_prompt_plans_shot
           ON h3_prompt_plans(shot_id, created_at DESC);
+        CREATE TABLE IF NOT EXISTS h3_validation_leases (
+          id TEXT PRIMARY KEY,
+          shot_id TEXT NOT NULL UNIQUE REFERENCES shots(id) ON DELETE RESTRICT,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          plan_hash TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_h3_validation_leases_project
+          ON h3_validation_leases(project_id, shot_id);
         """
     )
+    # The application uses a single API worker. A new process cannot own leases
+    # left by a previous process, so startup safely clears crash leftovers.
+    db.execute("DELETE FROM h3_validation_leases")
     columns = {row[1] for row in db.execute("PRAGMA table_info(h3_prompt_plans)").fetchall()}
     if "stale_reasons" not in columns:
         db.execute("ALTER TABLE h3_prompt_plans ADD COLUMN stale_reasons TEXT NOT NULL DEFAULT '[]'")
@@ -438,6 +450,36 @@ def public_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in plan.items() if not key.startswith("_") and key != "source_snapshot"}
 
 
+def begin_validation_lease(db_path: Path, plan: dict[str, Any]) -> str:
+    lease_id = f"h3-validation-{uuid.uuid4().hex[:12]}"
+    shot_id = str(plan["shot"]["id"])
+    project_id = str(plan["source_snapshot"]["shot"]["project_id"])
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        snapshot = _current_source_snapshot(db, shot_id, project_id)
+        if snapshot is None:
+            raise HTTPException(409, "镜头已删除，不能开始 H3 dry-run")
+        if _json_hash(snapshot) != plan["plan_hash"]:
+            raise HTTPException(409, "镜头、生产圣经或引用素材已变化，请刷新编译预览后重试")
+        try:
+            db.execute(
+                """INSERT INTO h3_validation_leases (id, shot_id, project_id, plan_hash, created_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (lease_id, shot_id, project_id, plan["plan_hash"], utc_now()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "该镜头已有进行中的 H3 dry-run") from exc
+        db.commit()
+    return lease_id
+
+
+def end_validation_lease(db_path: Path, lease_id: str) -> None:
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM h3_validation_leases WHERE id = ?", (lease_id,))
+        db.commit()
+
+
 def _current_source_snapshot(db: sqlite3.Connection, shot_id: str, project_id: str) -> dict[str, Any] | None:
     shot_row = db.execute(
         "SELECT * FROM shots WHERE id = ? AND project_id = ?", (shot_id, project_id)
@@ -484,6 +526,10 @@ def record_validation(db_path: Path, plan: dict[str, Any], adapter_output: Any) 
             (shot_id, project_id, plan["plan_hash"]),
         ).fetchone()
         current_snapshot = _current_source_snapshot(db, shot_id, project_id)
+        if current_snapshot is None:
+            # Do not retain a late result in a table whose shot FK no longer exists.
+            db.commit()
+            return False
         current_hash = _json_hash(current_snapshot) if current_snapshot else None
         if existing and existing["status"] == "superseded":
             db.commit()

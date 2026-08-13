@@ -34,7 +34,9 @@ try:
     from .production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from .prompt_compiler import (
         approve_plan,
+        begin_validation_lease,
         compile_prompt_plan,
+        end_validation_lease,
         init_prompt_schema,
         mark_prompt_plans_stale,
         project_prompt_status,
@@ -60,7 +62,9 @@ except ImportError:  # Support `uvicorn app:app` when backend is the working dir
     from production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from prompt_compiler import (
         approve_plan,
+        begin_validation_lease,
         compile_prompt_plan,
+        end_validation_lease,
         init_prompt_schema,
         mark_prompt_plans_stale,
         project_prompt_status,
@@ -3099,21 +3103,25 @@ def dry_run_prompt_plan(shot_id: str, request: PromptPlanRequest) -> dict[str, A
         raise HTTPException(409, "镜头、生产圣经或引用素材已变化，请刷新编译预览后重试")
     if not compiled["ready"]:
         raise HTTPException(400, {"message": "编译计划存在阻断项", "blocking": compiled["blocking"]})
-    shot = require_active_shot(shot_id)
-    project, arguments, adapter_plan = build_h3_arguments(
-        shot,
-        True,
-        compiled_prompt_override=compiled["compiled_prompt"],
-        references_override=compiled["_references"],
-        prompt_plan_hash=compiled["plan_hash"],
-    )
-    completed = run_h3(arguments, timeout=90)
+    lease_id = begin_validation_lease(DB_PATH, compiled)
     try:
-        adapter_output: Any = json.loads(completed.stdout.strip())
-    except json.JSONDecodeError:
-        adapter_output = completed.stdout.strip()
-    if not record_validation(DB_PATH, compiled, adapter_output):
-        raise HTTPException(409, "H3 dry-run 返回时输入或计划状态已变化；结果仅保留为历史，请重新检查")
+        shot = require_active_shot(shot_id)
+        project, arguments, adapter_plan = build_h3_arguments(
+            shot,
+            True,
+            compiled_prompt_override=compiled["compiled_prompt"],
+            references_override=compiled["_references"],
+            prompt_plan_hash=compiled["plan_hash"],
+        )
+        completed = run_h3(arguments, timeout=90)
+        try:
+            adapter_output: Any = json.loads(completed.stdout.strip())
+        except json.JSONDecodeError:
+            adapter_output = completed.stdout.strip()
+        if not record_validation(DB_PATH, compiled, adapter_output):
+            raise HTTPException(409, "H3 dry-run 返回时输入或计划状态已变化，请重新检查")
+    finally:
+        end_validation_lease(DB_PATH, lease_id)
     current = public_plan(compile_prompt_plan(DB_PATH, shot_id))
     return {
         **current,

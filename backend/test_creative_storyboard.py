@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
@@ -25,7 +26,13 @@ from backend.creative_storyboard import (
     StoryboardPreviewRequest,
     create_storyboard_router,
 )
-from backend.prompt_compiler import approve_plan, compile_prompt_plan, record_validation
+from backend.prompt_compiler import (
+    approve_plan,
+    begin_validation_lease,
+    compile_prompt_plan,
+    end_validation_lease,
+    record_validation,
+)
 
 
 class CreativeStoryboardContractTests(unittest.TestCase):
@@ -387,6 +394,44 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         with closing(studio.connect()) as db:
             self.assertIsNone(db.execute("SELECT id FROM shots WHERE id = ?", (shot_id,)).fetchone())
             self.assertIsNone(db.execute("SELECT id FROM creative_storyboard_links WHERE section_id = ?", (section["id"],)).fetchone())
+
+    def test_running_validation_lease_blocks_archive_sync_delete_without_partial_write(self) -> None:
+        section = self.approve_section(self.create_section("验证中的镜头"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        plan = compile_prompt_plan(studio.DB_PATH, shot_id)
+        lease_id = begin_validation_lease(studio.DB_PATH, plan)
+        current = self.call_content("/api/creative-planning", "GET")["chapters"][0]["sections"][0]
+        self.call_content(
+            "/api/creative-planning/sections/{section_id}/archive", "POST", current["id"],
+            RevisionBase(base_revision=current["revision"], source="human:test-archive-during-validation"),
+        )
+        before = self._storyboard_mutation_state()
+        protected = self.preview()
+        self.assertEqual(protected["summary"]["protected"], 1)
+        self.assertIn("进行中的 H3 dry-run", protected["rows"][0]["protected_reasons"])
+        with self.assertRaises(HTTPException) as blocked:
+            self.apply(protected)
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertEqual(self._storyboard_mutation_state(), before)
+        end_validation_lease(studio.DB_PATH, lease_id)
+
+        deletion = self.preview()
+        self.assertEqual(deletion["summary"]["delete"], 1)
+        self.apply(deletion)
+        with closing(studio.connect()) as db:
+            self.assertIsNone(db.execute("SELECT id FROM shots WHERE id = ?", (shot_id,)).fetchone())
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_prompt_plans WHERE shot_id = ?", (shot_id,)).fetchone()[0], 0)
+
+    def test_dry_run_failure_always_cleans_validation_lease(self) -> None:
+        self.approve_section(self.create_section("适配器失败"))
+        shot_id = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        plan = compile_prompt_plan(studio.DB_PATH, shot_id)
+        with patch.object(studio, "run_h3", side_effect=RuntimeError("controlled adapter failure")):
+            with self.assertRaisesRegex(RuntimeError, "controlled adapter failure"):
+                studio.dry_run_prompt_plan(shot_id, studio.PromptPlanRequest(plan_hash=plan["plan_hash"]))
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
+            self.assertIsNotNone(db.execute("SELECT id FROM shots WHERE id = ?", (shot_id,)).fetchone())
 
     def test_each_shot_foreign_key_relation_protects_delete_with_zero_partial_writes(self) -> None:
         relation_factories = {
