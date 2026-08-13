@@ -99,6 +99,7 @@ def init_content_schema(db: sqlite3.Connection) -> None:
           ordinal INTEGER NOT NULL,
           title TEXT NOT NULL,
           summary TEXT NOT NULL DEFAULT '',
+          content TEXT NOT NULL DEFAULT '',
           pacing_goal TEXT NOT NULL DEFAULT '',
           planned_seconds REAL NOT NULL DEFAULT 0,
           status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'approved', 'archived')),
@@ -125,6 +126,9 @@ def init_content_schema(db: sqlite3.Connection) -> None:
           ON creative_revisions(project_id, entity_type, entity_id, revision DESC);
         """
     )
+    columns = {row[1] for row in db.execute("PRAGMA table_info(creative_sections)").fetchall()}
+    if "content" not in columns:
+        db.execute("ALTER TABLE creative_sections ADD COLUMN content TEXT NOT NULL DEFAULT ''")
 
 
 ContentStatus = Literal["draft", "approved"]
@@ -205,6 +209,7 @@ class ChapterUpdate(RevisionBase):
 class SectionCreate(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     summary: str = Field("", max_length=6000)
+    content: str = Field("", max_length=24000)
     pacing_goal: str = Field("", max_length=1200)
     planned_seconds: float = Field(0, ge=0, le=36000)
     source: str = Field("human:create", min_length=2, max_length=120)
@@ -213,6 +218,7 @@ class SectionCreate(BaseModel):
 class SectionUpdate(RevisionBase):
     title: str | None = Field(None, min_length=1, max_length=160)
     summary: str | None = Field(None, max_length=6000)
+    content: str | None = Field(None, max_length=24000)
     pacing_goal: str | None = Field(None, max_length=1200)
     planned_seconds: float | None = Field(None, ge=0, le=36000)
     status: ContentStatus | None = None
@@ -933,9 +939,9 @@ def create_content_router(db_path: Path) -> APIRouter:
             values = _clean(payload.model_dump(exclude={"source"}))
             db.execute(
                 """INSERT INTO creative_sections
-                (id, project_id, chapter_id, ordinal, title, summary, pacing_goal, planned_seconds,
+                (id, project_id, chapter_id, ordinal, title, summary, content, pacing_goal, planned_seconds,
                  status, revision, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?)""",
                 (section_id, project["id"], chapter_id, ordinal, *values.values(), now, now),
             )
             _save_revision(db, project["id"], "section", section_id, payload.source)
@@ -1172,9 +1178,14 @@ def create_content_router(db_path: Path) -> APIRouter:
             if source["chapter_id"] != target["chapter_id"]:
                 raise HTTPException(422, "只能合并同一章节内的小节")
             combined = "\n\n".join(part for part in (target["summary"], source["summary"]) if part.strip())
+            combined_content = "\n\n".join(part for part in (target["content"], source["content"]) if part.strip())
             _advance(
                 db, "creative_sections", "section", target["id"], project["id"], target["revision"], payload.source,
-                {"summary": combined, "planned_seconds": float(target["planned_seconds"]) + float(source["planned_seconds"])},
+                {
+                    "summary": combined,
+                    "content": combined_content,
+                    "planned_seconds": float(target["planned_seconds"]) + float(source["planned_seconds"]),
+                },
             )
             _advance(
                 db, "creative_sections", "section", source["id"], project["id"], source["revision"], payload.source,

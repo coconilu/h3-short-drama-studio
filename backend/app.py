@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 try:
     from .content_planning import create_content_router, init_content_schema
+    from .local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from .delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
     from .project_archive import create_archive_router, init_archive_schema
     from .production_bible import create_bible_router, init_bible_schema
@@ -50,6 +51,7 @@ try:
     from .runtime_control import request_supervisor_action, supervisor_status
 except ImportError:  # Support `uvicorn app:app` when backend is the working directory.
     from content_planning import create_content_router, init_content_schema
+    from local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
     from project_archive import create_archive_router, init_archive_schema
     from production_bible import create_bible_router, init_bible_schema
@@ -416,6 +418,7 @@ def init_db() -> None:
             """
         )
         init_content_schema(db)
+        init_local_agent_schema(db)
         init_script_schema(db)
         init_bible_schema(db)
         init_prompt_schema(db)
@@ -1207,6 +1210,7 @@ async def lifespan(_: FastAPI):
     EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
     EXPORT_JOB_ROOT.mkdir(parents=True, exist_ok=True)
     init_db()
+    recover_local_agent_runs(DB_PATH)
     start_export_worker()
     configure_production_scheduler(
         DB_PATH,
@@ -1231,6 +1235,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(create_content_router(DB_PATH))
+app.include_router(create_local_agent_router(DB_PATH))
 app.include_router(create_script_router(DB_PATH, ROOT))
 app.include_router(create_bible_router(DB_PATH))
 app.include_router(create_production_router(DB_PATH, lambda shot_id: compile_prompt_plan(DB_PATH, shot_id)))

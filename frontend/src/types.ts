@@ -147,6 +147,7 @@ export type CreativeSection = {
   ordinal: number
   title: string
   summary: string
+  content: string
   pacing_goal: string
   planned_seconds: number
   status: 'draft' | 'approved'
@@ -220,6 +221,69 @@ export type CreativeArchive = {
     total: number
     by_type: Record<CreativeArchiveEntry['entity_type'], number>
   }
+}
+
+export type LocalAgentProvider = {
+  id: 'codex' | 'kimi'
+  adapter: 'codex' | 'kimi'
+  label: string
+  executable_path?: string
+  enabled: boolean
+  timeout_seconds: number
+  model: string
+  capabilities: Array<{ scope: CreativeAgentScope; operations: CreativeAgentOperation[] }>
+  probe_state: 'unknown' | 'verified' | 'unverified' | 'unavailable'
+  installed: boolean
+  callable: boolean
+  auth_state: 'unknown' | 'verified' | 'unverified' | 'unavailable'
+  model_state: 'unknown' | 'verified' | 'unverified' | 'unavailable'
+  callable_state: 'unknown' | 'verified' | 'unverified' | 'unavailable'
+  version?: string
+  last_error?: string
+  last_probe_at?: string
+  action_hint: string
+}
+
+export type CreativeAgentScope = 'plot' | 'outline' | 'chapter' | 'section' | 'body'
+export type CreativeAgentOperation = 'generate' | 'expand' | 'compress' | 'rewrite' | 'proofread'
+
+export type CreativeAgentRun = {
+  id: string
+  project_id: string
+  provider_id: 'codex' | 'kimi'
+  scope: CreativeAgentScope
+  operation: CreativeAgentOperation
+  target_id?: string
+  parent_id?: string
+  instruction: string
+  state: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'applied' | 'rejected'
+  message: string
+  input_summary: string
+  input_hash: string
+  base_payload: Record<string, unknown>
+  base_revisions: Array<{ entity_type: string; id: string; revision: number }>
+  proposed_payload: { proposal?: Record<string, unknown> }
+  diff: Array<{ path: string; before: string; after: string; unified: string }>
+  raw_output: string
+  log: string
+  error?: string
+  command_info: { adapter?: string; transport?: string; security_profile?: string; executable?: string; arguments?: string[] }
+  provider_version?: string
+  provider_adapter: 'codex' | 'kimi'
+  executable_path: string
+  executable_fingerprint: string
+  timeout_seconds: number
+  model: string
+  retry_of?: string
+  attempt: number
+  cancel_requested: boolean
+  recoverable: boolean
+  confirmed_by?: string
+  created_at: string
+  updated_at: string
+  started_at?: string
+  completed_at?: string
+  applied_at?: string
 }
 
 export type ProjectSummary = {
