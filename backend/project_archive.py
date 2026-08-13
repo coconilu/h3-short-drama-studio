@@ -109,6 +109,11 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
         "SELECT * FROM creative_revisions WHERE project_id = ? ORDER BY entity_type, entity_id, revision",
         (project_id,),
     )
+    creative_agent_runs = _rows(
+        db,
+        "SELECT * FROM creative_agent_runs WHERE project_id = ? ORDER BY created_at",
+        (project_id,),
+    )
 
     return {
         "projects": projects,
@@ -146,6 +151,7 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
         "creative_chapters": creative_chapters,
         "creative_sections": creative_sections,
         "creative_revisions": creative_revisions,
+        "creative_agent_runs": creative_agent_runs,
     }
 
 
