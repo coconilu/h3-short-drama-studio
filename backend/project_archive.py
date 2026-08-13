@@ -99,6 +99,16 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
     export_ids = _ids(export_runs)
     delivery_signoffs = _rows(db, "SELECT * FROM delivery_signoffs WHERE project_id = ? ORDER BY category, revision", (project_id,))
     acceptance_runs = _rows(db, "SELECT * FROM production_acceptance_runs WHERE project_id = ? ORDER BY created_at", (project_id,))
+    creative_briefs = _rows(db, "SELECT * FROM creative_briefs WHERE project_id = ?", (project_id,))
+    creative_proposals = _rows(db, "SELECT * FROM creative_proposals WHERE project_id = ? ORDER BY ordinal", (project_id,))
+    creative_characters = _rows(db, "SELECT * FROM creative_characters WHERE project_id = ? ORDER BY ordinal", (project_id,))
+    creative_chapters = _rows(db, "SELECT * FROM creative_chapters WHERE project_id = ? ORDER BY ordinal", (project_id,))
+    creative_sections = _rows(db, "SELECT * FROM creative_sections WHERE project_id = ? ORDER BY chapter_id, ordinal", (project_id,))
+    creative_revisions = _rows(
+        db,
+        "SELECT * FROM creative_revisions WHERE project_id = ? ORDER BY entity_type, entity_id, revision",
+        (project_id,),
+    )
 
     return {
         "projects": projects,
@@ -130,6 +140,12 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
         "export_events": _by_ids(db, "export_events", "run_id", export_ids),
         "delivery_signoffs": delivery_signoffs,
         "production_acceptance_runs": acceptance_runs,
+        "creative_briefs": creative_briefs,
+        "creative_proposals": creative_proposals,
+        "creative_characters": creative_characters,
+        "creative_chapters": creative_chapters,
+        "creative_sections": creative_sections,
+        "creative_revisions": creative_revisions,
     }
 
 
