@@ -203,7 +203,7 @@ def _provider_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     if result["callable_state"] == "verified":
         result["action_hint"] = "安装、登录和模型调用条件均已验证。"
     elif result["callable"]:
-        result["action_hint"] = "配置已就绪；为避免消耗额度，实际模型调用仍标记为未验证。"
+        result["action_hint"] = result.get("last_error") or "配置已就绪；为避免消耗额度，实际模型调用仍标记为未验证。"
     elif not result["enabled"]:
         result["action_hint"] = "提供方已停用；在系统设置中重新启用后再探测。"
     elif result["installed"]:
@@ -242,9 +242,11 @@ def _resolve_executable(row: sqlite3.Row | dict[str, Any]) -> str | None:
 
 def _executable_fingerprint(executable: str) -> str:
     path = Path(executable).resolve(strict=True)
-    stat = path.stat()
-    identity = f"{os.path.normcase(str(path))}\0{stat.st_size}\0{stat.st_mtime_ns}"
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _isolated_environment(adapter: str) -> dict[str, str]:
@@ -280,6 +282,59 @@ def _probe_command(executable: str, args: list[str], adapter: str, timeout_secon
         env=_isolated_environment(adapter),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+
+
+def _structural_ids(value: Any, *, fields: tuple[str, ...]) -> set[str]:
+    identifiers: set[str] = set()
+    if isinstance(value, dict):
+        identifiers.update(str(key).strip() for key in value if str(key).strip())
+        records = value.values()
+    elif isinstance(value, list):
+        records = value
+    else:
+        return identifiers
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for field in fields:
+            candidate = record.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                identifiers.add(candidate.strip())
+            elif isinstance(candidate, list):
+                identifiers.update(str(item).strip() for item in candidate if isinstance(item, str) and item.strip())
+    return identifiers
+
+
+def _parse_kimi_provider_config(raw: str, configured_model: str) -> tuple[bool, str, str | None]:
+    """Return whether Kimi may be attempted, model state, and an actionable error."""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return False, "unavailable", "Kimi provider list --json 返回了无效 JSON"
+    if not isinstance(payload, dict):
+        return False, "unavailable", "Kimi provider 配置必须是 JSON 对象"
+    provider_ids = _structural_ids(payload.get("providers"), fields=("id", "alias", "aliases"))
+    if not provider_ids:
+        return False, "unavailable", "Kimi provider 配置中没有可用提供方"
+    models = payload.get("models")
+    model_ids = _structural_ids(models, fields=("id", "alias", "aliases", "model"))
+    if not model_ids:
+        return False, "unavailable", "Kimi provider 配置中没有可用模型"
+
+    requested = configured_model.strip()
+    if requested:
+        if requested not in model_ids:
+            return False, "unavailable", f"Kimi 配置中未找到精确模型别名或 ID：{requested}"
+        return True, "verified", None
+
+    default_model = payload.get("defaultModel") or payload.get("default_model")
+    if isinstance(default_model, dict):
+        default_model = default_model.get("id") or default_model.get("alias") or default_model.get("model")
+    if isinstance(default_model, str) and default_model.strip() in model_ids:
+        return True, "verified", None
+    if default_model:
+        return False, "unavailable", "Kimi 默认模型不是已配置的精确模型别名或 ID"
+    return True, "unverified", "Kimi JSON 配置未声明默认模型；实际模型选择未验证"
 
 
 def probe_provider(db_path: Path, provider_id: str) -> dict[str, Any]:
@@ -326,16 +381,17 @@ def probe_provider(db_path: Path, provider_id: str) -> dict[str, Any]:
                     )
                     config_output = (configured.stdout or configured.stderr or "").strip()
                     model = (row["model"] or "").strip()
-                    config_ok = configured.returncode == 0 and bool(config_output)
-                    model_ok = config_ok and (not model or model.lower() in config_output.lower())
+                    if configured.returncode != 0:
+                        config_ok, model_state, config_error = False, "unavailable", None
+                    else:
+                        config_ok, model_state, config_error = _parse_kimi_provider_config(config_output, model)
                     auth_state = "unverified" if config_ok else "unavailable"
-                    model_state = "verified" if model_ok else "unavailable"
-                    callable_detail = "unverified" if model_ok else "unavailable"
-                    callable_state = model_ok
-                    if not config_ok:
+                    callable_detail = "unverified" if config_ok else "unavailable"
+                    callable_state = config_ok
+                    if configured.returncode != 0:
                         error = "Kimi 提供方配置不可读取；请运行 kimi provider list"
-                    elif not model_ok:
-                        error = f"Kimi 配置中未找到模型 {model}"
+                    else:
+                        error = config_error
             except subprocess.TimeoutExpired:
                 error = "版本探测超时"
                 auth_state = model_state = callable_detail = "unavailable"

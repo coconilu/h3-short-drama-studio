@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -45,7 +46,7 @@ if "login" in sys.argv and "status" in sys.argv:
     print("Logged in using fake test identity")
     raise SystemExit(0)
 if "provider" in sys.argv and "list" in sys.argv:
-    print(json.dumps({"providers": [{"id": "fake", "models": ["fake-kimi-model"]}], "defaultModel": "fake-kimi-model"}))
+    print(json.dumps({"providers": {"fake": {"type": "test"}}, "models": {"fake-kimi-model": {"provider": "fake", "model": "fake-kimi-model"}}, "defaultModel": "fake-kimi-model"}))
     raise SystemExit(0)
 
 def response_for(prompt: str) -> str:
@@ -178,6 +179,73 @@ class LocalAgentContractTests(unittest.TestCase):
         self.assertFalse(unavailable["callable"])
         self.assertIn("可执行文件路径", unavailable["action_hint"])
 
+    def test_kimi_provider_json_probe_uses_only_structural_exact_model_identifiers(self) -> None:
+        cases = (
+            (
+                "providers-empty",
+                {"providers": [], "models": {"fake-kimi-model": {"provider": "fake"}}, "defaultModel": "fake-kimi-model"},
+                "", False, "unavailable",
+            ),
+            ("models-empty", {"providers": {"fake": {}}, "models": {}}, "", False, "unavailable"),
+            (
+                "valid-default",
+                {"providers": {"fake": {}}, "models": {"fake-kimi-model": {"provider": "fake"}}, "defaultModel": "fake-kimi-model"},
+                "", True, "verified",
+            ),
+            (
+                "no-default",
+                {"providers": {"fake": {}}, "models": {"fake-kimi-model": {"provider": "fake"}}},
+                "", True, "unverified",
+            ),
+            (
+                "name-only-in-url-and-description",
+                {
+                    "providers": {"fake": {"baseUrl": "https://fake-kimi-model.invalid"}},
+                    "models": {"different-model": {"provider": "fake", "description": "fake-kimi-model"}},
+                },
+                "fake-kimi-model", False, "unavailable",
+            ),
+            (
+                "exact-alias",
+                {"providers": {"fake": {}}, "models": {"fake-kimi-model": {"provider": "fake"}}},
+                "fake-kimi-model", True, "verified",
+            ),
+        )
+        for name, config, configured_model, expected_callable, expected_model_state in cases:
+            with self.subTest(name=name):
+                with closing(studio.connect()) as db:
+                    db.execute("UPDATE local_agent_providers SET model = ? WHERE id = 'kimi'", (configured_model,))
+                    db.commit()
+
+                def fake_probe(_executable: str, args: list[str], _adapter: str, _timeout: int):
+                    if args == ["--version"]:
+                        return subprocess.CompletedProcess(args, 0, "fake-local-agent 1.0\n", "")
+                    return subprocess.CompletedProcess(args, 0, json.dumps(config), "")
+
+                with patch("backend.local_agents._probe_command", side_effect=fake_probe):
+                    status = probe_provider(studio.DB_PATH, "kimi")
+                self.assertEqual(status["callable"], expected_callable)
+                self.assertEqual(status["model_state"], expected_model_state)
+                self.assertEqual(status["callable_state"], "unverified" if expected_callable else "unavailable")
+                if name == "no-default":
+                    self.assertIn("未声明默认模型", status["action_hint"])
+
+    def test_cached_provider_status_does_not_run_probe_commands(self) -> None:
+        with patch("backend.local_agents._probe_command", side_effect=AssertionError("probe must stay idle")):
+            providers = self.call("/api/local-agents/providers", "GET", False)
+        self.assertEqual({provider["id"] for provider in providers}, {"codex", "kimi"})
+
+    def test_kimi_provider_probe_rejects_invalid_json(self) -> None:
+        def fake_probe(_executable: str, args: list[str], _adapter: str, _timeout: int):
+            stdout = "fake-local-agent 1.0\n" if args == ["--version"] else "{not-json"
+            return subprocess.CompletedProcess(args, 0, stdout, "")
+
+        with patch("backend.local_agents._probe_command", side_effect=fake_probe):
+            status = probe_provider(studio.DB_PATH, "kimi")
+        self.assertFalse(status["callable"])
+        self.assertEqual(status["model_state"], "unavailable")
+        self.assertIn("无效 JSON", status["action_hint"])
+
     def test_all_five_scopes_have_strict_structured_contracts(self) -> None:
         cases = {
             "plot": {"proposal": {"title": "A", "synopsis": "B", "core_conflict": "C", "ending": "D"}},
@@ -304,6 +372,27 @@ class LocalAgentContractTests(unittest.TestCase):
         self.assertEqual(completed["timeout_seconds"], 2)
         self.assertEqual(completed["provider_version"], "fake-local-agent 1.0")
         self.assertEqual(Path(str(completed["executable_path"])), self.fake_cli.resolve())
+
+    def test_content_fingerprint_rejects_same_size_same_mtime_executable_replacement(self) -> None:
+        run = create_run_record(studio.DB_PATH, AgentRunCreate(
+            provider_id="codex", scope="body", operation="rewrite", target_id=self.section["id"],
+            instruction="检测可执行文件内容替换",
+        ))
+        before = self.fake_cli.read_bytes()
+        stat = self.fake_cli.stat()
+        replacement = before.replace(b"fake-local-agent 1.0", b"fake-local-agent 2.0")
+        self.assertEqual(len(replacement), len(before))
+        self.assertNotEqual(replacement, before)
+        self.fake_cli.write_bytes(replacement)
+        os.utime(self.fake_cli, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        self.assertEqual(self.fake_cli.stat().st_size, stat.st_size)
+        self.assertEqual(self.fake_cli.stat().st_mtime_ns, stat.st_mtime_ns)
+        with patch("backend.local_agents.subprocess.Popen") as popen:
+            execute_agent_run(studio.DB_PATH, run["id"])
+        failed = self.row(run["id"])
+        self.assertFalse(popen.called)
+        self.assertEqual(failed["state"], "failed")
+        self.assertIn("发生变化", str(failed["error"]))
 
     def test_plot_chapter_section_and_outline_proposals_apply_only_after_confirmation(self) -> None:
         plot = self.run_sync(AgentRunCreate(

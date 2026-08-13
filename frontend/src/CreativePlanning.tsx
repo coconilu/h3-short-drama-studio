@@ -192,32 +192,60 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
   const [editor, setEditor] = useState<Editor | null>(null)
   const [history, setHistory] = useState<CreativeRevisionHistory | null>(null)
   const [providers, setProviders] = useState<LocalAgentProvider[]>([])
+  const [probingProviders, setProbingProviders] = useState(false)
   const [agentRuns, setAgentRuns] = useState<CreativeAgentRun[]>([])
   const [agentTarget, setAgentTarget] = useState<AgentTarget | null>(null)
   const [reviewRun, setReviewRun] = useState<CreativeAgentRun | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
-  const load = useCallback(async () => {
+  const loadWorkspace = useCallback(async () => {
     try {
-      const [data, archived, providerData, runData] = await Promise.all([
-        planningApi<CreativePlanningWorkspace>('/api/creative-planning'),
-        planningApi<CreativeArchive>('/api/creative-planning/archive'),
-        planningApi<LocalAgentProvider[]>('/api/local-agents/providers'),
-        planningApi<CreativeAgentRun[]>('/api/local-agents/runs'),
-      ])
+      const data = await planningApi<CreativePlanningWorkspace>('/api/creative-planning')
       setWorkspace(data)
       setBrief(data.brief)
-      setArchiveView(archived)
-      setProviders(providerData)
-      setAgentRuns(runData)
       setError('')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '创作规划加载失败')
     }
   }, [])
 
-  useEffect(() => { load() }, [load, projectId])
+  useEffect(() => { void loadWorkspace() }, [loadWorkspace, projectId])
+
+  useEffect(() => {
+    let active = true
+    let freshProbeApplied = false
+    const supportController = new AbortController()
+    const probeController = new AbortController()
+    const probeTimeout = window.setTimeout(() => probeController.abort(), 8000)
+
+    void planningApi<CreativeArchive>('/api/creative-planning/archive', { signal: supportController.signal })
+      .then((archived) => { if (active) setArchiveView(archived) })
+      .catch(() => { /* archive history is supplementary; editing remains available */ })
+    void planningApi<CreativeAgentRun[]>('/api/local-agents/runs', { signal: supportController.signal })
+      .then((runs) => { if (active) setAgentRuns(runs) })
+      .catch(() => { /* recoverable run history must not block manual planning */ })
+    void planningApi<LocalAgentProvider[]>('/api/local-agents/providers?probe=false', { signal: supportController.signal })
+      .then((cached) => { if (active && !freshProbeApplied) setProviders(cached) })
+      .catch(() => { /* background probe below may still recover provider status */ })
+
+    setProbingProviders(true)
+    void planningApi<LocalAgentProvider[]>('/api/local-agents/providers?probe=true', { signal: probeController.signal })
+      .then((fresh) => {
+        if (!active) return
+        freshProbeApplied = true
+        setProviders(fresh)
+      })
+      .catch(() => { /* timeout/failure leaves the cached state and manual workflow intact */ })
+      .finally(() => { if (active) setProbingProviders(false) })
+
+    return () => {
+      active = false
+      window.clearTimeout(probeTimeout)
+      supportController.abort()
+      probeController.abort()
+    }
+  }, [projectId])
 
   const activeAgentRun = agentRuns.find((run) => run.state === 'queued' || run.state === 'running')
   useEffect(() => {
@@ -396,7 +424,7 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
       else setAgentRuns((items) => items.map((item) => item.id === next.id ? next : item))
       if (action === 'apply') {
         setReviewRun(null)
-        await load()
+        await loadWorkspace()
         setNotice('Agent 提案已确认，并创建新的正式修订')
       } else if (action === 'reject') {
         setReviewRun(null)
@@ -408,7 +436,7 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
 
   const plannedSeconds = useMemo(() => workspace?.chapters.reduce((sum, chapter) => sum + chapter.sections.reduce((subtotal, section) => subtotal + section.planned_seconds, 0), 0) || 0, [workspace])
 
-  if (!workspace || !brief) return <main className="planning-loading">{error ? <><CircleDashed size={28} /><strong>创作规划暂时无法加载</strong><p>{error}</p><button className="button secondary" onClick={load}>重试</button></> : <><LoaderCircle className="spin" /><span>正在建立创作规划工作区…</span></>}</main>
+  if (!workspace || !brief) return <main className="planning-loading">{error ? <><CircleDashed size={28} /><strong>创作规划暂时无法加载</strong><p>{error}</p><button className="button secondary" onClick={loadWorkspace}>重试</button></> : <><LoaderCircle className="spin" /><span>正在建立创作规划工作区…</span></>}</main>
 
   return <main className="creative-planning">
     <section className="planning-hero">
@@ -423,7 +451,7 @@ export function CreativePlanning({ projectId, onOpenScript, setNotice }: {
     {error && <button className="planning-error" onClick={() => setError('')}>{error}<X size={14} /></button>}
 
     <section className="planning-section agent-task-section">
-      <header><div><span><Bot size={17} /></span><div><h2>本地 Agent 任务</h2><p>调用记录可恢复；每个结果必须查看差异并人工确认。</p></div></div><em>{providers.filter((provider) => provider.callable).length}/{providers.length} 个提供方可用</em></header>
+      <header><div><span><Bot size={17} /></span><div><h2>本地 Agent 任务</h2><p>调用记录可恢复；每个结果必须查看差异并人工确认。</p></div></div><em>{probingProviders ? '后台探测中 · ' : ''}{providers.filter((provider) => provider.callable).length}/{providers.length} 个提供方可用</em></header>
       <div className="agent-run-list">{agentRuns.slice(0, 8).map((run) => <article key={run.id}><div><span className={`agent-run-state state-${run.state}`}>{runStateLabel[run.state]}</span><strong>{scopeLabel[run.scope]} · {operationLabel[run.operation]}</strong><small>{providers.find((provider) => provider.id === run.provider_id)?.label || run.provider_id} · {formatTime(run.updated_at)} · 尝试 {run.attempt}</small><p>{run.error || run.message}</p>{(run.state === 'failed' && (run.raw_output || run.log)) && <details><summary>查看错误日志与原始输出</summary><pre>{[run.log, run.raw_output].filter(Boolean).join('\n\n')}</pre></details>}</div><div>{(run.state === 'queued' || run.state === 'running') && <button className="button secondary" disabled={busy} onClick={() => mutateAgentRun(run, 'cancel')}>取消</button>}{(run.state === 'failed' || run.state === 'cancelled') && <button className="button secondary" disabled={busy} onClick={() => mutateAgentRun(run, 'retry')}>重试</button>}{run.state === 'completed' && <button className="button primary" onClick={() => setReviewRun(run)}>查看差异</button>}</div></article>)}{!agentRuns.length && <div className="agent-run-empty"><Bot size={20} /><span>尚无任务；可从剧情、大纲、章节、小节或正文发起。</span></div>}</div>
     </section>
 
