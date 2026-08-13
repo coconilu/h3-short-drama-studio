@@ -1070,6 +1070,90 @@ def draft_attempt_marker(shot_id: str, db: sqlite3.Connection | None = None) -> 
     return (int(record["id"]), str(record["state"]), int(record["reconciliation_revision"] or 0))
 
 
+def legacy_active_draft_jobs(shot_id: str) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in ACTIVE_JOB_STATES)
+    return rows(
+        f"""SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
+        AND state IN ({placeholders})
+        AND (candidate_ids IS NULL OR candidate_ids = '' OR candidate_ids = '[]')
+        ORDER BY id""",
+        (shot_id, *ACTIVE_JOB_STATES),
+    )
+
+
+def legacy_recovery_result(project: str, job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "project": project,
+        "state": job["state"],
+        "message": job["message"],
+        "prompt_ids": string_list(job.get("prompt_ids")),
+        "completed": 0,
+        "total": len(draft_attempt_candidate_ids(job)),
+    }
+
+
+def recover_legacy_draft_job(
+    job: dict[str, Any], project: str, manifest: dict[str, Any], reserved_candidate_ids: set[str],
+) -> dict[str, Any]:
+    evidence = job_reconciliation_evidence(job)
+    attempt_ids, recovery, recovery_error = match_legacy_attempt_by_prompt_ids(job, project, manifest)
+    overlapping_ids = [candidate_id for candidate_id in attempt_ids if candidate_id in reserved_candidate_ids]
+    if overlapping_ids:
+        recovery["status"] = "failed"
+        recovery["overlapping_candidate_ids"] = overlapping_ids
+        recovery_error = "旧任务恢复出的 candidate set 与其他活动 attempt 重叠"
+        attempt_ids = []
+    evidence["legacy_attempt_recovery"] = recovery
+    if recovery_error:
+        resolved = update_reconciliation_job(
+            job,
+            "待人工对账",
+            f"旧任务 candidate set 无法安全恢复：{recovery_error}；禁止全量 manifest 同步",
+            evidence,
+            completed=True,
+        )
+        return legacy_recovery_result(project, resolved)
+    reserved_candidate_ids.update(attempt_ids)
+    try:
+        return sync_manifest_to_db(
+            str(job["shot_id"]),
+            project,
+            manifest,
+            job_id=int(job["id"]),
+            record_ids=attempt_ids,
+            reconciliation_evidence=evidence,
+            expected_job_state=str(job["state"]),
+            expected_job_revision=int(job.get("reconciliation_revision") or 0),
+        )
+    except ReconciliationConflict:
+        current = row("SELECT * FROM jobs WHERE id = ?", (job["id"],)) or job
+        return legacy_recovery_result(project, current)
+
+
+def recover_all_legacy_draft_jobs(
+    shot_id: str, project: str, manifest: dict[str, Any], *, skip_job_id: int | None = None,
+) -> list[dict[str, Any]]:
+    legacy_jobs = [
+        job for job in legacy_active_draft_jobs(shot_id)
+        if skip_job_id is None or int(job["id"]) != skip_job_id
+    ]
+    if not legacy_jobs:
+        return []
+    reserved_candidate_ids = {
+        candidate_id
+        for job in rows(
+            """SELECT candidate_ids FROM jobs WHERE shot_id = ? AND kind = 'draft'
+            AND candidate_ids IS NOT NULL AND candidate_ids NOT IN ('', '[]')""",
+            (shot_id,),
+        )
+        for candidate_id in string_list(job.get("candidate_ids"))
+    }
+    return [
+        recover_legacy_draft_job(job, project, manifest, reserved_candidate_ids)
+        for job in legacy_jobs
+    ]
+
+
 class H3AdapterError(HTTPException):
     def __init__(self, status_code: int, detail: str, *, process_started: bool) -> None:
         super().__init__(status_code=status_code, detail=detail)
@@ -1610,12 +1694,13 @@ def refresh_h3_project(
             "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1",
             (shot_id,),
         )
+    pending_legacy_jobs = legacy_active_draft_jobs(shot_id)
     manual = latest if latest and latest.get("state") == "待人工对账" else row(
         """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
         AND state = '待人工对账' ORDER BY id DESC LIMIT 1""",
         (shot_id,),
     )
-    if manual:
+    if manual and not pending_legacy_jobs:
         return {
             "project": project,
             "state": manual["state"],
@@ -1647,7 +1732,11 @@ def refresh_h3_project(
         }
     attempt_ids = draft_attempt_candidate_ids(latest) if latest else []
     attempt_evidence = job_reconciliation_evidence(latest) if latest else {}
-    legacy_recovery_needed = latest is not None and not attempt_ids
+    legacy_recovery_needed = (
+        latest is not None
+        and latest.get("state") in ACTIVE_JOB_STATES
+        and not attempt_ids
+    )
     if latest and latest.get("retry_safe"):
         return {
             "project": project,
@@ -1661,50 +1750,50 @@ def refresh_h3_project(
     try:
         manifest = read_manifest(project)
     except HTTPException as exc:
-        if not legacy_recovery_needed:
+        legacy_jobs = legacy_active_draft_jobs(shot_id)
+        if not legacy_jobs and not legacy_recovery_needed:
             raise
-        recovery = {
-            "strategy": "exact_prompt_id_match",
-            "status": "failed",
-            "checked_at": utc_now(),
-            "expected_prompt_ids": string_list(latest.get("prompt_ids")),
-            "manifest_error": str(exc.detail),
-        }
-        attempt_evidence["legacy_attempt_recovery"] = recovery
-        resolved = update_reconciliation_job(
-            latest,
-            "待人工对账",
-            f"旧任务 candidate set 无法安全恢复：{exc.detail}；禁止全量 manifest 同步",
-            attempt_evidence,
-            completed=True,
-        )
-        return {
-            "project": project,
-            "state": resolved["state"],
-            "message": resolved["message"],
-            "prompt_ids": string_list(resolved.get("prompt_ids")),
-            "completed": 0,
-            "total": len(draft_attempt_candidate_ids(resolved)),
-        }
-    if legacy_recovery_needed:
-        attempt_ids, recovery, recovery_error = match_legacy_attempt_by_prompt_ids(latest, project, manifest)
-        attempt_evidence["legacy_attempt_recovery"] = recovery
-        if recovery_error:
+        recovery_results: list[dict[str, Any]] = []
+        for job in legacy_jobs:
+            evidence = job_reconciliation_evidence(job)
+            evidence["legacy_attempt_recovery"] = {
+                "strategy": "exact_prompt_id_match",
+                "status": "failed",
+                "checked_at": utc_now(),
+                "expected_prompt_ids": string_list(job.get("prompt_ids")),
+                "manifest_error": str(exc.detail),
+            }
             resolved = update_reconciliation_job(
-                latest,
+                job,
                 "待人工对账",
-                f"旧任务 candidate set 无法安全恢复：{recovery_error}；禁止全量 manifest 同步",
-                attempt_evidence,
+                f"旧任务 candidate set 无法安全恢复：{exc.detail}；禁止全量 manifest 同步",
+                evidence,
                 completed=True,
             )
-            return {
-                "project": project,
-                "state": resolved["state"],
-                "message": resolved["message"],
-                "prompt_ids": string_list(resolved.get("prompt_ids")),
-                "completed": 0,
-                "total": len(draft_attempt_candidate_ids(resolved)),
-            }
+            recovery_results.append(legacy_recovery_result(project, resolved))
+        return recovery_results[-1]
+    other_legacy_results = recover_all_legacy_draft_jobs(
+        shot_id,
+        project,
+        manifest,
+        skip_job_id=int(latest["id"]) if legacy_recovery_needed else None,
+    )
+    if legacy_recovery_needed:
+        reserved_ids = {
+            candidate_id
+            for job in rows(
+                """SELECT candidate_ids FROM jobs WHERE shot_id = ? AND kind = 'draft'
+                AND candidate_ids IS NOT NULL AND candidate_ids NOT IN ('', '[]')""",
+                (shot_id,),
+            )
+            for candidate_id in string_list(job.get("candidate_ids"))
+        }
+        result = recover_legacy_draft_job(latest, project, manifest, reserved_ids)
+        return result
+    if manual:
+        return legacy_recovery_result(project, manual)
+    if other_legacy_results and latest is None:
+        return other_legacy_results[-1]
     attempt_id_set = set(attempt_ids)
     relevant_records = [
         record for record in manifest.get("candidates") or []
