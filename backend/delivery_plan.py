@@ -296,6 +296,11 @@ def _hash_items(items: list[dict[str, Any]]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def delivery_plan_hash(items: list[dict[str, Any]]) -> str:
+    """Public canonical hash contract shared by lock and export gates."""
+    return _hash_items(items)
+
+
 def _validate_items(db: sqlite3.Connection, project_id: str, items: list[dict[str, Any]]) -> None:
     current = {
         row["id"]: dict(row)

@@ -31,8 +31,12 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         self.video.write_bytes(b"controlled-frozen-video")
         self.original_db = studio.DB_PATH
         self.original_output = studio.COMFY_OUTPUT_ROOT
+        self.original_export_root = studio.EXPORT_ROOT
+        self.original_export_job_root = studio.EXPORT_JOB_ROOT
         studio.DB_PATH = self.db_path
         studio.COMFY_OUTPUT_ROOT = self.root.resolve()
+        studio.EXPORT_ROOT = (self.root / "exports").resolve()
+        studio.EXPORT_JOB_ROOT = (self.root / "export-jobs").resolve()
         with closing(sqlite3.connect(self.db_path)) as db:
             db.executescript(
                 """
@@ -63,6 +67,20 @@ class FrozenDeliveryExportTests(unittest.TestCase):
                   shot_id TEXT PRIMARY KEY, section_id TEXT NOT NULL, last_synced_revision INTEGER NOT NULL
                 );
                 CREATE TABLE creative_sections (id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+                CREATE TABLE export_runs (
+                  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, state TEXT NOT NULL, message TEXT NOT NULL,
+                  output_name TEXT NOT NULL UNIQUE, width INTEGER NOT NULL, height INTEGER NOT NULL,
+                  polish_audio INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL DEFAULT '{}',
+                  outputs TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                  completed_at TEXT, error TEXT, attempt INTEGER NOT NULL DEFAULT 1, parent_run_id TEXT,
+                  cancel_requested INTEGER NOT NULL DEFAULT 0, started_at TEXT, worker_id TEXT,
+                  recovery_count INTEGER NOT NULL DEFAULT 0, source_snapshot TEXT NOT NULL DEFAULT '{}',
+                  is_current INTEGER NOT NULL DEFAULT 0, log_file TEXT
+                );
+                CREATE TABLE export_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES export_runs(id) ON DELETE CASCADE,
+                  level TEXT NOT NULL, event TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL
+                );
                 """
             )
             db.execute("INSERT INTO projects VALUES ('p1', '测试剧', 'EP01', 'logline', 60, 'now', 0)")
@@ -99,6 +117,8 @@ class FrozenDeliveryExportTests(unittest.TestCase):
     def tearDown(self) -> None:
         studio.DB_PATH = self.original_db
         studio.COMFY_OUTPUT_ROOT = self.original_output
+        studio.EXPORT_ROOT = self.original_export_root
+        studio.EXPORT_JOB_ROOT = self.original_export_job_root
         self.temp_dir.cleanup()
 
     @staticmethod
@@ -118,6 +138,8 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         self.assertTrue(source["subtitle_enabled"])
         self.assertEqual(source["section_revision"], 7)
         self.assertEqual(source["checksum_sha256"], hashlib.sha256(self.video.read_bytes()).hexdigest())
+        self.assertEqual(result["delivery_plan"]["plan_hash"], result["delivery_plan"]["calculated_plan_hash"])
+        self.assertEqual(len(result["delivery_plan"]["assembly_snapshot_hash"]), 64)
 
     def test_current_selection_change_does_not_replace_frozen_source(self) -> None:
         other = self.root / "other.mp4"
@@ -141,6 +163,94 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertEqual(result["ready_shot_count"], 0)
         self.assertIn("SHA256", result["issues"][0]["message"])
+
+    def test_locked_item_or_plan_hash_tampering_fails_preflight_and_create_atomically(self) -> None:
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("UPDATE delivery_plan_items SET dialogue_mode = 'original'")
+            db.commit()
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            preflight = studio.export_preflight_payload(include_private=True)
+        self.assertFalse(preflight["ready"])
+        self.assertIn("plan_hash", " ".join(issue["message"] for issue in preflight["issues"]))
+
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("UPDATE delivery_plan_items SET dialogue_mode = 'mute'")
+            db.commit()
+        original_integrity = studio._assembly_integrity
+        calls = 0
+
+        def tamper_after_preflight(assembly: dict) -> dict:
+            nonlocal calls
+            result = original_integrity(assembly)
+            calls += 1
+            if calls == 1:
+                with closing(sqlite3.connect(self.db_path)) as db:
+                    db.execute("UPDATE delivery_plan_items SET subtitle_start_seconds = 0.4")
+                    db.commit()
+            return result
+
+        with patch("backend.app.probe_media", side_effect=self.probe), patch(
+            "backend.app._assembly_integrity", side_effect=tamper_after_preflight,
+        ):
+            with self.assertRaises(Exception):
+                studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM export_runs").fetchone()[0], 0)
+
+    def test_worker_start_revalidates_locked_assembly_before_ffmpeg(self) -> None:
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("UPDATE delivery_plan_items SET dialogue_mode = 'original'")
+            db.commit()
+        claimed = studio.claim_next_export_run()
+        self.assertEqual(claimed["id"], queued["id"])
+        with patch("backend.app.subprocess.Popen") as popen:
+            studio.run_export_job(queued["id"])
+        popen.assert_not_called()
+        with closing(sqlite3.connect(self.db_path)) as db:
+            failed = db.execute("SELECT state, is_current FROM export_runs WHERE id = ?", (queued["id"],)).fetchone()
+        self.assertEqual(failed[0], "失败")
+        self.assertEqual(failed[1], 0)
+
+    def test_media_replaced_during_render_fails_before_publish(self) -> None:
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
+        claimed = studio.claim_next_export_run()
+        self.assertEqual(claimed["id"], queued["id"])
+        run = studio.row("SELECT * FROM export_runs WHERE id = ?", (queued["id"],))
+        snapshot = json.loads(run["source_snapshot"])
+        stem = run["output_name"]
+
+        class SuccessfulRender:
+            pid = 4242
+            returncode = 0
+
+            def __init__(self, test: "FrozenDeliveryExportTests") -> None:
+                self.test = test
+                self.finished = False
+
+            def poll(self) -> int:
+                if not self.finished:
+                    studio.EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+                    for suffix in (".mp4", ".srt", ".vtt"):
+                        (studio.EXPORT_ROOT / f"{stem}{suffix}").write_bytes(b"controlled-output")
+                    (studio.EXPORT_ROOT / f"{stem}.sources.json").write_text(
+                        json.dumps(snapshot["sources"], ensure_ascii=False), encoding="utf-8",
+                    )
+                    self.test.video.write_bytes(b"replaced-during-render-with-different-content")
+                    self.finished = True
+                return 0
+
+        fake = SuccessfulRender(self)
+        with patch("backend.app.subprocess.Popen", return_value=fake):
+            studio.run_export_job(queued["id"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            failed = db.execute("SELECT state, is_current, outputs FROM export_runs WHERE id = ?", (queued["id"],)).fetchone()
+        self.assertEqual(failed[0], "失败")
+        self.assertEqual(failed[1], 0)
+        self.assertEqual(json.loads(failed[2]), {})
+        self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe") and shutil.which("powershell.exe"), "requires FFmpeg and Windows PowerShell")
     def test_export_script_applies_trim_mute_and_frozen_subtitle(self) -> None:

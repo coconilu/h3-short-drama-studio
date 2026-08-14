@@ -29,7 +29,7 @@ try:
     from .content_planning import create_content_router, init_content_schema
     from .creative_storyboard import create_storyboard_router, init_storyboard_schema
     from .local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
-    from .delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
+    from .delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
     from .project_archive import create_archive_router, init_archive_schema
     from .production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from .prompt_compiler import (
@@ -58,7 +58,7 @@ except ImportError:  # Support `uvicorn app:app` when backend is the working dir
     from content_planning import create_content_router, init_content_schema
     from creative_storyboard import create_storyboard_router, init_storyboard_schema
     from local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
-    from delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
+    from delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
     from project_archive import create_archive_router, init_archive_schema
     from production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from prompt_compiler import (
@@ -1841,19 +1841,26 @@ def refresh_h3_project(
     *,
     attempt_job: dict[str, Any] | None = None,
     include_promotions: bool = False,
+    strict_attempt: bool = False,
 ) -> dict[str, Any]:
+    exact_attempt = strict_attempt
     latest = attempt_job
     if latest is None:
         latest = row(
             "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1",
             (shot_id,),
         )
-    pending_legacy_jobs = legacy_draft_jobs_needing_recovery(shot_id)
-    manual = latest if latest and latest.get("state") == "待人工对账" else row(
-        """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
-        AND state = '待人工对账' ORDER BY id DESC LIMIT 1""",
-        (shot_id,),
-    )
+    pending_legacy_jobs = [] if exact_attempt else legacy_draft_jobs_needing_recovery(shot_id)
+    if latest and latest.get("state") == "待人工对账":
+        manual = latest
+    elif exact_attempt:
+        manual = None
+    else:
+        manual = row(
+            """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
+            AND state = '待人工对账' ORDER BY id DESC LIMIT 1""",
+            (shot_id,),
+        )
     if manual and not pending_legacy_jobs:
         return {
             "project": project,
@@ -1923,11 +1930,8 @@ def refresh_h3_project(
             )
             recovery_results.append(legacy_recovery_result(project, resolved))
         return recovery_results[-1]
-    other_legacy_results = recover_all_legacy_draft_jobs(
-        shot_id,
-        project,
-        manifest,
-        skip_job_id=int(latest["id"]) if legacy_recovery_needed else None,
+    other_legacy_results = [] if exact_attempt else recover_all_legacy_draft_jobs(
+        shot_id, project, manifest, skip_job_id=int(latest["id"]) if legacy_recovery_needed else None,
     )
     if legacy_recovery_needed:
         reserved_ids = {
@@ -2122,6 +2126,70 @@ class DeliverySignoffRequest(BaseModel):
     source: str = Field(default="human-review", min_length=2, max_length=80)
 
 
+def sync_production_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Poll only the immutable draft job owned by one production attempt."""
+    job_id = item.get("draft_job_id")
+    if not job_id:
+        return {
+            "authoritative": False,
+            "state": "待人工对账",
+            "message": "生产条目缺少精确 draft job 绑定；保持运行且禁止按全量 manifest 覆盖所有权",
+            "prompt_ids": [],
+            "candidate_ids": [],
+        }
+    job = row(
+        "SELECT * FROM jobs WHERE id = ? AND shot_id = ? AND kind = 'draft'",
+        (job_id, item["shot_id"]),
+    )
+    if not job:
+        return {
+            "authoritative": False,
+            "state": "待人工对账",
+            "message": "生产条目绑定的 draft job 已不存在；保持运行并等待人工对账",
+            "job_id": job_id,
+            "prompt_ids": [],
+            "candidate_ids": [],
+        }
+    base_revision = int(job.get("reconciliation_revision") or 0)
+    if base_revision != int(item.get("draft_job_revision") or 0):
+        return {
+            "authoritative": False,
+            "state": "待人工对账",
+            "message": "draft job 修订已被其他同步或人工动作更新；生产条目保持运行并等待重新对账",
+            "job_id": int(job["id"]),
+            "job_revision": base_revision,
+            "prompt_ids": string_list(job.get("prompt_ids")),
+            "candidate_ids": draft_attempt_candidate_ids(job),
+        }
+    refreshed = refresh_h3_project(
+        item["shot_id"],
+        item.get("h3_project") or job.get("h3_project") or h3_project_for_shot(item["shot_id"]),
+        attempt_job=job,
+        strict_attempt=True,
+    )
+    current = row("SELECT * FROM jobs WHERE id = ? AND shot_id = ? AND kind = 'draft'", (job_id, item["shot_id"]))
+    if not current:
+        return {
+            "authoritative": False,
+            "state": "待人工对账",
+            "message": "同步后 draft job 不可读取；禁止覆盖生产条目所有权",
+            "job_id": job_id,
+            "prompt_ids": [],
+            "candidate_ids": [],
+        }
+    return {
+        **refreshed,
+        "authoritative": True,
+        "job_id": int(current["id"]),
+        "base_job_revision": base_revision,
+        "job_revision": int(current.get("reconciliation_revision") or 0),
+        "state": current["state"],
+        "message": current["message"],
+        "prompt_ids": string_list(current.get("prompt_ids")),
+        "candidate_ids": draft_attempt_candidate_ids(current),
+    }
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     ASSET_ROOT.mkdir(parents=True, exist_ok=True)
@@ -2137,10 +2205,7 @@ async def lifespan(_: FastAPI):
             item["shot_id"],
             GenerateRequest(confirm=True, dry_run=False, expected_validation_hash=item["validation_hash"]),
         ),
-        lambda item: {
-            **refresh_h3_project(item["shot_id"], item.get("h3_project") or h3_project_for_shot(item["shot_id"])),
-            "job_id": item.get("draft_job_id"),
-        },
+        sync_production_item,
         output_root=COMFY_OUTPUT_ROOT,
     )
     start_production_worker()
@@ -2779,6 +2844,64 @@ def export_run_public(item: dict[str, Any], include_events: bool = False) -> dic
     return item
 
 
+def _locked_assembly_from_db(db: sqlite3.Connection, project_id: str) -> dict[str, Any] | None:
+    plan_row = db.execute(
+        "SELECT * FROM delivery_plans WHERE project_id = ? AND status = 'locked'", (project_id,),
+    ).fetchone()
+    if not plan_row:
+        return None
+    plan = dict(plan_row)
+    items: list[dict[str, Any]] = []
+    for row_value in db.execute(
+        "SELECT * FROM delivery_plan_items WHERE plan_id = ? ORDER BY ordinal, shot_id", (plan["id"],),
+    ).fetchall():
+        item = dict(row_value)
+        item["subtitle_enabled"] = bool(item.get("subtitle_enabled"))
+        try:
+            item["source_snapshot"] = json.loads(item.get("source_snapshot") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            item["source_snapshot"] = {}
+        items.append(item)
+    return {**plan, "items": items}
+
+
+def _assembly_snapshot(assembly: dict[str, Any]) -> dict[str, Any]:
+    normalized_items = [
+        {
+            "shot_id": item["shot_id"], "ordinal": int(item["ordinal"]),
+            "subtitle_enabled": bool(item["subtitle_enabled"]),
+            "subtitle_start_seconds": item.get("subtitle_start_seconds"),
+            "transition": item.get("transition") or "cut",
+            "in_point_seconds": item.get("in_point_seconds", 0),
+            "out_point_seconds": item.get("out_point_seconds"),
+            "dialogue_mode": item.get("dialogue_mode") or "original",
+            "section_id": item.get("section_id"), "candidate_id": item.get("candidate_id"),
+            "master_version_id": item.get("master_version_id"),
+            "source_snapshot": item.get("source_snapshot") or {},
+        }
+        for item in assembly["items"]
+    ]
+    return {
+        "id": assembly["id"],
+        "project_id": assembly["project_id"],
+        "status": assembly["status"],
+        "revision": int(assembly["revision"]),
+        "plan_hash": assembly["plan_hash"],
+        "items": normalized_items,
+    }
+
+
+def _assembly_integrity(assembly: dict[str, Any]) -> dict[str, Any]:
+    calculated = delivery_plan_hash(assembly["items"])
+    snapshot = _assembly_snapshot(assembly)
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "calculated_plan_hash": calculated,
+        "snapshot_hash": hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest(),
+        "valid": calculated == assembly.get("plan_hash") and assembly.get("status") == "locked",
+    }
+
+
 def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
     project = active_project()
     if not project:
@@ -2790,6 +2913,12 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
         issues.append({"shot_id": "delivery-plan", "title": "成片装配", "message": "装配计划尚未锁定"})
         shots = current_shots
     else:
+        assembly_integrity = _assembly_integrity(assembly)
+        if not assembly_integrity["valid"]:
+            issues.append({
+                "shot_id": "delivery-plan", "title": "成片装配",
+                "message": "锁定装配的规范化内容与 plan_hash 不一致，禁止导出",
+            })
         shots_by_id = {shot["id"]: shot for shot in current_shots}
         assembly_ids = [item["shot_id"] for item in assembly["items"]]
         if set(assembly_ids) != set(shots_by_id):
@@ -2892,7 +3021,9 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
         "duration_seconds": round(total_seconds, 3),
         "source_policy": "selected_only",
         "delivery_plan": None if not assembly else {
-            "id": assembly["id"], "revision": assembly["revision"], "plan_hash": assembly["plan_hash"], "status": assembly["status"],
+            "id": assembly["id"], "revision": assembly["revision"], "plan_hash": assembly["plan_hash"],
+            "calculated_plan_hash": assembly_integrity["calculated_plan_hash"],
+            "assembly_snapshot_hash": assembly_integrity["snapshot_hash"], "status": assembly["status"],
         },
         "sources": sources,
         "issues": issues,
@@ -2959,6 +3090,63 @@ def terminate_process_tree(process: subprocess.Popen[str]) -> None:
 def export_cancel_requested(run_id: str) -> bool:
     current = row("SELECT cancel_requested FROM export_runs WHERE id = ?", (run_id,))
     return bool(current and current.get("cancel_requested"))
+
+
+def _verify_frozen_export_sources(
+    snapshot: dict[str, Any], rendered_sources: list[dict[str, Any]] | None = None,
+) -> None:
+    frozen_sources = snapshot.get("sources")
+    if not isinstance(frozen_sources, list) or not frozen_sources:
+        raise RuntimeError("导出任务缺少冻结来源")
+    rendered_by_shot = {
+        str(item.get("shot_id")): item for item in (rendered_sources or []) if isinstance(item, dict)
+    }
+    if rendered_sources is not None and len(rendered_by_shot) != len(frozen_sources):
+        raise RuntimeError("FFmpeg 来源清单与冻结装配的镜头集合不一致")
+    for frozen in frozen_sources:
+        path = allowed_output_file(frozen.get("path"))
+        expected_sha = str(frozen.get("checksum_sha256") or "").lower()
+        if len(expected_sha) != 64 or file_sha256(path).lower() != expected_sha:
+            raise RuntimeError(f"镜头 {frozen.get('shot_id')} 的冻结媒体在导出期间发生变化")
+        if rendered_sources is None:
+            continue
+        rendered = rendered_by_shot.get(str(frozen.get("shot_id")))
+        comparable = (
+            "source_id", "path", "checksum_sha256", "in_point_seconds", "out_point_seconds",
+            "dialogue_mode", "subtitle_enabled", "subtitle_start_seconds",
+        )
+        if not rendered or any(rendered.get(key) != frozen.get(key) for key in comparable):
+            raise RuntimeError(f"镜头 {frozen.get('shot_id')} 的渲染来源与冻结快照不一致")
+
+
+def _validate_export_run_snapshot(export_run: dict[str, Any]) -> dict[str, Any]:
+    try:
+        snapshot = json.loads(export_run.get("source_snapshot") or "{}")
+        config = json.loads(export_run.get("config") or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("导出任务冻结快照无法解析") from exc
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    if hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest() != config.get("source_snapshot_sha256"):
+        raise RuntimeError("导出任务冻结快照 hash 不一致")
+    delivery = snapshot.get("delivery_plan") or {}
+    with closing(connect()) as db:
+        assembly = _locked_assembly_from_db(db, str(export_run.get("project_id") or ""))
+    if not assembly:
+        raise RuntimeError("导出任务对应的锁定装配已不存在")
+    integrity = _assembly_integrity(assembly)
+    if not integrity["valid"]:
+        raise RuntimeError("锁定装配 plan_hash 已损坏")
+    expected = {
+        "id": assembly["id"], "revision": assembly["revision"], "plan_hash": assembly["plan_hash"],
+        "calculated_plan_hash": integrity["calculated_plan_hash"],
+        "assembly_snapshot_hash": integrity["snapshot_hash"], "status": assembly["status"],
+    }
+    if delivery != expected:
+        raise RuntimeError("当前锁定装配与任务冻结的规范化快照不一致")
+    if config.get("delivery_plan_hash") != assembly["plan_hash"] or config.get("assembly_snapshot_hash") != integrity["snapshot_hash"]:
+        raise RuntimeError("导出任务的装配 hash 凭证不一致")
+    _verify_frozen_export_sources(snapshot)
+    return snapshot
 
 
 def claim_next_export_run() -> dict[str, Any] | None:
@@ -3048,9 +3236,7 @@ def run_export_job(run_id: str) -> None:
             raise RuntimeError(f"导出脚本不存在：{EXPORT_SCRIPT}")
         EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
         EXPORT_JOB_ROOT.mkdir(parents=True, exist_ok=True)
-        snapshot = json.loads(export_run.get("source_snapshot") or "{}")
-        if not snapshot.get("sources"):
-            raise RuntimeError("导出任务缺少冻结的输入快照")
+        snapshot = _validate_export_run_snapshot(export_run)
         snapshot_path = EXPORT_JOB_ROOT / f"{run_id}.request.json"
         snapshot_temp = EXPORT_JOB_ROOT / f"{run_id}.request.tmp.json"
         snapshot_temp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3106,6 +3292,14 @@ def run_export_job(run_id: str) -> None:
         captions_path = allowed_export_file(stem, ".vtt")
         sources_path = allowed_export_file(stem, ".sources.json")
         sources = json.loads(sources_path.read_text(encoding="utf-8-sig"))
+        if isinstance(sources, dict):
+            sources = [sources]
+        if not isinstance(sources, list):
+            raise RuntimeError("FFmpeg 来源清单格式无效")
+        # Recheck the immutable inputs after FFmpeg exits and before publishing
+        # any production manifest/current version.  A mid-render replacement
+        # must fail closed even when the output process itself succeeded.
+        _verify_frozen_export_sources(snapshot, sources)
         verified_sources = []
         for source in sources:
             source_path = allowed_output_file(source.get("path"))
@@ -3391,9 +3585,30 @@ def create_export(payload: ExportRequest) -> dict[str, Any]:
         "source_snapshot_sha256": hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest(),
         "delivery_plan_hash": preflight["delivery_plan"]["plan_hash"],
         "delivery_plan_revision": preflight["delivery_plan"]["revision"],
+        "assembly_snapshot_hash": preflight["delivery_plan"]["assembly_snapshot_hash"],
     }
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
+        current_assembly = _locked_assembly_from_db(db, preflight["project_id"])
+        if not current_assembly:
+            db.rollback()
+            raise HTTPException(409, "创建任务前锁定装配已不存在")
+        current_integrity = _assembly_integrity(current_assembly)
+        current_delivery = {
+            "id": current_assembly["id"], "revision": current_assembly["revision"],
+            "plan_hash": current_assembly["plan_hash"],
+            "calculated_plan_hash": current_integrity["calculated_plan_hash"],
+            "assembly_snapshot_hash": current_integrity["snapshot_hash"], "status": current_assembly["status"],
+        }
+        if not current_integrity["valid"] or current_delivery != preflight["delivery_plan"]:
+            db.rollback()
+            raise HTTPException(409, "创建任务前锁定装配内容或 hash 已变化")
+        try:
+            _verify_frozen_export_sources(source_snapshot)
+        except (HTTPException, RuntimeError) as exc:
+            db.rollback()
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            raise HTTPException(409, f"创建任务前冻结媒体凭证已变化：{detail}") from exc
         active = db.execute(
             "SELECT id FROM export_runs WHERE state IN ('排队中', '恢复排队', '导出中', '取消中') LIMIT 1"
         ).fetchone()

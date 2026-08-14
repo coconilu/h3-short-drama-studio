@@ -139,6 +139,19 @@ def init_production_schema(db: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS production_shot_conflicts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          shot_id TEXT NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
+          item_id TEXT NOT NULL UNIQUE REFERENCES production_batch_items(id) ON DELETE CASCADE,
+          original_state TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('unresolved', 'resolved')) DEFAULT 'unresolved',
+          reason TEXT NOT NULL,
+          evidence TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_production_shot_conflicts_open
+          ON production_shot_conflicts(shot_id, state);
         """
     )
     batch_columns = {row[1] for row in db.execute("PRAGMA table_info(production_batches)").fetchall()}
@@ -167,37 +180,94 @@ def init_production_schema(db: sqlite3.Connection) -> None:
             db.execute(f"ALTER TABLE production_batch_items ADD COLUMN {column} {definition}")
         if column not in attempt_columns:
             db.execute(f"ALTER TABLE production_item_attempts ADD COLUMN {column} {definition}")
-    # Upgrade safety: older databases had no cross-batch ownership row. Claim
-    # every still-actionable item deterministically; duplicate queued copies
-    # fail closed instead of becoming a second GPU submission after restart.
-    for row in db.execute(
+    # Upgrade safety: older databases had no cross-batch ownership row.  The
+    # migration is one atomic unit: a shot with more than one actionable or
+    # outcome-unknown item is never assigned an arbitrary winner.  Every
+    # conflicting item receives durable audit evidence and the shot remains
+    # blocked until those historical attempts are explicitly reconciled.
+    db.execute("SAVEPOINT production_lease_migration")
+    actionable = db.execute(
         """SELECT items.*, batches.created_at AS batch_created_at
         FROM production_batch_items items JOIN production_batches batches ON batches.id = items.batch_id
         WHERE items.state IN ('queued', 'submitting', 'running')
            OR (items.state = 'failed' AND items.error = 'submission_outcome_unknown')
         ORDER BY batches.created_at, items.ordinal, items.created_at"""
-    ).fetchall():
-        state = "unknown" if row["state"] == "failed" else row["state"]
-        inserted = db.execute(
-            """INSERT OR IGNORE INTO production_shot_leases
-            (shot_id, batch_id, item_id, state, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (row["shot_id"], row["batch_id"], row["id"], state, row["created_at"], row["updated_at"]),
-        )
-        if inserted.rowcount == 0 and row["state"] == "queued":
+    ).fetchall()
+    by_shot: dict[str, list[sqlite3.Row]] = {}
+    for item in actionable:
+        by_shot.setdefault(str(item["shot_id"]), []).append(item)
+    for shot_id, items in by_shot.items():
+        existing_lease = db.execute(
+            "SELECT * FROM production_shot_leases WHERE shot_id = ?", (shot_id,),
+        ).fetchone()
+        mismatched_lease = bool(existing_lease and all(existing_lease["item_id"] != item["id"] for item in items))
+        if len(items) > 1 or mismatched_lease:
             now = utc_now()
+            conflict_items = list(items)
+            if mismatched_lease:
+                owner = db.execute(
+                    "SELECT * FROM production_batch_items WHERE id = ?", (existing_lease["item_id"],),
+                ).fetchone()
+                if owner is not None and all(owner["id"] != item["id"] for item in conflict_items):
+                    conflict_items.append(owner)
+            evidence = {
+                "shot_id": shot_id,
+                "item_ids": [str(item["id"]) for item in conflict_items],
+                "states": {str(item["id"]): str(item["state"]) for item in conflict_items},
+                "detected_at": now,
+            }
+            for item in conflict_items:
+                db.execute(
+                    """INSERT OR IGNORE INTO production_shot_conflicts
+                    (shot_id, item_id, original_state, state, reason, evidence, created_at)
+                    VALUES (?, ?, ?, 'unresolved', 'migration_multiple_active_attempts', ?, ?)""",
+                    (shot_id, item["id"], item["state"], json.dumps(evidence, sort_keys=True), now),
+                )
+                db.execute(
+                    """UPDATE production_item_attempts SET state = 'submission_unknown',
+                    error = 'migration_shot_ownership_conflict', updated_at = ?, completed_at = ?
+                    WHERE item_id = ? AND state IN ('submitting', 'running')""",
+                    (now, now, item["id"]),
+                )
+                db.execute(
+                    """UPDATE production_batch_items SET state = 'failed',
+                    error = 'migration_shot_ownership_conflict',
+                    message = '升级时发现同一镜头存在多个未终结生产尝试；已失败关闭并等待人工对账',
+                    updated_at = ?, completed_at = ?
+                    WHERE id = ? AND (state IN ('queued', 'submitting', 'running')
+                      OR (state = 'failed' AND error = 'submission_outcome_unknown'))""",
+                    (now, now, item["id"]),
+                )
+                db.execute(
+                    """UPDATE production_batches SET state = 'paused',
+                    message = '升级发现重复镜头生产尝试；人工对账前保持镜头级阻断', updated_at = ?
+                    WHERE id = ? AND state = 'running'""",
+                    (now, item["batch_id"]),
+                )
+                db.execute(
+                    """INSERT INTO production_batch_events
+                    (batch_id, item_id, event, level, message, created_at)
+                    VALUES (?, ?, 'migration_ownership_conflict', 'error', ?, ?)""",
+                    (item["batch_id"], item["id"], "同一镜头存在多个旧活动或结果未知尝试，禁止自动选定所有者", now),
+                )
+            db.execute("DELETE FROM production_shot_leases WHERE shot_id = ?", (shot_id,))
+            continue
+        item = items[0]
+        state = "unknown" if item["state"] == "failed" else item["state"]
+        if existing_lease:
             db.execute(
-                """UPDATE production_batch_items SET state = 'failed', error = 'migration_shot_lease_conflict',
-                message = '升级时发现同一镜头已属于另一个活动批次，未提交 GPU', updated_at = ?, completed_at = ?
-                WHERE id = ? AND state = 'queued'""",
-                (now, now, row["id"]),
+                """UPDATE production_shot_leases SET state = ?, updated_at = ?
+                WHERE shot_id = ? AND item_id = ?""",
+                (state, utc_now(), shot_id, item["id"]),
             )
+        else:
             db.execute(
-                """UPDATE production_batches SET state = 'paused',
-                message = '升级时发现重复镜头批次，已失败关闭冲突条目', updated_at = ?
-                WHERE id = ? AND state = 'running'""",
-                (now, row["batch_id"]),
+                """INSERT INTO production_shot_leases
+                (shot_id, batch_id, item_id, state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (shot_id, item["batch_id"], item["id"], state, item["created_at"], item["updated_at"]),
             )
+    db.execute("RELEASE production_lease_migration")
 
 
 def configure_production_scheduler(
@@ -369,6 +439,14 @@ def _draft_job(db: sqlite3.Connection, job_id: int | None) -> dict[str, Any] | N
     return dict(row) if row else None
 
 
+def _has_unresolved_shot_conflict(db: sqlite3.Connection, shot_id: str) -> bool:
+    return bool(db.execute(
+        """SELECT 1 FROM production_shot_conflicts
+        WHERE shot_id = ? AND state = 'unresolved' LIMIT 1""",
+        (shot_id,),
+    ).fetchone())
+
+
 def _bind_draft_job(
     db: sqlite3.Connection, item: dict[str, Any], result: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
@@ -388,6 +466,31 @@ def _bind_draft_job(
     return dict(rows[0]) if len(rows) == 1 else None
 
 
+def _authoritative_draft_job(
+    db: sqlite3.Connection, item: dict[str, Any], result: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Verify that a sync result describes exactly the attempt-owned #4 job."""
+    job_id = result.get("job_id")
+    if not job_id:
+        return None
+    if item.get("draft_job_id") and int(item["draft_job_id"]) != int(job_id):
+        return None
+    job = _draft_job(db, int(job_id))
+    if not job or job.get("shot_id") != item["shot_id"]:
+        return None
+    if result.get("base_job_revision") is not None and int(result["base_job_revision"]) != int(item.get("draft_job_revision") or 0):
+        return None
+    if result.get("job_revision") is None or int(result["job_revision"]) != int(job.get("reconciliation_revision") or 0):
+        return None
+    if result.get("state") != job.get("state"):
+        return None
+    if "prompt_ids" not in result or list(result["prompt_ids"] or []) != _decode_json(job.get("prompt_ids"), []):
+        return None
+    if "candidate_ids" not in result or list(result["candidate_ids"] or []) != _decode_json(job.get("candidate_ids"), []):
+        return None
+    return job
+
+
 def _refresh_attempt_evidence(
     db: sqlite3.Connection,
     item: dict[str, Any],
@@ -397,13 +500,23 @@ def _refresh_attempt_evidence(
     error: str | None = None,
 ) -> None:
     result = result or {}
-    job = _bind_draft_job(db, item, result) or {}
+    if result.get("job_id"):
+        job = _authoritative_draft_job(db, item, result)
+        if job is None:
+            raise HTTPException(409, "生产同步结果与条目冻结的 draft job 所有权不一致")
+    else:
+        job = _bind_draft_job(db, item, result)
+    job = job or {}
     prompt_ids = (
-        result.get("prompt_ids")
-        or _decode_json(job.get("prompt_ids"), [])
-        or _decode_json(item.get("prompt_ids"), [])
+        list(result.get("prompt_ids") or [])
+        if "prompt_ids" in result
+        else _decode_json(job.get("prompt_ids"), []) or _decode_json(item.get("prompt_ids"), [])
     )
-    candidate_ids = result.get("candidate_ids") or _decode_json(job.get("candidate_ids"), [])
+    candidate_ids = (
+        list(result.get("candidate_ids") or [])
+        if "candidate_ids" in result
+        else _decode_json(job.get("candidate_ids"), [])
+    )
     candidate_ids, media = _candidate_evidence(db, item["shot_id"], list(candidate_ids))
     source_snapshot = _decode_json(job.get("source_snapshot"), {}) or {
         "plan_hash": item["plan_hash"],
@@ -586,6 +699,8 @@ def batch_preflight(db_path: Path, plan_provider: PlanProvider, shot_ids: list[s
             ).fetchone()
             if lease:
                 reasons.append("镜头已被另一个活动生产批次占用")
+            if _has_unresolved_shot_conflict(db, shot["id"]):
+                reasons.append("镜头存在升级前的生产所有权冲突，必须先完成人工对账")
             validation = db.execute(
                 "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'validation' ORDER BY id DESC LIMIT 1",
                 (shot["id"],),
@@ -624,6 +739,8 @@ def _verify_frozen_item(db: sqlite3.Connection, project_id: str, frozen: dict[st
         raise HTTPException(409, "预检后镜头已删除或移出当前项目")
     if db.execute("SELECT 1 FROM production_shot_leases WHERE shot_id = ?", (frozen["shot_id"],)).fetchone():
         raise HTTPException(409, "预检后镜头已被另一个活动生产批次占用")
+    if _has_unresolved_shot_conflict(db, frozen["shot_id"]):
+        raise HTTPException(409, "镜头存在尚未解决的历史生产所有权冲突")
     plan = db.execute(
         "SELECT plan_hash, status FROM h3_prompt_plans WHERE shot_id = ? ORDER BY rowid DESC LIMIT 1",
         (frozen["shot_id"],),
@@ -939,10 +1056,28 @@ def poll_running_items(db_path: Path, syncer: Syncer) -> int:
         except Exception:
             continue
         state = str(result.get("state") or "")
-        next_state = "completed" if state == "完成" else "failed" if state == "失败" else "running"
         now = utc_now()
         with closing(connect(db_path)) as db:
-            db.execute(
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT * FROM production_batch_items WHERE id = ? AND state = 'running'", (item["id"],),
+            ).fetchone()
+            if not current:
+                db.rollback()
+                continue
+            current_item = dict(current)
+            job = None if result.get("authoritative") is False else _authoritative_draft_job(db, current_item, result)
+            if job is None:
+                db.execute(
+                    """UPDATE production_batch_items SET message = ?, updated_at = ?
+                    WHERE id = ? AND state = 'running'""",
+                    (result.get("message") or "生产同步凭证冲突，保持运行并等待人工对账", now, item["id"]),
+                )
+                db.commit()
+                continue
+            state = str(job.get("state") or "")
+            next_state = "completed" if state == "完成" else "failed" if state in {"失败", "提交失败"} else "running"
+            updated = db.execute(
                 """UPDATE production_batch_items SET state = ?, prompt_ids = ?, message = ?,
                 error = CASE WHEN ? = 'failed' THEN ? ELSE error END, updated_at = ?,
                 completed_at = CASE WHEN ? IN ('completed', 'failed') THEN ? ELSE completed_at END
@@ -959,9 +1094,12 @@ def poll_running_items(db_path: Path, syncer: Syncer) -> int:
                     item["id"],
                 ),
             )
+            if updated.rowcount != 1:
+                db.rollback()
+                continue
             _refresh_attempt_evidence(
                 db,
-                item,
+                current_item,
                 state=next_state,
                 result=result,
                 error=(result.get("message") or "H3 生成失败") if next_state == "failed" else None,
@@ -1044,28 +1182,57 @@ def retry_item(db_path: Path, item_id: str, plan_provider: PlanProvider) -> dict
             raise HTTPException(409, "只有失败镜头可以重试")
         if item["attempts"] >= item["max_attempts"]:
             raise HTTPException(409, f"已达到本批次最多 {item['max_attempts']} 次提交尝试")
-        if item["error"] == "submission_outcome_unknown":
+        if _has_unresolved_shot_conflict(db, item["shot_id"]):
+            raise HTTPException(409, "镜头存在尚未解决的历史生产所有权冲突")
+        unknown_retry = item["error"] == "submission_outcome_unknown"
+        audited_job_revision = item["draft_job_revision"]
+        if unknown_retry:
             job = _draft_job(db, item["draft_job_id"])
-            if not job or not bool(job.get("retry_safe")):
+            if (
+                not job
+                or job.get("shot_id") != item["shot_id"]
+                or not bool(job.get("retry_safe"))
+                or _decode_json(job.get("candidate_ids"), [])
+            ):
                 raise HTTPException(409, "提交结果未知只能先完成人工对账，禁止直接重试或再次提交")
+            audited_job_revision = int(job.get("reconciliation_revision") or 0)
         current = plan_provider(item["shot_id"])
         if current.get("status") != "approved" or current.get("plan_hash") != item["plan_hash"]:
             raise HTTPException(409, "当前批准计划与批次快照不同，请新建生产批次")
         now = utc_now()
-        try:
-            db.execute(
-                """INSERT INTO production_shot_leases
-                (shot_id, batch_id, item_id, state, created_at, updated_at)
-                VALUES (?, ?, ?, 'queued', ?, ?)""",
-                (item["shot_id"], item["batch_id"], item_id, now, now),
+        if unknown_retry:
+            lease = db.execute(
+                "SELECT * FROM production_shot_leases WHERE shot_id = ?", (item["shot_id"],),
+            ).fetchone()
+            if not lease or lease["item_id"] != item_id or lease["state"] != "unknown":
+                raise HTTPException(409, "结果未知条目的镜头所有权凭证缺失或已被其他条目占用")
+            lease_cursor = db.execute(
+                """UPDATE production_shot_leases SET state = 'queued', updated_at = ?
+                WHERE shot_id = ? AND item_id = ? AND state = 'unknown'""",
+                (now, item["shot_id"], item_id),
             )
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(409, "镜头已被另一个活动生产批次占用") from exc
-        db.execute(
+            if lease_cursor.rowcount != 1:
+                db.rollback()
+                raise HTTPException(409, "结果未知条目的重试所有权已被另一请求更新")
+        else:
+            try:
+                db.execute(
+                    """INSERT INTO production_shot_leases
+                    (shot_id, batch_id, item_id, state, created_at, updated_at)
+                    VALUES (?, ?, ?, 'queued', ?, ?)""",
+                    (item["shot_id"], item["batch_id"], item_id, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(409, "镜头已被另一个活动生产批次占用") from exc
+        updated = db.execute(
             """UPDATE production_batch_items SET state = 'queued', message = '人工重试，等待提交',
-            error = NULL, completed_at = NULL, updated_at = ? WHERE id = ?""",
-            (now, item_id),
+            error = NULL, completed_at = NULL, updated_at = ?, draft_job_revision = ?
+            WHERE id = ? AND state = 'failed'""",
+            (now, audited_job_revision, item_id),
         )
+        if updated.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "条目已被另一重试请求更新")
         db.execute(
             """UPDATE production_batches SET state = 'running', message = '失败镜头已重新排队',
             completed_at = NULL, updated_at = ? WHERE id = ?""",
