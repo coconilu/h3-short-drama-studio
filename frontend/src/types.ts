@@ -64,6 +64,8 @@ export type Shot = {
     shot_id: string
     section_id: string
     section_title: string
+    chapter_id: string
+    chapter_title: string
     last_synced_revision: number
     current_section_revision: number
   }
@@ -606,6 +608,8 @@ export type BatchGenerationResult = {
   submitted_count?: number
   failed_count: number
   gpu_submitted?: boolean
+  preflight_hash?: string
+  frozen_items?: Array<Record<string, unknown>>
   results: Array<{
     shot_id: string
     title: string
@@ -615,7 +619,11 @@ export type BatchGenerationResult = {
     resolution?: string
     candidate_count?: number
     prompt_ids?: string[]
-    message: string
+    message?: string
+    reasons?: string[]
+    plan_hash?: string
+    validation_job_id?: number
+    validation_hash?: string
   }>
 }
 
@@ -671,6 +679,37 @@ export type DeliveryPlanItem = {
   subtitle_enabled: boolean
   subtitle_start_seconds?: number
   transition: 'cut'
+  in_point_seconds: number
+  out_point_seconds?: number
+  dialogue_mode: 'original' | 'mute'
+  section_id?: string
+  candidate_id?: string
+  master_version_id?: string
+  source_snapshot: {
+    section_id?: string
+    section_revision?: number
+    storyboard_revision?: number
+    shot_id: string
+    candidate_id?: string
+    candidate_external_id?: string
+    candidate_prompt_id?: string
+    master_version_id?: string
+    master_revision?: number
+    review_id?: string
+    review_revision?: number
+    shot_snapshot?: Record<string, unknown>
+    master_snapshot?: Record<string, unknown>
+    media?: {
+      status: 'verified' | 'missing' | 'invalid'
+      output_file?: string
+      size_bytes?: number
+      modified_ns?: number
+      checksum_sha256?: string
+      reason?: string
+    }
+    source_status: 'ready' | 'historical_debt' | 'missing' | 'unavailable'
+    source_reason?: string
+  }
   title: string
   scene_code: string
   dialogue: string
@@ -845,13 +884,52 @@ export type CandidateReview = {
   stale: boolean
   can_select: boolean
   created_at?: string
+  history?: CandidateReview[]
+}
+
+export type CandidateComparison = {
+  candidate_id: string
+  label: string
+  selected: boolean
+  status: string
+  trace: {
+    evidence_status: 'verified' | 'historical_debt'
+    debt_reason?: string
+    prompt?: string
+    seed?: string | number
+    spec: { width?: number; height?: number; actual_seconds?: number }
+    plan_hash?: string
+    h3_project?: string
+    prompt_id?: string
+    candidate_id?: string
+    media: { output_file?: string; file_exists: boolean; size_bytes?: number }
+  }
+}
+
+export type CandidateMasterVersion = {
+  id: string
+  revision: number
+  candidate_id: string
+  candidate_snapshot: Record<string, unknown>
+  action: 'select' | 'rollback'
+  rollback_of_revision?: number
+  review_id: string
+  review_revision: number
+  note: string
+  created_at: string
+  current: boolean
 }
 
 export type ReviewWorkspace = {
   shot_id: string
   reviews: CandidateReview[]
+  comparison: CandidateComparison[]
+  master_versions: CandidateMasterVersion[]
+  selected_debt: { active: boolean; candidate_id?: string; message?: string }
   summary: {
     candidate_count: number
+    comparable_count: number
+    evidence_debt_count: number
     passed_count: number
     needs_changes_count: number
     rejected_count: number
@@ -896,6 +974,21 @@ export type ProductionBatchItem = {
   updated_at: string
   started_at?: string
   completed_at?: string
+  attempt_history: Array<{
+    id: string
+    attempt: number
+    state: 'submitting' | 'running' | 'completed' | 'failed' | 'submission_unknown'
+    plan_hash: string
+    plan_snapshot: PromptPlan
+    h3_project?: string
+    prompt_ids: string[]
+    candidate_ids: string[]
+    source_snapshot: Record<string, unknown>
+    media_evidence: Array<{ candidate_id: string; prompt_id?: string; seed?: number; status: string; output_file?: string; file_exists: boolean; size_bytes?: number }>
+    error?: string
+    created_at: string
+    completed_at?: string
+  }>
 }
 
 export type ProductionBatchEvent = {
@@ -918,7 +1011,7 @@ export type ProductionBatch = {
   completed_count: number
   failed_count: number
   cancelled_count: number
-  config: { concurrency: number; candidate_total: number; snapshot_policy: string }
+  config: { concurrency: number; candidate_total: number; snapshot_policy: string; minimum_candidates_per_shot?: number; resolution_policy?: string }
   message: string
   created_at: string
   updated_at: string
@@ -926,6 +1019,44 @@ export type ProductionBatch = {
   completed_at?: string
   items: ProductionBatchItem[]
   events: ProductionBatchEvent[]
+}
+
+export type ProductionConflictItem = {
+  id: number
+  item_id: string
+  batch_id: string
+  item_title: string
+  original_state: string
+  item_state: string
+  item_error?: string
+  state: 'unresolved' | 'resolved'
+  reason: string
+  evidence: {
+    kind?: string
+    target_attempt?: {
+      item_id?: string
+      attempt?: number
+      draft_job_id?: number
+      item_job_revision?: number
+      attempt_job_revision?: number
+    }
+  }
+  proof: { verified: boolean; basis?: string; reason?: string; attempt?: number; job_id?: number; job_revision?: number }
+  created_at: string
+  resolved_at?: string
+  resolved_by?: string
+  resolution_note?: string
+  revision: number
+}
+
+export type ProductionConflictGroup = {
+  shot_id: string
+  shot_title: string
+  state: 'unresolved' | 'resolved'
+  can_resolve: boolean
+  issues: string[]
+  expected_revisions: Record<string, number>
+  items: ProductionConflictItem[]
 }
 
 export type ScriptAgentProvider = {

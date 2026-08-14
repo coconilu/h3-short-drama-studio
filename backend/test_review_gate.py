@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from backend.review_gate import (
     AudioChecks,
+    CandidateMasterRollbackRequest,
     CandidateReviewRequest,
     ReviewScores,
     init_review_schema,
     latest_candidate_review,
+    record_master_selection,
     require_passed_review,
     review_workspace,
+    rollback_master_selection,
     save_candidate_review,
 )
 
@@ -38,22 +44,47 @@ class ReviewGateTests(unittest.TestCase):
                 CREATE TABLE workspace_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
                 CREATE TABLE shots (
                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), ordinal INTEGER NOT NULL,
-                  title TEXT NOT NULL, status TEXT NOT NULL, dialogue TEXT NOT NULL DEFAULT ''
+                  title TEXT NOT NULL, status TEXT NOT NULL, dialogue TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT 'now'
                 );
                 CREATE TABLE candidates (
                   id TEXT PRIMARY KEY, shot_id TEXT NOT NULL REFERENCES shots(id), source TEXT NOT NULL,
                   status TEXT NOT NULL, output_file TEXT, external_id TEXT, prompt_id TEXT,
                   scores TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '', archived INTEGER NOT NULL DEFAULT 0,
-                  label TEXT NOT NULL DEFAULT 'A', created_at TEXT NOT NULL DEFAULT 'now'
+                  label TEXT NOT NULL DEFAULT 'A', created_at TEXT NOT NULL DEFAULT 'now',
+                  selected INTEGER NOT NULL DEFAULT 0, seed INTEGER, metadata TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE jobs (
+                  id INTEGER PRIMARY KEY, shot_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+                  h3_project TEXT, prompt_ids TEXT NOT NULL, candidate_ids TEXT NOT NULL,
+                  source_snapshot TEXT NOT NULL, plan_hash TEXT
+                );
+                CREATE TABLE production_item_attempts (
+                  id TEXT PRIMARY KEY, shot_id TEXT NOT NULL, state TEXT NOT NULL, draft_job_id INTEGER,
+                  candidate_ids TEXT NOT NULL, prompt_ids TEXT NOT NULL, media_evidence TEXT NOT NULL,
+                  plan_hash TEXT, validation_hash TEXT
                 );
                 """
             )
             db.execute("INSERT INTO projects VALUES ('p1', '测试剧', 'EP01', 'logline', 60, 'now')")
             db.execute("INSERT INTO workspace_settings VALUES ('active_project_id', 'p1', 'now')")
-            db.execute("INSERT INTO shots VALUES ('s1', 'p1', 1, '镜头一', '待审片', '')")
             db.execute(
-                "INSERT INTO candidates VALUES ('c1', 's1', 'h3', 'completed', ?, 'draft-1', 'prompt-1', '{}', '', 0, 'A', 'now')",
-                (str(self.video_path),),
+                "INSERT INTO shots (id, project_id, ordinal, title, status, dialogue) VALUES ('s1', 'p1', 1, '镜头一', '待审片', '')"
+            )
+            db.execute(
+                "INSERT INTO candidates VALUES ('c1', 's1', 'h3', 'completed', ?, 'draft-1', 'prompt-1', '{}', '', 0, 'A', 'now', 0, 42, ?)",
+                (str(self.video_path), '{"width":608,"height":352,"actual_seconds":5.0,"prompt":"scene one"}'),
+            )
+            db.execute(
+                "INSERT INTO jobs VALUES (1, 's1', 'draft', '完成', 'h3-s1', '[\"prompt-1\"]', '[\"draft-1\"]', ?, ?)",
+                ('{"arguments":["generate","--prompt","scene one","--width","608","--height","352","--seconds","5"]}', "v" * 64),
+            )
+            evidence1 = json.dumps([{
+                "candidate_id": "draft-1", "output_file": str(self.video_path.resolve()), "seed": 42,
+                "checksum_sha256": hashlib.sha256(self.video_path.read_bytes()).hexdigest(),
+            }])
+            db.execute(
+                "INSERT INTO production_item_attempts VALUES ('attempt-1', 's1', 'completed', 1, '[\"draft-1\"]', '[\"prompt-1\"]', ?, ?, ?)",
+                (evidence1, "p" * 64, "v" * 64),
             )
             init_review_schema(db)
             db.commit()
@@ -155,6 +186,115 @@ class ReviewGateTests(unittest.TestCase):
             self.probe,
         )
         self.assertTrue(passed["can_select"])
+
+    def add_second_candidate(self) -> Path:
+        path = self.root / "candidate-2.mp4"
+        path.write_bytes(b"test-video-v2")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute(
+                "INSERT INTO candidates VALUES ('c2', 's1', 'h3', 'completed', ?, 'draft-2', 'prompt-2', '{}', '', 0, 'B', 'now', 0, 43, ?)",
+                (str(path), '{"width":608,"height":352,"actual_seconds":5.0,"prompt":"scene two"}'),
+            )
+            db.execute(
+                "INSERT INTO jobs VALUES (2, 's1', 'draft', '完成', 'h3-s1', '[\"prompt-2\"]', '[\"draft-2\"]', ?, ?)",
+                ('{"arguments":["generate","--prompt","scene two","--width","608","--height","352","--seconds","5"]}', "w" * 64),
+            )
+            evidence2 = json.dumps([{
+                "candidate_id": "draft-2", "output_file": str(path.resolve()), "seed": 43,
+                "checksum_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }])
+            db.execute(
+                "INSERT INTO production_item_attempts VALUES ('attempt-2', 's1', 'completed', 2, '[\"draft-2\"]', '[\"prompt-2\"]', ?, ?, ?)",
+                (evidence2, "q" * 64, "w" * 64),
+            )
+            db.commit()
+        return path
+
+    def test_master_selection_is_append_only_and_can_rollback(self) -> None:
+        self.add_second_candidate()
+        save_candidate_review(self.db_path, self.root, "s1", self.request(), self.probe)
+        save_candidate_review(
+            self.db_path, self.root, "s1", self.request(candidate_id="c2", note="候选 B 可用"), self.probe,
+        )
+        first = record_master_selection(self.db_path, self.root, "s1", "c1", note="先选 A", base_revision=0)
+        second = record_master_selection(self.db_path, self.root, "s1", "c2", note="切换 B", base_revision=1)
+        rolled = rollback_master_selection(
+            self.db_path,
+            self.root,
+            "s1",
+            CandidateMasterRollbackRequest(target_revision=1, base_revision=2, note="回滚到 A", confirm=True),
+        )
+        self.assertEqual((first["revision"], second["revision"], rolled["revision"]), (1, 2, 3))
+        self.assertEqual(rolled["action"], "rollback")
+        self.assertEqual(rolled["rollback_of_revision"], 1)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            selected = db.execute("SELECT id FROM candidates WHERE selected = 1").fetchone()[0]
+            candidate_count = db.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+        self.assertEqual(selected, "c1")
+        self.assertEqual(candidate_count, 2, "母版切换不能覆盖或删除候选")
+        workspace = review_workspace(self.db_path, "s1", self.root)
+        self.assertEqual([item["revision"] for item in workspace["master_versions"]], [3, 2, 1])
+        self.assertTrue(workspace["master_versions"][0]["current"])
+
+    def test_selection_requires_two_real_candidates_and_debt_remains_visible(self) -> None:
+        save_candidate_review(self.db_path, self.root, "s1", self.request(), self.probe)
+        self.add_second_candidate()
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("DELETE FROM production_item_attempts WHERE id = 'attempt-2'")
+            db.commit()
+        with self.assertRaises(HTTPException) as insufficient:
+            record_master_selection(self.db_path, self.root, "s1", "c1", note="不能只有一个", base_revision=0)
+        self.assertEqual(insufficient.exception.status_code, 409)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute(
+                "INSERT INTO candidates VALUES ('legacy', 's1', 'mock', 'completed', NULL, NULL, NULL, '{}', '', 0, '旧', 'now', 0, NULL, '{}')"
+            )
+            db.commit()
+        workspace = review_workspace(self.db_path, "s1", self.root)
+        debt = next(item for item in workspace["comparison"] if item["candidate_id"] == "legacy")
+        self.assertEqual(debt["trace"]["evidence_status"], "historical_debt")
+        self.assertEqual(workspace["summary"]["evidence_debt_count"], 2)
+
+    def test_media_replacement_during_master_selection_is_atomic(self) -> None:
+        self.add_second_candidate()
+        save_candidate_review(self.db_path, self.root, "s1", self.request(), self.probe)
+        original = __import__("backend.review_gate", fromlist=["_candidate_snapshot"])._candidate_snapshot
+        selected_calls = 0
+
+        def replacing(candidate: dict, path: Path) -> dict:
+            nonlocal selected_calls
+            if candidate["id"] == "c1":
+                selected_calls += 1
+                if selected_calls == 4:
+                    path.write_bytes(b"replaced-between-validation-and-write")
+            return original(candidate, path)
+
+        with patch("backend.review_gate._candidate_snapshot", side_effect=replacing):
+            with self.assertRaises(HTTPException) as changed:
+                record_master_selection(self.db_path, self.root, "s1", "c1", note="race", base_revision=0)
+        self.assertEqual(changed.exception.status_code, 409)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM candidate_master_versions").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM candidates WHERE selected = 1").fetchone()[0], 0)
+
+    def test_review_history_and_media_checksum_are_persisted(self) -> None:
+        first = save_candidate_review(self.db_path, self.root, "s1", self.request(), self.probe)
+        second = save_candidate_review(
+            self.db_path,
+            self.root,
+            "s1",
+            self.request(decision="needs_changes", issues=["other"], note="再次检查", watched_seconds=2),
+            self.probe,
+        )
+        workspace = review_workspace(self.db_path, "s1", self.root)
+        review = workspace["reviews"][0]
+        self.assertEqual([item["revision"] for item in review["history"]], [2, 1])
+        self.assertEqual((first["revision"], second["revision"]), (1, 2))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            snapshot = db.execute(
+                "SELECT candidate_snapshot FROM candidate_reviews WHERE candidate_id = 'c1' AND revision = 1"
+            ).fetchone()[0]
+        self.assertEqual(len(__import__("json").loads(snapshot)["checksum_sha256"]), 64)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from backend import app as studio
 from backend.content_planning import (
@@ -2061,9 +2062,10 @@ class CreativeStoryboardContractTests(unittest.TestCase):
         for contract in (
             "accept_current_manifest",
             "confirm_not_submitted",
+            "job_id: job.id",
             "expected_revision",
-            "接受证据",
-            "确认未提交",
+            "接受 job #",
+            "确认 job #",
         ):
             self.assertIn(contract, frontend_source)
         style_source = (Path(__file__).parents[1] / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
@@ -2629,6 +2631,7 @@ class CreativeStoryboardContractTests(unittest.TestCase):
             shot_id,
             studio.ReconciliationResolutionRequest(
                 action="confirm_not_submitted",
+                job_id=job["id"],
                 expected_revision=revision,
                 note="已在 ComfyUI 历史与队列中人工确认不存在该任务",
                 resolved_by="human:qa",
@@ -2646,6 +2649,7 @@ class CreativeStoryboardContractTests(unittest.TestCase):
                 shot_id,
                 studio.ReconciliationResolutionRequest(
                     action="confirm_not_submitted",
+                    job_id=job["id"],
                     expected_revision=revision,
                     note="陈旧标签页重复确认",
                     resolved_by="human:stale",
@@ -2653,6 +2657,101 @@ class CreativeStoryboardContractTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(stale.exception.status_code, 409)
+
+    def test_manual_reconciliation_targets_exact_job_project_shot_and_revision(self) -> None:
+        with self.assertRaises(ValidationError):
+            studio.ReconciliationResolutionRequest(
+                action="confirm_not_submitted",
+                expected_revision=0,
+                note="缺少精确 job",
+                resolved_by="human:invalid",
+                confirm=True,
+            )
+        first_section = self.approve_section(self.create_section("精确对账主镜头"))
+        first_shot = self.apply(self.preview())["sync"]["applied_snapshot"][0]["shot_id"]
+        second_section = self.approve_section(self.create_section("精确对账旁镜头"))
+        second_apply = self.apply(self.preview())["sync"]["applied_snapshot"]
+        second_shot = next(
+            item["shot_id"] for item in second_apply
+            if item.get("section_id") == second_section["id"]
+        )
+        self.assertNotEqual(first_section["id"], second_section["id"])
+        now = studio.utc_now()
+
+        def insert_manual_job(shot_id: str, label: str, revision: int = 7) -> int:
+            with closing(studio.connect()) as db:
+                cursor = db.execute(
+                    """INSERT INTO jobs
+                    (shot_id, kind, state, message, created_at, updated_at, candidate_ids,
+                     reconciliation_snapshot, retry_safe, reconciliation_revision)
+                    VALUES (?, 'draft', '待人工对账', ?, ?, ?, '[]', '{}', 0, ?)""",
+                    (shot_id, label, now, now, revision),
+                )
+                db.commit()
+                return int(cursor.lastrowid)
+
+        target_job_id = insert_manual_job(first_shot, "同镜头较早 target")
+        later_job_id = insert_manual_job(first_shot, "同镜头后来任务")
+        other_shot_job_id = insert_manual_job(second_shot, "同项目其他镜头")
+        other_project = studio.create_project(studio.ProjectCreate(
+            title="对账隔离项目",
+            episode="EP02",
+            logline="隔离",
+            target_duration=30,
+            shots=[studio.ShotCreate(title="隔离镜头", description="隔离测试镜头", prompt="isolated shot")],
+        ))
+        other_project_shot = other_project["shots"][0]["id"]
+        other_project_job_id = insert_manual_job(other_project_shot, "其他项目任务")
+        studio.set_active_project(self.project["id"])
+
+        def job_snapshot() -> list[tuple]:
+            with closing(studio.connect()) as db:
+                return db.execute(
+                    """SELECT id, shot_id, state, message, candidate_ids, reconciliation_snapshot,
+                    retry_safe, reconciliation_revision, updated_at, completed_at
+                    FROM jobs ORDER BY id"""
+                ).fetchall()
+
+        def request(job_id: int, revision: int = 7) -> studio.ReconciliationResolutionRequest:
+            return studio.ReconciliationResolutionRequest(
+                action="confirm_not_submitted",
+                job_id=job_id,
+                expected_revision=revision,
+                note="精确核验该 job 没有外部提交",
+                resolved_by="human:exact-job-test",
+                confirm=True,
+            )
+
+        for path_shot, job_id, revision in (
+            (second_shot, target_job_id, 7),
+            (other_project_shot, other_project_job_id, 7),
+            (first_shot, target_job_id, 8),
+        ):
+            before = job_snapshot()
+            with self.assertRaises(HTTPException) as rejected:
+                studio.resolve_reconciliation(path_shot, request(job_id, revision))
+            self.assertEqual(rejected.exception.status_code, 409)
+            self.assertEqual(job_snapshot(), before, "项目/镜头/job/revision 不匹配必须零写入")
+
+        resolved = studio.resolve_reconciliation(first_shot, request(target_job_id))
+        self.assertEqual(resolved["job"]["id"], target_job_id)
+        self.assertEqual(resolved["job"]["state"], "提交失败")
+        self.assertEqual(resolved["job"]["reconciliation_revision"], 8)
+        audit = json.loads(resolved["job"]["reconciliation_snapshot"])["manual_resolutions"][-1]
+        self.assertEqual(audit["job_id"], target_job_id)
+        with closing(studio.connect()) as db:
+            untouched = {
+                int(item["id"]): dict(item)
+                for item in db.execute(
+                    """SELECT id, state, retry_safe, reconciliation_revision
+                    FROM jobs WHERE id IN (?, ?, ?)""",
+                    (later_job_id, other_shot_job_id, other_project_job_id),
+                ).fetchall()
+            }
+        for job_id in (later_job_id, other_shot_job_id, other_project_job_id):
+            self.assertEqual(untouched[job_id]["state"], "待人工对账")
+            self.assertEqual(untouched[job_id]["retry_safe"], 0)
+            self.assertEqual(untouched[job_id]["reconciliation_revision"], 7)
 
     def test_reconciliation_cas_prevents_late_error_or_success_from_overwriting_terminal(self) -> None:
         self.approve_section(self.create_section("对账 CAS 竞态"))

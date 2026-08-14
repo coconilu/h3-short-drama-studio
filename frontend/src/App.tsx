@@ -42,7 +42,7 @@ import {
   WandSparkles,
   X,
 } from 'lucide-react'
-import type { Asset, BatchGenerationResult, Candidate, CandidateReview, DeliveryPlanItem, DeliveryWorkspace, DryRunResult, ExportPreflight, ExportRun, Health, Job, ProductionAcceptance, ProductionBatch, Project, ProjectArchive, Promotion, PromptPlan, ReviewWorkspace, RoughCut, Shot, ShotReference, Workbench, WorkspaceSettings } from './types'
+import type { Asset, BatchGenerationResult, Candidate, CandidateReview, DeliveryPlanItem, DeliveryWorkspace, DryRunResult, ExportPreflight, ExportRun, Health, Job, ProductionAcceptance, ProductionBatch, ProductionConflictGroup, Project, ProjectArchive, Promotion, PromptPlan, ReviewWorkspace, RoughCut, Shot, ShotReference, Workbench, WorkspaceSettings } from './types'
 import { GlobalActivityPage, GlobalQueuePage, ProjectsWorkbench, SettingsPage } from './WorkbenchPages'
 import { ScriptStudio } from './ScriptStudio'
 import { CreativePlanning } from './CreativePlanning'
@@ -338,6 +338,7 @@ function App() {
         method: 'POST',
         body: JSON.stringify({
           action,
+          job_id: job.id,
           expected_revision: job.reconciliation_revision || 0,
           note,
           resolved_by: 'human:workbench',
@@ -694,10 +695,15 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
   const [batchSelection, setBatchSelection] = useState<Set<string>>(new Set())
   const [batchResult, setBatchResult] = useState<BatchGenerationResult | null>(null)
   const [batchValidatedKey, setBatchValidatedKey] = useState('')
+  const [batchIdempotencyKey, setBatchIdempotencyKey] = useState('')
   const [batchBusy, setBatchBusy] = useState(false)
   const [batchConfirmOpen, setBatchConfirmOpen] = useState(false)
+  const [batchScope, setBatchScope] = useState('manual')
+  const [batchResolution, setBatchResolution] = useState('608x352')
+  const [batchSeconds, setBatchSeconds] = useState(5.17)
+  const [batchCandidateCount, setBatchCandidateCount] = useState(2)
   useEffect(() => { setDraft(selectedShot); setDryRun(null); setPickerOpen(false) }, [selectedShot.id])
-  useEffect(() => { setBatchSelection(new Set()); setBatchResult(null); setBatchValidatedKey(''); setBatchConfirmOpen(false) }, [project.id])
+  useEffect(() => { setBatchSelection(new Set()); setBatchResult(null); setBatchValidatedKey(''); setBatchIdempotencyKey(''); setBatchConfirmOpen(false) }, [project.id])
 
   const availableAssets = assets.filter((asset) => asset.bindable && !references.some((reference) => reference.asset_id === asset.id))
 
@@ -770,6 +776,7 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
 
   const selectionKey = (ids: string[]) => [...ids].sort().join('|')
   const changeBatchSelection = (shotId: string) => {
+    setBatchScope('manual')
     setBatchSelection((current) => {
       const next = new Set(current)
       if (next.has(shotId)) next.delete(shotId)
@@ -778,16 +785,55 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
     })
     setBatchResult(null)
     setBatchValidatedKey('')
+    setBatchIdempotencyKey('')
   }
   const selectUnfinished = () => {
     setBatchSelection(new Set(project.shots.filter((shot) => shot.status !== '已定稿' && shot.status !== '生成中').map((shot) => shot.id)))
     setBatchResult(null)
     setBatchValidatedKey('')
+    setBatchIdempotencyKey('')
   }
   const clearBatchSelection = () => {
+    setBatchScope('manual')
     setBatchSelection(new Set())
     setBatchResult(null)
     setBatchValidatedKey('')
+    setBatchIdempotencyKey('')
+  }
+  const chapters = useMemo(() => {
+    const values = new Map<string, string>()
+    project.shots.forEach((shot) => {
+      if (shot.source_mapping?.chapter_id) values.set(shot.source_mapping.chapter_id, shot.source_mapping.chapter_title)
+    })
+    return [...values.entries()]
+  }, [project.shots])
+  const selectBatchScope = (scope: string) => {
+    setBatchScope(scope)
+    const selected = scope === 'project'
+      ? project.shots
+      : scope === 'manual'
+        ? []
+        : project.shots.filter((shot) => shot.source_mapping?.chapter_id === scope)
+    setBatchSelection(new Set(selected.filter((shot) => shot.status !== '已定稿' && shot.status !== '生成中').map((shot) => shot.id)))
+    setBatchResult(null)
+    setBatchValidatedKey('')
+    setBatchIdempotencyKey('')
+  }
+  const applyBatchSpec = async () => {
+    const [width, height] = batchResolution.split('x').map(Number)
+    setBatchBusy(true)
+    try {
+      for (const shotId of batchSelection) {
+        await onUpdate(shotId, { width, height, seconds: batchSeconds, candidate_count: batchCandidateCount })
+      }
+      setBatchResult(null)
+      setBatchValidatedKey('')
+      setBatchIdempotencyKey('')
+      setNotice(`已将 ${batchSelection.size} 个镜头统一为 ${width}×${height} / ${batchSeconds} 秒 / ${batchCandidateCount} 候选；旧批准计划已过期，请完成 dry-run 与批准后再建批次。`)
+      await onRefresh()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '批量规格更新失败')
+    } finally { setBatchBusy(false) }
   }
   const runBatchDry = async () => {
     const shotIds = [...batchSelection]
@@ -795,28 +841,12 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
     setBatchBusy(true)
     try {
       if (batchSelection.has(draft.id)) await onUpdate(draft.id, draft)
-      const plans = await api<PromptPlan[]>('/api/prompt-plans')
-      const selectedPlans = shotIds.map((shotId) => plans.find((plan) => plan.shot.id === shotId))
-      const results = selectedPlans.map((plan, index) => ({
-        shot_id: shotIds[index],
-        title: plan?.shot.title || shotIds[index],
-        ok: Boolean(plan?.ready && plan.status === 'approved'),
-        mode: plan?.mode,
-        resolution: plan?.spec.resolution,
-        candidate_count: plan?.spec.candidate_count,
-        message: !plan ? '没有当前生成计划' : !plan.ready ? plan.blocking.join('；') : plan.status !== 'approved' ? '当前计划尚未 dry-run 并批准' : '批准哈希与当前输入一致',
-      }))
-      const passed = results.filter((item) => item.ok).length
-      const result: BatchGenerationResult = {
-        ok: passed === results.length,
-        requested_count: results.length,
-        passed_count: passed,
-        failed_count: results.length - passed,
-        gpu_submitted: false,
-        results,
-      }
+      const result = await api<BatchGenerationResult>('/api/production-batches/preflight', {
+        method: 'POST', body: JSON.stringify({ shot_ids: shotIds }),
+      })
       setBatchResult(result)
       setBatchValidatedKey(selectionKey(shotIds))
+      setBatchIdempotencyKey(crypto.randomUUID())
       setNotice(`生产门禁：${result.passed_count || 0}/${result.requested_count} 个镜头的批准计划有效，未占用 GPU`)
       await onRefresh()
     } catch (error) {
@@ -830,7 +860,10 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
     setBatchBusy(true)
     try {
       const result = await api<ProductionBatch>('/api/production-batches', {
-        method: 'POST', body: JSON.stringify({ shot_ids: shotIds, name: `${project.episode} 分镜生产`, max_attempts: 3, confirm: true }),
+        method: 'POST', body: JSON.stringify({
+          shot_ids: shotIds, name: `${project.episode} 分镜生产`, max_attempts: 3, confirm: true,
+          preflight_hash: batchResult?.preflight_hash, idempotency_key: batchIdempotencyKey,
+        }),
       })
       setNotice(`生产批次已冻结 ${result.item_count} 个镜头；调度器将逐镜提交并在重启后恢复`)
       setBatchConfirmOpen(false)
@@ -843,7 +876,7 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
     }
   }
   const selectedShotIds = [...batchSelection]
-  const batchReady = Boolean(batchResult?.ok && batchValidatedKey === selectionKey(selectedShotIds))
+  const batchReady = Boolean(batchResult?.ok && batchResult.preflight_hash && batchIdempotencyKey && batchValidatedKey === selectionKey(selectedShotIds))
   const selectedCandidateCount = project.shots.filter((shot) => batchSelection.has(shot.id)).reduce((sum, shot) => sum + shot.candidate_count, 0)
 
   return (
@@ -855,8 +888,15 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
         </div>
         <section className="batch-panel">
           <div><span className="eyebrow">整集生产批次</span><strong>{batchSelection.size ? `已选 ${batchSelection.size} 个镜头` : '选择镜头后检查生产门禁'}</strong><small>只接受“生成计划”中已完成 H3 dry-run 并人工批准的当前哈希；提交后由可恢复调度器逐镜执行。</small></div>
+          <div className="batch-spec-controls">
+            <label>选择范围<select value={batchScope} onChange={(event) => selectBatchScope(event.target.value)}><option value="manual">手工勾选</option><option value="project">整个项目</option>{chapters.map(([id, title]) => <option value={id} key={id}>章节 · {title}</option>)}</select></label>
+            <label>低清规格<select value={batchResolution} onChange={(event) => setBatchResolution(event.target.value)}><option value="608x352">608 × 352</option><option value="768x448">768 × 448</option></select></label>
+            <label>时长<select value={batchSeconds} onChange={(event) => setBatchSeconds(Number(event.target.value))}><option value={5.17}>5.17 秒</option><option value={8}>8 秒</option></select></label>
+            <label>每镜候选<select value={batchCandidateCount} onChange={(event) => setBatchCandidateCount(Number(event.target.value))}><option value={2}>2 条</option><option value={3}>3 条</option><option value={4}>4 条</option></select></label>
+            <button className="button secondary" disabled={!batchSelection.size || batchBusy} onClick={applyBatchSpec}>应用到所选</button>
+          </div>
           <div className="batch-actions"><button className="button secondary" disabled={batchBusy} onClick={selectUnfinished}>选择未定稿</button><button className="button secondary" disabled={!batchSelection.size || batchBusy} onClick={clearBatchSelection}>清空</button><button className="button primary" disabled={!batchSelection.size || batchBusy} onClick={runBatchDry}>{batchBusy ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}检查生产门禁</button><button className="button secondary" disabled={!batchReady || batchBusy} onClick={() => setBatchConfirmOpen(true)}><Sparkles size={15} />创建生产批次</button></div>
-          {batchResult && <div className="batch-results">{batchResult.results.map((result) => <span className={result.ok ? 'passed' : 'failed'} key={result.shot_id}><b>{displayShotId(result.shot_id)}</b>{result.ok ? `${result.mode} · 已批准` : result.message}</span>)}</div>}
+          {batchResult && <div className="batch-results">{batchResult.results.map((result) => <span className={result.ok ? 'passed' : 'failed'} key={result.shot_id}><b>{displayShotId(result.shot_id)}</b>{result.ok ? `计划与 dry-run 凭证已冻结 · ${result.validation_hash?.slice(0, 10)}` : (result.reasons || [result.message]).filter(Boolean).join('；')}</span>)}</div>}
         </section>
         <div className="shot-progress" style={{ gridTemplateColumns: `repeat(${project.shots.length}, 1fr)` }}>
           {project.shots.map((shot, index) => <button key={shot.id} className={`${shot.id === selectedShotId ? 'current' : ''} ${shot.status === '已定稿' ? 'done' : ''}`} onClick={() => onSelect(shot.id)}><span>{String(index + 1).padStart(2, '0')}</span></button>)}
@@ -902,7 +942,7 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
         <div className="settings-grid">
           <label>分辨率<select value={`${draft.width}x${draft.height}`} onChange={(event) => { const [width, height] = event.target.value.split('x').map(Number); setDraft({ ...draft, width, height }); setDryRun(null) }}><option value="608x352">608 × 352</option><option value="768x448">768 × 448</option><option value="1344x768">1344 × 768</option></select></label>
           <label>时长<select value={draft.seconds} onChange={(event) => { setDraft({ ...draft, seconds: Number(event.target.value) }); setDryRun(null) }}>{![5.17, 8].includes(draft.seconds) && <option value={draft.seconds}>{draft.seconds} 秒（当前成片）</option>}<option value={5.17}>5.17 秒</option><option value={8}>8 秒</option></select></label>
-          <label>候选数<select value={draft.candidate_count} onChange={(event) => { setDraft({ ...draft, candidate_count: Number(event.target.value) }); setDryRun(null) }}><option value={1}>1 条</option><option value={2}>2 条</option><option value={3}>3 条</option></select></label>
+          <label>候选数<select value={draft.candidate_count} onChange={(event) => { setDraft({ ...draft, candidate_count: Number(event.target.value) }); setDryRun(null) }}>{draft.candidate_count === 1 && <option value={1}>1 条（历史）</option>}<option value={2}>2 条</option><option value={3}>3 条</option><option value={4}>4 条</option></select></label>
         </div>
         <div className="strategy"><span>定稿策略</span><div><button className={draft.strategy === '保真放大' ? 'active' : ''} onClick={() => setDraft({ ...draft, strategy: '保真放大' })}>保真放大</button><button className={draft.strategy === 'Ref2VA 精修' ? 'active' : ''} onClick={() => setDraft({ ...draft, strategy: 'Ref2VA 精修' })}>Ref2VA 精修</button></div><p>{draft.strategy === '保真放大' ? '不重新生成内容，构图最稳定；不会凭空增加细节。' : '重新扩散以获得新细节；人物和运镜存在漂移风险。'}</p></div>
         <div className="generation-actions"><button className="button primary" disabled={busy} onClick={runDry}>{busy ? <LoaderCircle className="spin" size={17} /> : <WandSparkles size={17} />}Dry-run 检查</button><button className="button secondary" disabled={!dryRun || busy} onClick={() => onPrepareGeneration(draft)}><Sparkles size={16} />提交生成</button></div>
@@ -995,6 +1035,8 @@ function QueuePage({ jobs, onSync, onResolve }: {
   const [batches, setBatches] = useState<ProductionBatch[]>([])
   const [selectedBatchId, setSelectedBatchId] = useState('')
   const [selectedBatch, setSelectedBatch] = useState<ProductionBatch | null>(null)
+  const [conflicts, setConflicts] = useState<ProductionConflictGroup[]>([])
+  const [conflictNotes, setConflictNotes] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState('')
   const [queueError, setQueueError] = useState('')
 
@@ -1021,7 +1063,16 @@ function QueuePage({ jobs, onSync, onResolve }: {
     }
   }, [])
 
+  const loadConflicts = useCallback(async () => {
+    try {
+      setConflicts(await api<ProductionConflictGroup[]>('/api/production-conflicts?include_resolved=true'))
+    } catch (error) {
+      setQueueError(error instanceof Error ? error.message : '历史生产冲突加载失败')
+    }
+  }, [])
+
   useEffect(() => { void loadBatches() }, [loadBatches])
+  useEffect(() => { void loadConflicts() }, [loadConflicts])
   useEffect(() => { void loadDetail(selectedBatchId) }, [loadDetail, selectedBatchId])
   useEffect(() => {
     const hasActive = batches.some((batch) => ['running', 'paused', 'cancelling'].includes(batch.state))
@@ -1053,6 +1104,37 @@ function QueuePage({ jobs, onSync, onResolve }: {
     } finally { setBusy('') }
   }
 
+  const resolveConflict = async (group: ProductionConflictGroup) => {
+    const note = (conflictNotes[group.shot_id] || '').trim()
+    if (!note) { setQueueError('请填写本次冲突审计说明'); return }
+    setBusy(`conflict-${group.shot_id}`)
+    try {
+      await api<ProductionConflictGroup>(`/api/production-conflicts/${group.shot_id}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({
+          confirm: true,
+          expected_revisions: group.expected_revisions,
+          resolved_by: '本机操作员',
+          note,
+        }),
+      })
+      setConflictNotes((current) => ({ ...current, [group.shot_id]: '' }))
+      await Promise.all([loadConflicts(), loadBatches()])
+      setQueueError('')
+    } catch (error) {
+      setQueueError(error instanceof Error ? error.message : '生产所有权冲突解决失败')
+      await loadConflicts()
+    } finally { setBusy('') }
+  }
+
+  const resolveConflictJob = async (job: Job) => {
+    setBusy(`job-${job.id}`)
+    try {
+      await onResolve(job, 'confirm_not_submitted')
+      await Promise.all([loadConflicts(), loadBatches()])
+    } finally { setBusy('') }
+  }
+
   const batchStateLabels: Record<ProductionBatch['state'], string> = {
     running: '运行中', paused: '已暂停', cancelling: '停止中', completed: '已完成',
     completed_with_errors: '有失败', cancelled: '已取消',
@@ -1064,6 +1146,18 @@ function QueuePage({ jobs, onSync, onResolve }: {
   return <main className="page production-queue-page">
     <div className="page-heading"><div><span className="eyebrow">持久化单 GPU 调度</span><h1>项目队列</h1><p>只消费已批准的生成计划；批次、逐镜快照和恢复事件都保存在本地数据库。</p></div><div className="queue-safety"><ShieldCheck size={17} /><span><strong>重启可恢复</strong><small>提交结果不确定时失败关闭，绝不自动重复扣算力</small></span></div></div>
     {queueError && <div className="queue-error"><AlertTriangle size={16} />{queueError}</div>}
+    {conflicts.length > 0 && <section className="ownership-conflicts" aria-label="历史生产所有权冲突">
+      <header><div><AlertTriangle size={16} /><span><strong>生产所有权审计</strong><small>升级重复尝试或运行期 attempt/job 冲突不会自动选定所有者；精确证明未提交后才解除镜头门禁。</small></span></div><button onClick={() => void loadConflicts()}><RefreshCw size={14} />刷新证据</button></header>
+      <div>{conflicts.map((group) => <article className={group.state} key={group.shot_id}>
+        <div className="conflict-summary"><span><b>{displayShotId(group.shot_id)}</b><strong>{group.shot_title}</strong></span><em>{group.state === 'resolved' ? '已解决' : group.can_resolve ? '证据完整' : '证据不足'}</em></div>
+        <div className="conflict-attempts">{group.items.map((item) => {
+          const target = item.evidence?.target_attempt
+          const targetJob = target?.draft_job_id ? jobs.find((job) => job.id === target.draft_job_id) : undefined
+          return <span className={item.proof.verified ? 'verified' : 'blocked'} key={item.id}><b>{item.item_title}</b><small>{item.original_state} · R{item.revision}{target?.attempt ? ` · attempt ${target.attempt}` : ''}{target?.draft_job_id ? ` · job #${target.draft_job_id}` : ''}{targetJob ? ` / R${targetJob.reconciliation_revision || 0}` : target?.item_job_revision !== undefined ? ` / R${target.item_job_revision}` : ''}</small><em>{item.proof.verified ? (item.proof.basis === 'queued_never_claimed' ? '从未领取' : '已证明零提交') : item.proof.reason}</em>{group.state === 'unresolved' && targetJob?.state === '待人工对账' && <button type="button" className="danger" disabled={busy === `job-${targetJob.id}`} onClick={() => void resolveConflictJob(targetJob)}>{busy === `job-${targetJob.id}` ? '正在写入审计…' : `确认 job #${targetJob.id} 未提交`}</button>}</span>
+        })}</div>
+        {group.state === 'unresolved' ? <div className="conflict-resolution"><label>审计说明<input aria-label={`${group.shot_title}冲突审计说明`} value={conflictNotes[group.shot_id] || ''} onChange={(event) => setConflictNotes((current) => ({ ...current, [group.shot_id]: event.target.value }))} placeholder="说明如何确认整组尝试均未提交" /></label><button disabled={!group.can_resolve || !conflictNotes[group.shot_id]?.trim() || Boolean(busy)} onClick={() => void resolveConflict(group)}>{busy === `conflict-${group.shot_id}` ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />}确认整组未提交并解除门禁</button></div> : <footer>{group.items[0]?.resolved_by} · {group.items[0]?.resolution_note} · {group.items[0]?.resolved_at ? new Date(group.items[0].resolved_at).toLocaleString('zh-CN', { hour12: false }) : ''}</footer>}
+      </article>)}</div>
+    </section>}
     <section className="production-queue-grid">
       <aside className="production-batches">
         <header><span>生产批次</span><button onClick={() => void loadBatches()}><RefreshCw size={14} /></button></header>
@@ -1088,7 +1182,7 @@ function QueuePage({ jobs, onSync, onResolve }: {
         </> : <div className="production-detail-empty"><ListVideo size={26} /><strong>选择一个生产批次</strong><span>查看逐镜提交、生成、恢复和失败重试状态。</span></div>}
       </section>
     </section>
-    <details className="legacy-job-log"><summary>底层 H3 任务日志 <span>{jobs.length}</span></summary><div className="queue-table"><div className="queue-head"><span>镜头</span><span>任务</span><span>说明</span><span>状态</span><span>时间</span><span>操作</span></div>{jobs.map(job => <div className="queue-row" key={job.id}><strong>{displayShotId(job.shot_id)}</strong><span>{job.kind}</span><span><b>{job.message}</b>{job.prompt_ids?.length ? <small>{job.prompt_ids.length} 个 prompt_id</small> : null}</span><StatusPill status={job.state} /><time>{new Date(job.updated_at || job.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time><span className="queue-reconciliation-actions">{job.state === '待人工对账' ? <><button onClick={() => void onResolve(job, 'accept_current_manifest')}><RefreshCw size={14} />接受证据</button><button className="danger" onClick={() => void onResolve(job, 'confirm_not_submitted')}>确认未提交</button></> : <button className="queue-sync" disabled={!job.h3_project || job.kind !== 'draft'} onClick={() => onSync(job.shot_id)}><RefreshCw size={14} />同步</button>}</span></div>)}</div></details>
+    <details className="legacy-job-log"><summary>底层 H3 任务日志 <span>{jobs.length}</span></summary><div className="queue-table"><div className="queue-head"><span>镜头</span><span>任务</span><span>说明</span><span>状态</span><span>时间</span><span>操作</span></div>{jobs.map(job => <div className="queue-row" key={job.id}><strong>{displayShotId(job.shot_id)}</strong><span>{job.kind}<small>job #{job.id} · R{job.reconciliation_revision || 0}</small></span><span><b>{job.message}</b>{job.prompt_ids?.length ? <small>{job.prompt_ids.length} 个 prompt_id</small> : null}</span><StatusPill status={job.state} /><time>{new Date(job.updated_at || job.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time><span className="queue-reconciliation-actions">{job.state === '待人工对账' ? <><button onClick={() => void onResolve(job, 'accept_current_manifest')}><RefreshCw size={14} />接受 job #{job.id} 证据</button><button className="danger" onClick={() => void onResolve(job, 'confirm_not_submitted')}>确认 job #{job.id} 未提交</button></> : <button className="queue-sync" disabled={!job.h3_project || job.kind !== 'draft'} onClick={() => onSync(job.shot_id)}><RefreshCw size={14} />同步</button>}</span></div>)}</div></details>
   </main>
 }
 
@@ -1114,6 +1208,7 @@ function ReviewPage({ project, shot, candidates, promotions, reviewWorkspace, on
 }) {
   const [stage, setStage] = useState<'drafts' | 'promotions'>(promotions.length ? 'promotions' : 'drafts')
   const [selectedCandidate, setSelectedCandidate] = useState(candidates.find(c => c.selected)?.id || candidates[0]?.id)
+  const [compareCandidate, setCompareCandidate] = useState(candidates.find(c => c.id !== (candidates.find(item => item.selected)?.id || candidates[0]?.id))?.id)
   const [selectedPromotion, setSelectedPromotion] = useState(promotions.find(p => p.selected)?.id || promotions[0]?.id)
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
@@ -1133,6 +1228,9 @@ function ReviewPage({ project, shot, candidates, promotions, reviewWorkspace, on
 
   useEffect(() => {
     setSelectedCandidate(candidates.find(c => c.selected)?.id || candidates[0]?.id)
+    setCompareCandidate((current) => candidates.some((candidate) => candidate.id === current && candidate.id !== selectedCandidate)
+      ? current
+      : candidates.find((candidate) => candidate.id !== (candidates.find(item => item.selected)?.id || candidates[0]?.id))?.id)
   }, [candidates])
   useEffect(() => {
     setSelectedPromotion(promotions.find(p => p.selected)?.id || promotions[0]?.id)
@@ -1140,7 +1238,9 @@ function ReviewPage({ project, shot, candidates, promotions, reviewWorkspace, on
   }, [promotions, stage])
 
   const chosenCandidate = candidates.find(c => c.id === selectedCandidate) || candidates[0]
+  const comparisonCandidate = candidates.find(c => c.id === compareCandidate) || candidates.find(c => c.id !== chosenCandidate?.id)
   const chosenReview = reviewWorkspace?.reviews.find((review) => review.candidate_id === chosenCandidate?.id)
+  const chosenTrace = reviewWorkspace?.comparison.find((item) => item.candidate_id === chosenCandidate?.id)?.trace
   const chosenPromotion = promotions.find(p => p.id === selectedPromotion) || promotions[0]
   const chosen = stage === 'drafts' ? chosenCandidate : chosenPromotion
   const video = chosen?.video
@@ -1173,9 +1273,20 @@ function ReviewPage({ project, shot, candidates, promotions, reviewWorkspace, on
   const toggle = () => { if (!videoRef.current) return; if (videoRef.current.paused) videoRef.current.play(); else videoRef.current.pause(); setPlaying(!videoRef.current.paused) }
   const finalizeDraft = async () => {
     if (!chosenCandidate) return
-    await api(`/api/shots/${shot.id}/review`, { method: 'POST', body: JSON.stringify({ candidate_id: chosenCandidate.id, note }) })
+    await api(`/api/shots/${shot.id}/review`, { method: 'POST', body: JSON.stringify({ candidate_id: chosenCandidate.id, note, base_revision: reviewWorkspace?.master_versions[0]?.revision || 0 }) })
     setNotice(`候选 ${chosenCandidate.label} 已选为草稿母版`)
     await onRefresh()
+  }
+  const rollbackMaster = async (targetRevision: number) => {
+    const currentRevision = reviewWorkspace?.master_versions[0]?.revision
+    if (!currentRevision || !window.confirm(`确认把草稿母版回滚到 R${targetRevision}？候选与历史不会被删除。`)) return
+    try {
+      await api(`/api/shots/${shot.id}/candidate-master/rollback`, {
+        method: 'POST', body: JSON.stringify({ target_revision: targetRevision, base_revision: currentRevision, note: `人工回滚到 R${targetRevision}`, confirm: true }),
+      })
+      setNotice(`已追加母版回滚修订；当前来源为历史 R${targetRevision}`)
+      await onRefresh()
+    } catch (error) { setNotice(error instanceof Error ? error.message : '母版回滚失败') }
   }
   const saveReview = async () => {
     if (!chosenCandidate) return
@@ -1242,6 +1353,7 @@ function ReviewPage({ project, shot, candidates, promotions, reviewWorkspace, on
           </div>
         </div>
         <nav className="review-shot-nav" aria-label="切换审片镜头">{project.shots.map((item) => <button className={item.id === shot.id ? 'active' : ''} onClick={() => onSelectShot(item.id)} key={item.id}><span>{String(item.ordinal).padStart(2, '0')}</span><strong>{item.title}</strong><small>{item.status}</small></button>)}</nav>
+        {stage === 'drafts' && reviewWorkspace?.selected_debt.active && <div className="review-debt"><strong>历史证据债务</strong><span>{reviewWorkspace.selected_debt.message}</span></div>}
         <div className="video-frame">
           {video ? (
             <video key={`${stage}-${chosen?.id}`} ref={videoRef} src={video} poster={stage === 'drafts' ? chosenCandidate?.thumbnail : undefined} preload="auto" onTimeUpdate={(event) => { setCurrentTime(event.currentTarget.currentTime); setMaxWatched((value) => Math.max(value, event.currentTarget.currentTime)) }} onEnded={(event) => { setPlaying(false); setMaxWatched((value) => Math.max(value, event.currentTarget.duration || 0)) }} />
@@ -1250,6 +1362,7 @@ function ReviewPage({ project, shot, candidates, promotions, reviewWorkspace, on
           )}
         </div>
         <div className="video-controls"><button disabled={!video} aria-label={playing ? '暂停' : '播放'} onClick={toggle}>{playing ? <Pause /> : <Play />}</button><span>{timeLabel(currentTime)} / {timeLabel(duration)}</span><div><i style={{ width: `${duration ? Math.min(100, currentTime / duration * 100) : 0}%` }} /></div><Volume2 size={18} /></div>
+        {stage === 'drafts' && candidates.length >= 2 && chosenCandidate && comparisonCandidate && <section className="candidate-compare"><header><span><strong>双候选对比</strong><small>同屏观察构图；声音请依次播放，避免混音误判。</small></span><label>对照候选<select value={comparisonCandidate.id} onChange={(event) => setCompareCandidate(event.target.value)}>{candidates.filter(candidate => candidate.id !== chosenCandidate.id).map(candidate => <option value={candidate.id} key={candidate.id}>{candidate.label}</option>)}</select></label></header><div><article><video src={chosenCandidate.video} poster={chosenCandidate.thumbnail} controls preload="metadata" /><strong>{chosenCandidate.label} · 当前检查</strong></article><article><video src={comparisonCandidate.video} poster={comparisonCandidate.thumbnail} controls preload="metadata" /><strong>{comparisonCandidate.label} · 对照</strong></article></div></section>}
         {stage === 'drafts' ? (
           <div className="filmstrip candidate-strip">{candidates.map(candidate => { const review = reviewWorkspace?.reviews.find((item) => item.candidate_id === candidate.id); return <button className={candidate.id === selectedCandidate ? 'active' : ''} key={candidate.id} onClick={() => setSelectedCandidate(candidate.id)}><img src={candidate.thumbnail} /><span>{candidate.label} · {review?.can_select ? '审片通过' : review?.decision === 'reject' ? '已拒绝' : review?.decision === 'needs_changes' ? '需修改' : candidate.status === 'completed' ? '待审片' : '生成中'}</span></button> })}</div>
         ) : (
@@ -1269,10 +1382,13 @@ function ReviewPage({ project, shot, candidates, promotions, reviewWorkspace, on
               <div className="review-decisions"><button className={reviewDecision === 'pass' ? 'pass active' : 'pass'} onClick={() => setReviewDecision('pass')}><CheckCircle2 size={14} />通过</button><button className={reviewDecision === 'needs_changes' ? 'changes active' : 'changes'} onClick={() => setReviewDecision('needs_changes')}><RefreshCw size={14} />保留修改</button><button className={reviewDecision === 'reject' ? 'reject active' : 'reject'} onClick={() => setReviewDecision('reject')}><X size={14} />拒绝</button></div>
               <div className="review-issues">{reviewIssueOptions.map(([code, label]) => <button className={reviewIssues.has(code) ? 'active' : ''} onClick={() => setReviewIssues((current) => { const next = new Set(current); if (next.has(code)) next.delete(code); else next.add(code); return next })} key={code}>{reviewIssues.has(code) && <Check size={11} />}{label}</button>)}</div>
               {chosenReview?.media_probe && <div className={`review-media-qc ${chosenReview.media_probe.ok ? 'passed' : 'failed'}`}><ShieldCheck size={15} /><span><strong>{chosenReview.media_probe.ok ? '媒体与声音技术 QC 通过' : '媒体与声音技术 QC 未通过'}</strong><small>{chosenReview.media_probe.video?.width}×{chosenReview.media_probe.video?.height} · {chosenReview.media_probe.duration_seconds?.toFixed(3)} 秒 · {chosenReview.media_probe.video?.codec || '未知视频'} · {chosenReview.media_probe.audio?.present ? `${chosenReview.media_probe.audio.codec || '音频'} / ${chosenReview.media_probe.audio.channels || '?'} 声道` : '无音轨'}</small>{chosenReview.media_probe.audio_analysis && <small>平均 {chosenReview.media_probe.audio_analysis.mean_volume_db?.toFixed(1) ?? '—'} dB · 峰值 {chosenReview.media_probe.audio_analysis.max_volume_db?.toFixed(1) ?? '—'} dB · 长静音 {(chosenReview.media_probe.audio_analysis.silence_ratio * 100).toFixed(1)}%</small>}</span></div>}
+              {(chosenReview?.history?.length || 0) > 1 && <details className="review-revisions"><summary>查看 {chosenReview?.history?.length} 次审片修订</summary>{chosenReview?.history?.map(item => <span key={`${item.candidate_id}-${item.revision}`}>R{item.revision} · {item.decision === 'pass' ? '通过' : item.decision === 'reject' ? '拒绝' : '保留修改'} · {item.note || '无备注'} · {formatTimestamp(item.created_at)}</span>)}</details>}
             </section>}
+            {chosenCandidate && <section className={`candidate-trace ${chosenTrace?.evidence_status === 'verified' ? 'verified' : 'debt'}`}><header><strong>{chosenTrace?.evidence_status === 'verified' ? '真实媒体证据' : '历史证据债务'}</strong><span>{chosenTrace?.plan_hash ? `计划 ${chosenTrace.plan_hash.slice(0, 12)}` : '无计划哈希'}</span></header><dl><div><dt>Seed</dt><dd>{chosenTrace?.seed ?? chosenCandidate.seed}</dd></div><div><dt>Prompt / Comfy</dt><dd>{chosenTrace?.prompt_id || '缺失'}</dd></div><div><dt>规格</dt><dd>{chosenTrace?.spec.width || '—'}×{chosenTrace?.spec.height || '—'} · {chosenTrace?.spec.actual_seconds || '—'} 秒</dd></div><div><dt>媒体</dt><dd>{chosenTrace?.media.file_exists ? `${chosenTrace.media.size_bytes || 0} bytes` : chosenTrace?.debt_reason || '文件证据缺失'}</dd></div></dl></section>}
             <div className="frame-extract"><span><ImagePlus size={16} /><strong>从视频反哺素材库</strong><small>{currentTime > 0 ? `当前帧 ${currentTime.toFixed(2)} 秒` : '播放并暂停在人物清晰的画面'}</small></span><button className="button secondary" disabled={!video || currentTime <= 0 || extractingFrame} onClick={extractFrame}>{extractingFrame ? <LoaderCircle className="spin" size={15} /> : <ImagePlus size={15} />}提取当前帧</button></div>
             <label>审片结论与修改方向<textarea rows={4} value={note} onChange={(event) => setNote(event.target.value)} placeholder={reviewDecision === 'pass' ? '可选：记录可复用的优点或后续精修注意事项' : '必填：写明下一轮需要保留和修正的内容'} /></label>
-            <div className="review-actions"><button className="button secondary" disabled={!chosenCandidate || chosenCandidate.status !== 'completed' || savingReview} onClick={saveReview}>{savingReview ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}保存审片结论</button><button className="button primary" disabled={!chosenCandidate || chosenCandidate.status !== 'completed' || (!chosenCandidate.selected && !chosenReview?.can_select)} onClick={finalizeDraft}>{chosenCandidate?.selected ? '当前草稿母版' : chosenReview?.can_select ? '选为草稿母版' : '先完成通过审片'}</button></div>
+            <div className="review-actions"><button className="button secondary" disabled={!chosenCandidate || chosenCandidate.status !== 'completed' || savingReview} onClick={saveReview}>{savingReview ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}保存审片结论</button><button className="button primary" disabled={!chosenCandidate || Boolean(chosenCandidate.selected) || chosenCandidate.status !== 'completed' || !chosenReview?.can_select || (reviewWorkspace?.summary.comparable_count || 0) < 2} onClick={finalizeDraft}>{chosenCandidate?.selected ? '当前草稿母版' : (reviewWorkspace?.summary.comparable_count || 0) < 2 ? '至少需要 2 条真实候选' : chosenReview?.can_select ? '选为草稿母版' : '先完成通过审片'}</button></div>
+            {reviewWorkspace?.master_versions.length ? <details className="master-history"><summary>草稿母版历史 · {reviewWorkspace.master_versions.length} 个不可变修订</summary>{reviewWorkspace.master_versions.map(version => <article key={version.id}><span><strong>R{version.revision} · 候选 {candidates.find(candidate => candidate.id === version.candidate_id)?.label || version.candidate_id}</strong><small>{version.action === 'rollback' ? `回滚自 R${version.rollback_of_revision}` : '人工选择'} · 审片 R{version.review_revision} · {formatTimestamp(version.created_at)}</small></span>{version.current ? <em>当前</em> : <button disabled={!reviewWorkspace.master_versions[0]?.revision} onClick={() => rollbackMaster(version.revision)}>回滚到此版</button>}</article>)}</details> : null}
           </>
         ) : (
           <>
@@ -1335,9 +1451,15 @@ function TimelinePage({ shots, roughCut, preflight, exportRuns, deliveryWorkspac
       subtitle_enabled: item.subtitle_enabled,
       subtitle_start_seconds: item.subtitle_start_seconds || 0,
       transition: 'cut',
+      in_point_seconds: item.in_point_seconds || 0,
+      out_point_seconds: item.out_point_seconds || item.seconds,
+      dialogue_mode: item.dialogue_mode || 'original',
     }))
     return JSON.stringify(compact(assemblyItems)) !== JSON.stringify(compact(saved))
   }, [assemblyItems, deliveryWorkspace])
+  const assemblySourcesReady = assemblyItems.length > 0 && assemblyItems.every(
+    (item) => item.source_snapshot?.source_status === 'ready' && Boolean(item.source_snapshot?.media?.checksum_sha256),
+  )
   const updateAssemblyItem = (shotId: string, patch: Partial<DeliveryPlanItem>) => {
     setAssemblyItems((items) => items.map((item) => item.shot_id === shotId ? { ...item, ...patch } : item))
   }
@@ -1362,6 +1484,9 @@ function TimelinePage({ shots, roughCut, preflight, exportRuns, deliveryWorkspac
           subtitle_enabled: Boolean(item.dialogue && item.subtitle_enabled),
           subtitle_start_seconds: item.dialogue && item.subtitle_enabled ? Number(item.subtitle_start_seconds || 0) : null,
           transition: 'cut',
+          in_point_seconds: Number(item.in_point_seconds || 0),
+          out_point_seconds: Number(item.out_point_seconds || item.seconds),
+          dialogue_mode: item.dialogue_mode || 'original',
         })),
       }),
     })
@@ -1424,7 +1549,7 @@ function TimelinePage({ shots, roughCut, preflight, exportRuns, deliveryWorkspac
     </div>
     <section className="assembly-plan">
       <div className="assembly-heading">
-        <div><span className="eyebrow">交付装配计划</span><h2>锁定镜头顺序与字幕入点</h2><p>这里只编排已经选定的镜头，不复制、不覆盖候选视频。当前转场固定为硬切，保持生成内容的完整性。</p></div>
+        <div><span className="eyebrow">交付装配计划</span><h2>锁定顺序、入出点与对白策略</h2><p>每个装配项冻结小节、镜头、候选和母版修订；只引用真实媒体，不复制、不覆盖候选视频。</p></div>
         <div className="assembly-meta">
           <StatusPill status={deliveryWorkspace?.plan.status === 'locked' ? '已锁定' : '草稿'} />
           <span>修订 {deliveryWorkspace?.plan.revision || 0}</span>
@@ -1439,6 +1564,10 @@ function TimelinePage({ shots, roughCut, preflight, exportRuns, deliveryWorkspac
             <span className="assembly-index">{String(index + 1).padStart(2, '0')}</span>
             <div className="assembly-move"><button disabled={locked || index === 0} onClick={() => moveAssemblyItem(index, -1)} title="上移"><ArrowUp size={14} /></button><button disabled={locked || index === assemblyItems.length - 1} onClick={() => moveAssemblyItem(index, 1)} title="下移"><ArrowDown size={14} /></button></div>
             <div className="assembly-copy"><strong>{item.title}</strong><small>{item.scene_code} · {item.seconds.toFixed(2)} 秒 · {source ? `${source.width}×${source.height} ${source.source_type === 'promotion' ? '成片' : '候选'}` : '尚无可导出来源'}</small></div>
+            <div className={`assembly-source ${item.source_snapshot?.source_status || 'missing'}`}><strong>{item.source_snapshot?.source_status === 'ready' ? '来源已冻结' : '来源待处理'}</strong><small>{item.section_id ? `小节 ${item.section_id}` : '历史手工分镜'} → {item.shot_id} → {item.candidate_id || '未选候选'}{item.source_snapshot?.master_revision ? ` · 母版 R${item.source_snapshot.master_revision}` : ''}</small></div>
+            <label className="clip-point"><span>入点</span><input type="number" min="0" max={Math.max(0, (item.out_point_seconds || item.seconds) - 0.05)} step="0.05" disabled={locked} value={item.in_point_seconds || 0} onChange={(event) => updateAssemblyItem(item.shot_id, { in_point_seconds: Number(event.target.value) })} /></label>
+            <label className="clip-point"><span>出点</span><input type="number" min="0.05" max={item.seconds} step="0.05" disabled={locked} value={item.out_point_seconds || item.seconds} onChange={(event) => updateAssemblyItem(item.shot_id, { out_point_seconds: Number(event.target.value) })} /></label>
+            <label className="dialogue-mode"><span>对白</span><select disabled={locked} value={item.dialogue_mode || 'original'} onChange={(event) => updateAssemblyItem(item.shot_id, { dialogue_mode: event.target.value as DeliveryPlanItem['dialogue_mode'] })}><option value="original">保留原声</option><option value="mute">静音对白</option></select></label>
             <label className="subtitle-switch"><input type="checkbox" disabled={locked || !item.dialogue} checked={Boolean(item.dialogue && item.subtitle_enabled)} onChange={(event) => updateAssemblyItem(item.shot_id, { subtitle_enabled: event.target.checked })} /><span>{item.dialogue ? '显示对白字幕' : '无对白'}</span></label>
             <label className="subtitle-start"><span>字幕入点</span><input type="number" min="0" max={Math.max(0, item.seconds - 0.05)} step="0.05" disabled={locked || !item.subtitle_enabled} value={item.subtitle_start_seconds || 0} onChange={(event) => updateAssemblyItem(item.shot_id, { subtitle_start_seconds: Number(event.target.value) })} /></label>
             <span className="transition-label">硬切</span>
@@ -1449,7 +1578,7 @@ function TimelinePage({ shots, roughCut, preflight, exportRuns, deliveryWorkspac
         <span>{deliveryWorkspace?.summary.item_count || assemblyItems.length} 镜头 · {deliveryWorkspace?.summary.subtitle_count || assemblyItems.filter((item) => item.subtitle_enabled).length} 条字幕 · 约 {(deliveryWorkspace?.summary.planned_seconds || assemblyItems.reduce((sum, item) => sum + item.seconds, 0)).toFixed(2)} 秒</span>
         {deliveryWorkspace?.plan.status === 'locked'
           ? <button className="button secondary" disabled={savingAssembly} onClick={reopenAssembly}><RefreshCw size={15} />开启新修订</button>
-          : <><button className="button secondary" disabled={savingAssembly || (!assemblyDirty && deliveryWorkspace?.plan.revision !== 0)} onClick={persistAssembly}><Save size={15} />保存草稿</button><button className="button primary" disabled={savingAssembly || !assemblyItems.length} onClick={lockAssembly}><ShieldCheck size={15} />锁定交付计划</button></>}
+          : <><button className="button secondary" disabled={savingAssembly || (!assemblyDirty && deliveryWorkspace?.plan.revision !== 0)} onClick={persistAssembly}><Save size={15} />保存草稿</button><button className="button primary" title={assemblySourcesReady ? '冻结当前装配凭证' : '所有镜头都需先通过结构化审片并选择有完整证据的母版'} disabled={savingAssembly || !assemblySourcesReady} onClick={lockAssembly}><ShieldCheck size={15} />锁定交付计划</button></>}
       </div>
       {deliveryWorkspace?.versions.length ? <details className="assembly-history"><summary>查看 {deliveryWorkspace.versions.length} 个历史修订</summary>{deliveryWorkspace.versions.map((version) => <span key={version.id}>R{version.revision} · {version.status} · {version.plan_hash.slice(0, 12)} · {formatTimestamp(version.created_at)}</span>)}</details> : null}
     </section>

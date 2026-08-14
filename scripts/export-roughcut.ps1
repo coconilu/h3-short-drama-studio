@@ -119,6 +119,15 @@ foreach ($shot in $shots) {
     if ([string]::IsNullOrWhiteSpace([string]$source) -or -not (Test-Path -LiteralPath ([string]$source) -PathType Leaf)) {
         throw "Shot $shotId has no completed local video source."
     }
+    if (-not [string]::IsNullOrWhiteSpace($SourceSnapshotPath)) {
+        if ([string]::IsNullOrWhiteSpace([string]$shot.checksum_sha256)) {
+            throw "Shot $shotId has no frozen SHA256 credential."
+        }
+        $actualHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne ([string]$shot.checksum_sha256).ToLowerInvariant()) {
+            throw "Shot $shotId no longer matches its frozen SHA256 credential."
+        }
+    }
 
     $probe = Get-MediaProbe $source
     $video = $probe.streams | Where-Object codec_type -eq 'video' | Select-Object -First 1
@@ -126,6 +135,13 @@ foreach ($shot in $shots) {
     if (-not $video -or -not $audio) {
         throw "Shot $shotId must contain both video and audio for this rough-cut export."
     }
+    $mediaDuration = [double]$probe.format.duration
+    $inPoint = if ($null -eq $shot.in_point_seconds) { 0.0 } else { [double]$shot.in_point_seconds }
+    $outPoint = if ($null -eq $shot.out_point_seconds) { $mediaDuration } else { [double]$shot.out_point_seconds }
+    if ($inPoint -lt 0 -or $outPoint -le $inPoint -or $outPoint -gt ($mediaDuration + 0.001)) {
+        throw "Shot $shotId has invalid frozen in/out points."
+    }
+    $dialogueMode = if ([string]::IsNullOrWhiteSpace([string]$shot.dialogue_mode)) { 'original' } else { [string]$shot.dialogue_mode }
 
     $subtitleStartOffset = $null
     if ($SubtitleStartOffsets.ContainsKey($shotId)) {
@@ -153,7 +169,11 @@ foreach ($shot in $shots) {
         source_id = $sourceId
         source_detail = $sourceDetail
         path = $source
-        duration_seconds = [Math]::Round([double]$probe.format.duration, 3)
+        duration_seconds = [Math]::Round($outPoint - $inPoint, 3)
+        in_point_seconds = $inPoint
+        out_point_seconds = $outPoint
+        dialogue_mode = $dialogueMode
+        checksum_sha256 = [string]$shot.checksum_sha256
         width = $video.width
         height = $video.height
         subtitle_enabled = if ($null -eq $shot.subtitle_enabled) { $true } else { [bool]$shot.subtitle_enabled }
@@ -210,8 +230,13 @@ $filterParts = [System.Collections.Generic.List[string]]::new()
 $concatInputs = [System.Collections.Generic.List[string]]::new()
 $totalDuration = ($sources | Measure-Object -Property duration_seconds -Sum).Sum
 for ($index = 0; $index -lt $sources.Count; $index += 1) {
-    $filterParts.Add("[$index`:v:0]scale=$Width`:$Height`:force_original_aspect_ratio=decrease:flags=lanczos,pad=$Width`:$Height`:(ow-iw)/2`:(oh-ih)/2`:color=black,fps=24,format=yuv420p,setsar=1,setpts=PTS-STARTPTS[v$index]")
-    $audioFilter = "aresample=48000`:async=1`:first_pts=0,aformat=sample_fmts=fltp`:sample_rates=48000`:channel_layouts=stereo,asetpts=PTS-STARTPTS"
+    $inPointText = ([double]$sources[$index].in_point_seconds).ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)
+    $outPointText = ([double]$sources[$index].out_point_seconds).ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)
+    $filterParts.Add("[$index`:v:0]trim=start=$inPointText`:end=$outPointText,setpts=PTS-STARTPTS,scale=$Width`:$Height`:force_original_aspect_ratio=decrease:flags=lanczos,pad=$Width`:$Height`:(ow-iw)/2`:(oh-ih)/2`:color=black,fps=24,format=yuv420p,setsar=1[v$index]")
+    $audioFilter = "atrim=start=$inPointText`:end=$outPointText,asetpts=PTS-STARTPTS,aresample=48000`:async=1`:first_pts=0,aformat=sample_fmts=fltp`:sample_rates=48000`:channel_layouts=stereo"
+    if ($sources[$index].dialogue_mode -eq 'mute') {
+        $audioFilter += ',volume=0'
+    }
     if ($PolishAudio) {
         $targetLufs = [double]$sources[$index].audio_target_lufs
         $targetLufsText = $targetLufs.ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)

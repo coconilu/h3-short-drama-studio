@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -29,7 +29,7 @@ try:
     from .content_planning import create_content_router, init_content_schema
     from .creative_storyboard import create_storyboard_router, init_storyboard_schema
     from .local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
-    from .delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
+    from .delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
     from .project_archive import create_archive_router, init_archive_schema
     from .production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from .prompt_compiler import (
@@ -51,14 +51,14 @@ try:
         start_production_worker,
         stop_production_worker,
     )
-    from .review_gate import create_review_router, init_review_schema, require_passed_review
+    from .review_gate import create_review_router, init_review_schema, record_master_selection, require_passed_review
     from .script_workspace import create_script_router, init_script_schema
     from .runtime_control import request_supervisor_action, supervisor_status
 except ImportError:  # Support `uvicorn app:app` when backend is the working directory.
     from content_planning import create_content_router, init_content_schema
     from creative_storyboard import create_storyboard_router, init_storyboard_schema
     from local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
-    from delivery_plan import create_delivery_router, init_delivery_schema, locked_delivery_plan
+    from delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
     from project_archive import create_archive_router, init_archive_schema
     from production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from prompt_compiler import (
@@ -80,7 +80,7 @@ except ImportError:  # Support `uvicorn app:app` when backend is the working dir
         start_production_worker,
         stop_production_worker,
     )
-    from review_gate import create_review_router, init_review_schema, require_passed_review
+    from review_gate import create_review_router, init_review_schema, record_master_selection, require_passed_review
     from script_workspace import create_script_router, init_script_schema
     from runtime_control import request_supervisor_action, supervisor_status
 
@@ -1550,6 +1550,22 @@ def sync_manifest_to_db(
         shot = db.execute("SELECT * FROM shots WHERE id = ?", (shot_id,)).fetchone()
         if not shot:
             raise HTTPException(404, "镜头不存在")
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'candidate_master_versions'"
+        ).fetchone():
+            authoritative_master = db.execute(
+                """SELECT candidates.external_id FROM candidate_master_versions versions
+                JOIN candidates ON candidates.id = versions.candidate_id
+                WHERE versions.shot_id = ? ORDER BY versions.revision DESC LIMIT 1""",
+                (shot_id,),
+            ).fetchone()
+            if authoritative_master and authoritative_master["external_id"]:
+                master_external_id = authoritative_master["external_id"]
+                tracked_selected_id = (
+                    master_external_id
+                    if tracked_ids is None or master_external_id in tracked_ids
+                    else None
+                )
         expected_job = None
         if job_id is not None:
             if expected_job_state is None or expected_job_revision is None:
@@ -1825,19 +1841,26 @@ def refresh_h3_project(
     *,
     attempt_job: dict[str, Any] | None = None,
     include_promotions: bool = False,
+    strict_attempt: bool = False,
 ) -> dict[str, Any]:
+    exact_attempt = strict_attempt
     latest = attempt_job
     if latest is None:
         latest = row(
             "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1",
             (shot_id,),
         )
-    pending_legacy_jobs = legacy_draft_jobs_needing_recovery(shot_id)
-    manual = latest if latest and latest.get("state") == "待人工对账" else row(
-        """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
-        AND state = '待人工对账' ORDER BY id DESC LIMIT 1""",
-        (shot_id,),
-    )
+    pending_legacy_jobs = [] if exact_attempt else legacy_draft_jobs_needing_recovery(shot_id)
+    if latest and latest.get("state") == "待人工对账":
+        manual = latest
+    elif exact_attempt:
+        manual = None
+    else:
+        manual = row(
+            """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
+            AND state = '待人工对账' ORDER BY id DESC LIMIT 1""",
+            (shot_id,),
+        )
     if manual and not pending_legacy_jobs:
         return {
             "project": project,
@@ -1907,11 +1930,8 @@ def refresh_h3_project(
             )
             recovery_results.append(legacy_recovery_result(project, resolved))
         return recovery_results[-1]
-    other_legacy_results = recover_all_legacy_draft_jobs(
-        shot_id,
-        project,
-        manifest,
-        skip_job_id=int(latest["id"]) if legacy_recovery_needed else None,
+    other_legacy_results = [] if exact_attempt else recover_all_legacy_draft_jobs(
+        shot_id, project, manifest, skip_job_id=int(latest["id"]) if legacy_recovery_needed else None,
     )
     if legacy_recovery_needed:
         reserved_ids = {
@@ -2026,6 +2046,7 @@ class GenerateRequest(BaseModel):
 
 class ReconciliationResolutionRequest(BaseModel):
     action: Literal["confirm_not_submitted", "accept_current_manifest"]
+    job_id: int = Field(gt=0)
     expected_revision: int = Field(ge=0)
     note: str = Field(min_length=2, max_length=500)
     resolved_by: str = Field("human:workbench", min_length=2, max_length=120)
@@ -2067,6 +2088,7 @@ class FrameExtractRequest(BaseModel):
 class ReviewRequest(BaseModel):
     candidate_id: str
     note: str = ""
+    base_revision: int = Field(ge=0)
 
 
 class FinalizePromotionRequest(BaseModel):
@@ -2105,6 +2127,78 @@ class DeliverySignoffRequest(BaseModel):
     source: str = Field(default="human-review", min_length=2, max_length=80)
 
 
+def sync_production_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Poll only the immutable draft job owned by one production attempt."""
+    job_id = item.get("draft_job_id")
+    if not job_id:
+        return {
+            "authoritative": False,
+            "state": "待人工对账",
+            "message": "生产条目缺少精确 draft job 绑定；保持运行且禁止按全量 manifest 覆盖所有权",
+            "prompt_ids": [],
+            "candidate_ids": [],
+        }
+    job = row(
+        "SELECT * FROM jobs WHERE id = ? AND shot_id = ? AND kind = 'draft'",
+        (job_id, item["shot_id"]),
+    )
+    if not job:
+        return {
+            "authoritative": False,
+            "state": "待人工对账",
+            "message": "生产条目绑定的 draft job 已不存在；保持运行并等待人工对账",
+            "job_id": job_id,
+            "prompt_ids": [],
+            "candidate_ids": [],
+        }
+    base_revision = int(job.get("reconciliation_revision") or 0)
+    item_revision = int(item.get("draft_job_revision") or 0)
+    if base_revision != item_revision:
+        return {
+            # The scheduler owns the CAS that advances the production item.  It
+            # can only consume this newer revision after re-checking the exact
+            # prompt/candidate set persisted by this attempt.  Returning the
+            # current exact job here avoids leaving a production item running
+            # forever after an external sync or manual reconciliation.
+            "authoritative": True,
+            "revision_advanced": True,
+            "state": job["state"],
+            "message": job["message"],
+            "job_id": int(job["id"]),
+            "base_job_revision": item_revision,
+            "job_revision": base_revision,
+            "prompt_ids": string_list(job.get("prompt_ids")),
+            "candidate_ids": draft_attempt_candidate_ids(job),
+        }
+    refreshed = refresh_h3_project(
+        item["shot_id"],
+        item.get("h3_project") or job.get("h3_project") or h3_project_for_shot(item["shot_id"]),
+        attempt_job=job,
+        strict_attempt=True,
+    )
+    current = row("SELECT * FROM jobs WHERE id = ? AND shot_id = ? AND kind = 'draft'", (job_id, item["shot_id"]))
+    if not current:
+        return {
+            "authoritative": False,
+            "state": "待人工对账",
+            "message": "同步后 draft job 不可读取；禁止覆盖生产条目所有权",
+            "job_id": job_id,
+            "prompt_ids": [],
+            "candidate_ids": [],
+        }
+    return {
+        **refreshed,
+        "authoritative": True,
+        "job_id": int(current["id"]),
+        "base_job_revision": base_revision,
+        "job_revision": int(current.get("reconciliation_revision") or 0),
+        "state": current["state"],
+        "message": current["message"],
+        "prompt_ids": string_list(current.get("prompt_ids")),
+        "candidate_ids": draft_attempt_candidate_ids(current),
+    }
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     ASSET_ROOT.mkdir(parents=True, exist_ok=True)
@@ -2116,8 +2210,12 @@ async def lifespan(_: FastAPI):
     configure_production_scheduler(
         DB_PATH,
         lambda shot_id: compile_prompt_plan(DB_PATH, shot_id),
-        lambda shot_id: generate(shot_id, GenerateRequest(confirm=True, dry_run=False)),
-        lambda shot_id: refresh_h3_project(shot_id, h3_project_for_shot(shot_id)),
+        lambda item: generate(
+            item["shot_id"],
+            GenerateRequest(confirm=True, dry_run=False, expected_validation_hash=item["validation_hash"]),
+        ),
+        sync_production_item,
+        output_root=COMFY_OUTPUT_ROOT,
     )
     start_production_worker()
     try:
@@ -2142,7 +2240,7 @@ app.include_router(create_script_router(DB_PATH, ROOT))
 app.include_router(create_bible_router(DB_PATH))
 app.include_router(create_production_router(DB_PATH, lambda shot_id: compile_prompt_plan(DB_PATH, shot_id)))
 app.include_router(create_review_router(DB_PATH, COMFY_OUTPUT_ROOT))
-app.include_router(create_delivery_router(DB_PATH))
+app.include_router(create_delivery_router(DB_PATH, COMFY_OUTPUT_ROOT))
 app.include_router(create_archive_router(DB_PATH, BACKUP_ROOT, EXPORT_ROOT))
 
 
@@ -2374,9 +2472,11 @@ def project_detail(project: dict[str, Any]) -> dict[str, Any]:
         item["shot_id"]: item
         for item in rows(
             """SELECT links.shot_id, links.section_id, links.last_synced_revision,
-            sections.title AS section_title, sections.revision AS current_section_revision
+            sections.title AS section_title, sections.revision AS current_section_revision,
+            sections.chapter_id, chapters.title AS chapter_title
             FROM creative_storyboard_links links
             JOIN creative_sections sections ON sections.id = links.section_id
+            JOIN creative_chapters chapters ON chapters.id = sections.chapter_id
             WHERE links.project_id = ?""",
             (project["id"],),
         )
@@ -2753,6 +2853,64 @@ def export_run_public(item: dict[str, Any], include_events: bool = False) -> dic
     return item
 
 
+def _locked_assembly_from_db(db: sqlite3.Connection, project_id: str) -> dict[str, Any] | None:
+    plan_row = db.execute(
+        "SELECT * FROM delivery_plans WHERE project_id = ? AND status = 'locked'", (project_id,),
+    ).fetchone()
+    if not plan_row:
+        return None
+    plan = dict(plan_row)
+    items: list[dict[str, Any]] = []
+    for row_value in db.execute(
+        "SELECT * FROM delivery_plan_items WHERE plan_id = ? ORDER BY ordinal, shot_id", (plan["id"],),
+    ).fetchall():
+        item = dict(row_value)
+        item["subtitle_enabled"] = bool(item.get("subtitle_enabled"))
+        try:
+            item["source_snapshot"] = json.loads(item.get("source_snapshot") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            item["source_snapshot"] = {}
+        items.append(item)
+    return {**plan, "items": items}
+
+
+def _assembly_snapshot(assembly: dict[str, Any]) -> dict[str, Any]:
+    normalized_items = [
+        {
+            "shot_id": item["shot_id"], "ordinal": int(item["ordinal"]),
+            "subtitle_enabled": bool(item["subtitle_enabled"]),
+            "subtitle_start_seconds": item.get("subtitle_start_seconds"),
+            "transition": item.get("transition") or "cut",
+            "in_point_seconds": item.get("in_point_seconds", 0),
+            "out_point_seconds": item.get("out_point_seconds"),
+            "dialogue_mode": item.get("dialogue_mode") or "original",
+            "section_id": item.get("section_id"), "candidate_id": item.get("candidate_id"),
+            "master_version_id": item.get("master_version_id"),
+            "source_snapshot": item.get("source_snapshot") or {},
+        }
+        for item in assembly["items"]
+    ]
+    return {
+        "id": assembly["id"],
+        "project_id": assembly["project_id"],
+        "status": assembly["status"],
+        "revision": int(assembly["revision"]),
+        "plan_hash": assembly["plan_hash"],
+        "items": normalized_items,
+    }
+
+
+def _assembly_integrity(assembly: dict[str, Any]) -> dict[str, Any]:
+    calculated = delivery_plan_hash(assembly["items"])
+    snapshot = _assembly_snapshot(assembly)
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "calculated_plan_hash": calculated,
+        "snapshot_hash": hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest(),
+        "valid": calculated == assembly.get("plan_hash") and assembly.get("status") == "locked",
+    }
+
+
 def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
     project = active_project()
     if not project:
@@ -2764,6 +2922,12 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
         issues.append({"shot_id": "delivery-plan", "title": "成片装配", "message": "装配计划尚未锁定"})
         shots = current_shots
     else:
+        assembly_integrity = _assembly_integrity(assembly)
+        if not assembly_integrity["valid"]:
+            issues.append({
+                "shot_id": "delivery-plan", "title": "成片装配",
+                "message": "锁定装配的规范化内容与 plan_hash 不一致，禁止导出",
+            })
         shots_by_id = {shot["id"]: shot for shot in current_shots}
         assembly_ids = [item["shot_id"] for item in assembly["items"]]
         if set(assembly_ids) != set(shots_by_id):
@@ -2777,26 +2941,28 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
                 "ordinal": item["ordinal"],
                 "subtitle_enabled": item["subtitle_enabled"],
                 "subtitle_start_seconds": item["subtitle_start_seconds"],
+                "_assembly_item": item,
             })
     sources: list[dict[str, Any]] = []
     total_seconds = 0.0
     for shot in shots:
-        selected = row(
-            """SELECT id, 'promotion' AS source_type, status, output_file, strategy AS source_detail
-            FROM promotions WHERE shot_id = ? AND selected = 1
-            ORDER BY selected_at DESC LIMIT 1""",
-            (shot["id"],),
-        )
-        if not selected:
+        assembly_item = shot.get("_assembly_item")
+        frozen_source = (assembly_item or {}).get("source_snapshot") or {}
+        selected = None
+        if assembly_item:
+            frozen_candidate_id = frozen_source.get("candidate_id")
             selected = row(
                 """SELECT id, 'candidate' AS source_type, status, output_file, source AS source_detail
-                FROM candidates WHERE shot_id = ? AND selected = 1 AND archived = 0
-                ORDER BY created_at DESC LIMIT 1""",
-                (shot["id"],),
-            )
+                FROM candidates WHERE id = ? AND shot_id = ? AND archived = 0""",
+                (frozen_candidate_id, shot["id"]),
+            ) if frozen_candidate_id else None
         issue = None
-        if not selected:
-            issue = "尚未选择草稿母版或最终成片"
+        if not assembly_item:
+            issue = "缺少锁定装配的冻结来源凭证"
+        elif frozen_source.get("source_status") != "ready" or not frozen_source.get("media", {}).get("checksum_sha256"):
+            issue = "锁定装配是旧版或缺少候选、审片、母版与媒体校验和凭证"
+        elif not selected:
+            issue = "锁定装配中的候选已删除"
         elif selected.get("status") != "completed":
             issue = f"所选版本状态为 {selected.get('status')}"
         elif selected.get("source_type") == "candidate" and selected.get("source_detail") != "h3":
@@ -2804,11 +2970,19 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
         else:
             try:
                 source_path = allowed_output_file(selected.get("output_file"))
+                frozen_media = frozen_source["media"]
+                if str(source_path) != frozen_media.get("output_file") or file_sha256(source_path) != frozen_media.get("checksum_sha256"):
+                    raise HTTPException(409, "冻结候选的路径或 SHA256 已变化")
                 probe = probe_media(source_path)
                 if not probe.get("has_audio"):
                     issue = "所选视频没有音轨"
                 else:
-                    duration = float(probe.get("duration_seconds") or 0)
+                    media_duration = float(probe.get("duration_seconds") or 0)
+                    in_point = float(assembly_item.get("in_point_seconds") or 0)
+                    out_point = float(assembly_item.get("out_point_seconds") or media_duration)
+                    if in_point >= out_point or out_point > media_duration + 0.001:
+                        raise HTTPException(409, "冻结入出点已超出当前媒体时长")
+                    duration = out_point - in_point
                     total_seconds += duration
                     source = {
                         "shot_id": shot["id"],
@@ -2821,14 +2995,23 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
                         "width": probe.get("width"),
                         "height": probe.get("height"),
                         "has_audio": bool(probe.get("has_audio")),
+                        "checksum_sha256": frozen_media["checksum_sha256"],
+                        "master_version_id": frozen_source.get("master_version_id"),
+                        "review_id": frozen_source.get("review_id"),
+                        "review_revision": frozen_source.get("review_revision"),
+                        "section_id": frozen_source.get("section_id"),
+                        "section_revision": frozen_source.get("section_revision"),
+                        "in_point_seconds": in_point,
+                        "out_point_seconds": out_point,
+                        "dialogue_mode": assembly_item.get("dialogue_mode") or "original",
                     }
                     if include_private:
                         source.update(
                             {
                                 "path": str(source_path),
-                                "dialogue": shot.get("dialogue") or "",
-                                "subtitle_enabled": bool(shot.get("subtitle_enabled", 1)),
-                                "subtitle_start_seconds": shot.get("subtitle_start_seconds"),
+                                "dialogue": frozen_source.get("shot_snapshot", {}).get("dialogue") or "",
+                                "subtitle_enabled": bool(assembly_item.get("subtitle_enabled")),
+                                "subtitle_start_seconds": assembly_item.get("subtitle_start_seconds"),
                             }
                         )
                     sources.append(source)
@@ -2847,7 +3030,9 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
         "duration_seconds": round(total_seconds, 3),
         "source_policy": "selected_only",
         "delivery_plan": None if not assembly else {
-            "id": assembly["id"], "revision": assembly["revision"], "plan_hash": assembly["plan_hash"], "status": assembly["status"],
+            "id": assembly["id"], "revision": assembly["revision"], "plan_hash": assembly["plan_hash"],
+            "calculated_plan_hash": assembly_integrity["calculated_plan_hash"],
+            "assembly_snapshot_hash": assembly_integrity["snapshot_hash"], "status": assembly["status"],
         },
         "sources": sources,
         "issues": issues,
@@ -2892,6 +3077,101 @@ def cleanup_export_outputs(stem: str) -> None:
         path.unlink(missing_ok=True)
 
 
+def export_staging_root(run_id: str) -> Path:
+    root = (EXPORT_JOB_ROOT / f"{run_id}.staging").resolve()
+    try:
+        root.relative_to(EXPORT_JOB_ROOT.resolve())
+    except ValueError as exc:
+        raise RuntimeError("导出 staging 路径越界") from exc
+    return root
+
+
+def allowed_staged_export_file(raw_path: str | None, run_id: str) -> Path:
+    path = Path(str(raw_path or "")).resolve()
+    source_root = (export_staging_root(run_id) / "sources").resolve()
+    try:
+        path.relative_to(source_root)
+    except ValueError as exc:
+        raise RuntimeError("导出 staged 来源不在本次运行私有目录内") from exc
+    if not path.is_file():
+        raise RuntimeError("导出 staged 来源不存在")
+    return path
+
+
+def cleanup_export_staging(run_id: str) -> None:
+    root = export_staging_root(run_id)
+    if not root.exists():
+        return
+
+    def make_writable_and_retry(function: Any, path: str, _error: Any) -> None:
+        os.chmod(path, 0o700)
+        function(path)
+
+    shutil.rmtree(root, onerror=make_writable_and_retry)
+
+
+def stage_export_sources(run_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Copy frozen sources into a private immutable run directory.
+
+    FFmpeg never receives the mutable original path.  Each copy is accepted
+    only when the original hash is stable before and after copying and the
+    staged bytes independently match the frozen credential.
+    """
+    frozen_sources = snapshot.get("sources")
+    if not isinstance(frozen_sources, list) or not frozen_sources:
+        raise RuntimeError("导出任务缺少冻结来源")
+    cleanup_export_staging(run_id)
+    root = export_staging_root(run_id)
+    source_root = root / "sources"
+    root.mkdir(parents=True, exist_ok=False)
+    source_root.mkdir(exist_ok=False)
+    staged_sources: list[dict[str, Any]] = []
+    try:
+        for index, frozen in enumerate(frozen_sources, 1):
+            original = allowed_output_file(frozen.get("path"))
+            expected_sha = str(frozen.get("checksum_sha256") or "").lower()
+            if len(expected_sha) != 64:
+                raise RuntimeError(f"镜头 {frozen.get('shot_id')} 缺少有效冻结 SHA256")
+            before_sha = file_sha256(original).lower()
+            if before_sha != expected_sha:
+                raise RuntimeError(f"镜头 {frozen.get('shot_id')} 的原始媒体与冻结 SHA256 不一致")
+            suffix = original.suffix.lower()
+            if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+                suffix = ".media"
+            staged_path = source_root / f"{index:04d}-{expected_sha}{suffix}"
+            staged_temp = source_root / f".{index:04d}-{uuid.uuid4().hex}.tmp"
+            with original.open("rb") as source_handle, staged_temp.open("xb") as staged_handle:
+                shutil.copyfileobj(source_handle, staged_handle, length=1024 * 1024)
+                staged_handle.flush()
+                os.fsync(staged_handle.fileno())
+            after_sha = file_sha256(original).lower()
+            staged_sha = file_sha256(staged_temp).lower()
+            if before_sha != after_sha or after_sha != expected_sha or staged_sha != expected_sha:
+                raise RuntimeError(f"镜头 {frozen.get('shot_id')} 在 staging 复制期间发生变化")
+            staged_temp.replace(staged_path)
+            os.chmod(staged_path, 0o444)
+            staged_sources.append({
+                **frozen,
+                "original_path": str(original),
+                "original_checksum_sha256": expected_sha,
+                "path": str(staged_path.resolve()),
+                "checksum_sha256": staged_sha,
+                "staged_path": str(staged_path.resolve()),
+                "staged_checksum_sha256": staged_sha,
+                "staged_size_bytes": staged_path.stat().st_size,
+            })
+        staged_snapshot = {**snapshot, "sources": staged_sources, "staging_run_id": run_id}
+        request_path = root / "request.json"
+        request_temp = root / f".{uuid.uuid4().hex}.request.tmp"
+        request_temp.write_text(json.dumps(staged_snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        request_temp.replace(request_path)
+        os.chmod(request_path, 0o444)
+        return staged_snapshot
+    except Exception:
+        cleanup_export_staging(run_id)
+        raise
+
+
 class ExportCancelled(RuntimeError):
     pass
 
@@ -2914,6 +3194,144 @@ def terminate_process_tree(process: subprocess.Popen[str]) -> None:
 def export_cancel_requested(run_id: str) -> bool:
     current = row("SELECT cancel_requested FROM export_runs WHERE id = ?", (run_id,))
     return bool(current and current.get("cancel_requested"))
+
+
+def _verify_frozen_export_sources(
+    snapshot: dict[str, Any], rendered_sources: list[dict[str, Any]] | None = None,
+) -> None:
+    frozen_sources = snapshot.get("sources")
+    if not isinstance(frozen_sources, list) or not frozen_sources:
+        raise RuntimeError("导出任务缺少冻结来源")
+    rendered_by_shot = {
+        str(item.get("shot_id")): item for item in (rendered_sources or []) if isinstance(item, dict)
+    }
+    if rendered_sources is not None and len(rendered_by_shot) != len(frozen_sources):
+        raise RuntimeError("FFmpeg 来源清单与冻结装配的镜头集合不一致")
+    staging_run_id = str(snapshot.get("staging_run_id") or "")
+    for frozen in frozen_sources:
+        path = (
+            allowed_staged_export_file(frozen.get("path"), staging_run_id)
+            if staging_run_id
+            else allowed_output_file(frozen.get("path"))
+        )
+        expected_sha = str(frozen.get("checksum_sha256") or "").lower()
+        if len(expected_sha) != 64 or file_sha256(path).lower() != expected_sha:
+            raise RuntimeError(f"镜头 {frozen.get('shot_id')} 的冻结媒体在导出期间发生变化")
+        if rendered_sources is None:
+            continue
+        rendered = rendered_by_shot.get(str(frozen.get("shot_id")))
+        comparable = (
+            "source_id", "path", "checksum_sha256", "in_point_seconds", "out_point_seconds",
+            "dialogue_mode", "subtitle_enabled", "subtitle_start_seconds",
+        )
+        if not rendered or any(rendered.get(key) != frozen.get(key) for key in comparable):
+            raise RuntimeError(f"镜头 {frozen.get('shot_id')} 的渲染来源与冻结快照不一致")
+
+
+@contextmanager
+def hold_staged_export_sources(
+    snapshot: dict[str, Any], rendered_sources: list[dict[str, Any]] | None = None,
+):
+    """Hold OS-enforced read-only handles through the publication CAS.
+
+    Windows ``CreateFileW`` sharing rules are mandatory here: ``FILE_SHARE_READ``
+    permits FFmpeg/readers but rejects later write or delete opens while these
+    handles are alive.  A POSIX advisory lock would not provide the same trust
+    boundary, so unsupported platforms fail closed instead of pretending that
+    chmod or flock makes mutable external files immutable.
+    """
+    if os.name != "nt":
+        raise RuntimeError("当前平台无法提供 staged 输入的 OS 级禁写/禁删发布锁，导出已失败关闭")
+    import ctypes
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    invalid_handle = ctypes.c_void_p(-1).value
+    staging_run_id = str(snapshot.get("staging_run_id") or "")
+    frozen_sources = snapshot.get("sources")
+    if not staging_run_id or not isinstance(frozen_sources, list) or not frozen_sources:
+        raise RuntimeError("导出 staged 发布锁缺少有效运行或来源快照")
+    handles: list[Any] = []
+    locked_paths: set[Path] = set()
+    try:
+        for frozen in frozen_sources:
+            path = allowed_staged_export_file(frozen.get("path"), staging_run_id)
+            if path in locked_paths:
+                continue
+            handle = create_file(
+                str(path), generic_read, file_share_read, None,
+                open_existing, file_attribute_normal, None,
+            )
+            if handle == invalid_handle:
+                error = ctypes.get_last_error()
+                raise RuntimeError(
+                    f"无法取得 staged 输入的 OS 级发布锁：{path.name}（Windows {error}: {ctypes.FormatError(error).strip()}）"
+                )
+            handles.append(handle)
+            locked_paths.add(path)
+        # Recompute SHA/path evidence only after every source is protected.
+        _verify_frozen_export_sources(snapshot, rendered_sources)
+        yield
+    finally:
+        for handle in reversed(handles):
+            close_handle(handle)
+
+
+def _validate_export_assembly(
+    db: sqlite3.Connection,
+    export_run: dict[str, Any],
+    snapshot: dict[str, Any],
+    config: dict[str, Any],
+) -> None:
+    delivery = snapshot.get("delivery_plan") or {}
+    assembly = _locked_assembly_from_db(db, str(export_run.get("project_id") or ""))
+    if not assembly:
+        raise RuntimeError("导出任务对应的锁定装配已不存在")
+    integrity = _assembly_integrity(assembly)
+    if not integrity["valid"]:
+        raise RuntimeError("锁定装配 plan_hash 已损坏")
+    expected = {
+        "id": assembly["id"], "revision": assembly["revision"], "plan_hash": assembly["plan_hash"],
+        "calculated_plan_hash": integrity["calculated_plan_hash"],
+        "assembly_snapshot_hash": integrity["snapshot_hash"], "status": assembly["status"],
+    }
+    if delivery != expected:
+        raise RuntimeError("当前锁定装配与任务冻结的规范化快照不一致")
+    if config.get("delivery_plan_hash") != assembly["plan_hash"] or config.get("assembly_snapshot_hash") != integrity["snapshot_hash"]:
+        raise RuntimeError("导出任务的装配 hash 凭证不一致")
+
+
+def _validate_export_run_snapshot(
+    export_run: dict[str, Any], *, db: sqlite3.Connection | None = None, verify_sources: bool = True,
+) -> dict[str, Any]:
+    try:
+        snapshot = json.loads(export_run.get("source_snapshot") or "{}")
+        config = json.loads(export_run.get("config") or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("导出任务冻结快照无法解析") from exc
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    if hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest() != config.get("source_snapshot_sha256"):
+        raise RuntimeError("导出任务冻结快照 hash 不一致")
+    if db is None:
+        with closing(connect()) as current_db:
+            _validate_export_assembly(current_db, export_run, snapshot, config)
+    else:
+        _validate_export_assembly(db, export_run, snapshot, config)
+    if verify_sources:
+        _verify_frozen_export_sources(snapshot)
+    return snapshot
 
 
 def claim_next_export_run() -> dict[str, Any] | None:
@@ -3003,13 +3421,9 @@ def run_export_job(run_id: str) -> None:
             raise RuntimeError(f"导出脚本不存在：{EXPORT_SCRIPT}")
         EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
         EXPORT_JOB_ROOT.mkdir(parents=True, exist_ok=True)
-        snapshot = json.loads(export_run.get("source_snapshot") or "{}")
-        if not snapshot.get("sources"):
-            raise RuntimeError("导出任务缺少冻结的输入快照")
-        snapshot_path = EXPORT_JOB_ROOT / f"{run_id}.request.json"
-        snapshot_temp = EXPORT_JOB_ROOT / f"{run_id}.request.tmp.json"
-        snapshot_temp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        snapshot_temp.replace(snapshot_path)
+        original_snapshot = _validate_export_run_snapshot(export_run)
+        staged_snapshot = stage_export_sources(run_id, original_snapshot)
+        snapshot_path = export_staging_root(run_id) / "request.json"
         log_path = EXPORT_JOB_ROOT / f"{run_id}.log"
         with closing(connect()) as db:
             db.execute(
@@ -3017,7 +3431,11 @@ def run_export_job(run_id: str) -> None:
                 (str(log_path), utc_now(), run_id),
             )
             db.commit()
-        record_export_event(run_id, "snapshot_ready", f"已冻结 {len(snapshot['sources'])} 个镜头输入")
+        record_export_event(
+            run_id,
+            "snapshot_ready",
+            f"已将 {len(staged_snapshot['sources'])} 个冻结镜头复制到本次运行的只读 staging",
+        )
         command = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(EXPORT_SCRIPT),
             "-ApiBase", API_BASE,
@@ -3061,10 +3479,45 @@ def run_export_job(run_id: str) -> None:
         captions_path = allowed_export_file(stem, ".vtt")
         sources_path = allowed_export_file(stem, ".sources.json")
         sources = json.loads(sources_path.read_text(encoding="utf-8-sig"))
+        if isinstance(sources, dict):
+            sources = [sources]
+        if not isinstance(sources, list):
+            raise RuntimeError("FFmpeg 来源清单格式无效")
+        # Recheck the immutable inputs after FFmpeg exits and before publishing
+        # any production manifest/current version.  A mid-render replacement
+        # must fail closed even when the output process itself succeeded.
+        _verify_frozen_export_sources(staged_snapshot, sources)
+        # FFmpeg may run for a long time.  Revalidate the complete normalized
+        # locked assembly after it exits, not only the media files frozen at
+        # worker start.
+        _validate_export_run_snapshot(export_run, verify_sources=False)
+        original_by_shot = {
+            str(source.get("shot_id")): source for source in original_snapshot["sources"]
+        }
+        staged_by_shot = {
+            str(source.get("shot_id")): source for source in staged_snapshot["sources"]
+        }
         verified_sources = []
         for source in sources:
-            source_path = allowed_output_file(source.get("path"))
-            verified_sources.append({**source, "sha256": file_sha256(source_path)})
+            source_path = allowed_staged_export_file(source.get("path"), run_id)
+            shot_id = str(source.get("shot_id"))
+            original_source = original_by_shot.get(shot_id)
+            staged_source = staged_by_shot.get(shot_id)
+            if not original_source or not staged_source:
+                raise RuntimeError(f"镜头 {shot_id} 的 original/staged 来源映射不完整")
+            verified_sources.append({
+                **source,
+                "sha256": file_sha256(source_path),
+                "original": {
+                    "path": original_source.get("path"),
+                    "checksum_sha256": original_source.get("checksum_sha256"),
+                },
+                "staged": {
+                    "path": staged_source.get("path"),
+                    "checksum_sha256": staged_source.get("checksum_sha256"),
+                    "size_bytes": staged_source.get("staged_size_bytes"),
+                },
+            })
         config = json.loads(export_run.get("config") or "{}")
         video_probe = probe_media(video_path)
         production_manifest_path = EXPORT_ROOT / f"{stem}.production.json"
@@ -3079,6 +3532,10 @@ def run_export_job(run_id: str) -> None:
             "created_at": export_run["created_at"],
             "completed_at": utc_now(),
             "config": config,
+            "source_snapshot_sha256": config.get("source_snapshot_sha256"),
+            "staged_snapshot_sha256": hashlib.sha256(
+                json.dumps(staged_snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
             "inputs": verified_sources,
             "outputs": {
                 "video": {"file": video_path.name, "sha256": file_sha256(video_path), "probe": video_probe},
@@ -3090,7 +3547,6 @@ def run_export_job(run_id: str) -> None:
         production_manifest_temp.write_text(
             json.dumps(production_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        production_manifest_temp.replace(production_manifest_path)
         outputs = {
             "video": video_path.name,
             "subtitles": subtitles_path.name,
@@ -3101,18 +3557,51 @@ def run_export_job(run_id: str) -> None:
             "size_bytes": video_path.stat().st_size,
         }
         completed_at = utc_now()
-        with closing(connect()) as db:
-            db.execute("UPDATE export_runs SET is_current = 0 WHERE project_id = ?", (export_run["project_id"],))
-            db.execute(
-                """UPDATE export_runs SET state = '已完成', message = '横屏成片与生产清单已生成',
-                outputs = ?, updated_at = ?, completed_at = ?, error = NULL, worker_id = NULL,
-                cancel_requested = 0, is_current = 1 WHERE id = ?""",
-                (json.dumps(outputs, ensure_ascii=False), completed_at, completed_at, run_id),
-            )
-            db.commit()
+        # Reject obvious source drift before taking the publication lock.  The
+        # authoritative hash is repeated inside the final transaction below.
+        _verify_frozen_export_sources(staged_snapshot, sources)
+        # chmod is not a publication lock on Windows.  Keep handles that deny
+        # write/delete sharing alive from the final SHA check through manifest
+        # replacement and the current-version CAS.
+        with hold_staged_export_sources(staged_snapshot, sources):
+            with closing(connect()) as db:
+                db.execute("BEGIN IMMEDIATE")
+                current_run = db.execute(
+                    "SELECT * FROM export_runs WHERE id = ? AND state = '导出中' AND cancel_requested = 0",
+                    (run_id,),
+                ).fetchone()
+                if not current_run:
+                    raise RuntimeError("导出任务在发布前已被取消或修改")
+                current_run = dict(current_run)
+                if (
+                    current_run.get("source_snapshot") != export_run.get("source_snapshot")
+                    or current_run.get("config") != export_run.get("config")
+                ):
+                    raise RuntimeError("导出任务冻结凭证在发布前发生变化")
+                # The mutable originals are no longer render inputs.  Revalidate
+                # the locked assembly and the OS-protected staged bytes in the
+                # publication transaction before exposing manifest/current.
+                _validate_export_run_snapshot(current_run, db=db, verify_sources=False)
+                _verify_frozen_export_sources(staged_snapshot, sources)
+                production_manifest_temp.replace(production_manifest_path)
+                db.execute("UPDATE export_runs SET is_current = 0 WHERE project_id = ?", (export_run["project_id"],))
+                published = db.execute(
+                    """UPDATE export_runs SET state = '已完成', message = '横屏成片与生产清单已生成',
+                    outputs = ?, updated_at = ?, completed_at = ?, error = NULL, worker_id = NULL,
+                    cancel_requested = 0, is_current = 1 WHERE id = ? AND state = '导出中'
+                    AND source_snapshot = ? AND config = ? AND cancel_requested = 0""",
+                    (
+                        json.dumps(outputs, ensure_ascii=False), completed_at, completed_at, run_id,
+                        export_run.get("source_snapshot"), export_run.get("config"),
+                    ),
+                )
+                if published.rowcount != 1:
+                    raise RuntimeError("导出任务发布 CAS 失败")
+                db.commit()
         record_export_event(run_id, "completed", "媒体校验与生产清单写入完成，已设为当前版本")
     except ExportCancelled as exc:
         cleanup_export_outputs(export_run["output_name"])
+        cleanup_export_staging(run_id)
         cancelled_at = utc_now()
         with closing(connect()) as db:
             db.execute(
@@ -3124,6 +3613,7 @@ def run_export_job(run_id: str) -> None:
         record_export_event(run_id, "cancelled", str(exc), "warning")
     except ExportInterrupted as exc:
         cleanup_export_outputs(export_run["output_name"])
+        cleanup_export_staging(run_id)
         with closing(connect()) as db:
             db.execute(
                 """UPDATE export_runs SET state = '恢复排队', message = '服务停止，等待下次启动恢复',
@@ -3134,6 +3624,7 @@ def run_export_job(run_id: str) -> None:
         record_export_event(run_id, "interrupted", str(exc), "warning")
     except Exception as exc:
         cleanup_export_outputs(export_run["output_name"])
+        cleanup_export_staging(run_id)
         failed_at = utc_now()
         with closing(connect()) as db:
             db.execute(
@@ -3346,9 +3837,30 @@ def create_export(payload: ExportRequest) -> dict[str, Any]:
         "source_snapshot_sha256": hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest(),
         "delivery_plan_hash": preflight["delivery_plan"]["plan_hash"],
         "delivery_plan_revision": preflight["delivery_plan"]["revision"],
+        "assembly_snapshot_hash": preflight["delivery_plan"]["assembly_snapshot_hash"],
     }
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
+        current_assembly = _locked_assembly_from_db(db, preflight["project_id"])
+        if not current_assembly:
+            db.rollback()
+            raise HTTPException(409, "创建任务前锁定装配已不存在")
+        current_integrity = _assembly_integrity(current_assembly)
+        current_delivery = {
+            "id": current_assembly["id"], "revision": current_assembly["revision"],
+            "plan_hash": current_assembly["plan_hash"],
+            "calculated_plan_hash": current_integrity["calculated_plan_hash"],
+            "assembly_snapshot_hash": current_integrity["snapshot_hash"], "status": current_assembly["status"],
+        }
+        if not current_integrity["valid"] or current_delivery != preflight["delivery_plan"]:
+            db.rollback()
+            raise HTTPException(409, "创建任务前锁定装配内容或 hash 已变化")
+        try:
+            _verify_frozen_export_sources(source_snapshot)
+        except (HTTPException, RuntimeError) as exc:
+            db.rollback()
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            raise HTTPException(409, f"创建任务前冻结媒体凭证已变化：{detail}") from exc
         active = db.execute(
             "SELECT id FROM export_runs WHERE state IN ('排队中', '恢复排队', '导出中', '取消中') LIMIT 1"
         ).fetchone()
@@ -4324,6 +4836,9 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
         "message": reconciled["message"],
         "h3_project": project,
         "prompt_ids": prompt_ids,
+        "candidate_ids": string_list(reconciled.get("candidate_ids")),
+        "job_id": int(reconciled["id"]),
+        "job_revision": int(reconciled.get("reconciliation_revision") or 0),
         "mode": plan["mode"],
         "references": plan["references"],
     }
@@ -4477,54 +4992,87 @@ def sync_shot(shot_id: str) -> dict[str, Any]:
 
 @app.post("/api/shots/{shot_id}/reconciliation/resolve")
 def resolve_reconciliation(shot_id: str, request: ReconciliationResolutionRequest) -> dict[str, Any]:
-    require_active_shot(shot_id)
     if not request.confirm:
         raise HTTPException(400, "人工解决对账前必须显式确认")
-    job = row(
-        """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
-        AND state = '待人工对账' ORDER BY id DESC LIMIT 1""",
-        (shot_id,),
-    )
-    if not job:
-        raise HTTPException(409, "该镜头没有待人工解决的 H3 对账任务")
-    if int(job.get("reconciliation_revision") or 0) != request.expected_revision:
-        raise HTTPException(409, "对账任务已变化，请刷新后再确认")
-    try:
-        evidence = json.loads(job.get("reconciliation_snapshot") or "{}")
-    except (TypeError, json.JSONDecodeError):
-        evidence = {}
-    history = list(evidence.get("manual_resolutions") or [])
-    history.append({
-        "action": request.action,
-        "note": request.note,
-        "resolved_by": request.resolved_by,
-        "resolved_at": utc_now(),
-        "from_state": job["state"],
-        "from_revision": request.expected_revision,
-    })
-    evidence["manual_resolutions"] = history
-    if request.action == "confirm_not_submitted":
-        resolved = update_reconciliation_job(
-            job,
-            "提交失败",
-            f"{request.resolved_by} 已确认外部任务未提交，可在修复后重试：{request.note}",
-            evidence,
-            retry_safe=True,
-            completed=True,
+    now = utc_now()
+    with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        selected = db.execute(
+            """SELECT jobs.* FROM jobs
+            JOIN shots ON shots.id = jobs.shot_id
+            JOIN workspace_settings ON workspace_settings.key = 'active_project_id'
+              AND workspace_settings.value = shots.project_id
+            JOIN projects ON projects.id = shots.project_id AND projects.archived = 0
+            WHERE jobs.id = ? AND jobs.shot_id = ? AND jobs.kind = 'draft'
+              AND jobs.state = '待人工对账'
+              AND jobs.reconciliation_revision = ?""",
+            (request.job_id, shot_id, request.expected_revision),
+        ).fetchone()
+        if not selected:
+            db.rollback()
+            raise HTTPException(409, "指定对账任务不属于当前项目/镜头，或任务修订已变化")
+        job = dict(selected)
+        try:
+            evidence = json.loads(job.get("reconciliation_snapshot") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            evidence = {}
+        history = list(evidence.get("manual_resolutions") or [])
+        history.append({
+            "action": request.action,
+            "job_id": request.job_id,
+            "note": request.note,
+            "resolved_by": request.resolved_by,
+            "resolved_at": now,
+            "from_state": job["state"],
+            "from_revision": request.expected_revision,
+        })
+        evidence["manual_resolutions"] = history
+        next_state = "提交失败" if request.action == "confirm_not_submitted" else "提交状态未知"
+        message = (
+            f"{request.resolved_by} 已确认外部任务未提交，可在修复后重试：{request.note}"
+            if request.action == "confirm_not_submitted"
+            else f"{request.resolved_by} 请求按当前 manifest/ComfyUI 证据重新对账：{request.note}"
         )
-        if resolved["state"] != "提交失败" or not resolved.get("retry_safe"):
+        retry_safe = request.action == "confirm_not_submitted"
+        completed_at = now if retry_safe else None
+        changed = db.execute(
+            """UPDATE jobs SET state = ?, message = ?, reconciliation_snapshot = ?, retry_safe = ?,
+            candidate_ids = CASE WHEN ? = 1 THEN '[]' ELSE candidate_ids END,
+            updated_at = ?, completed_at = ?, reconciliation_revision = reconciliation_revision + 1
+            WHERE id = ? AND shot_id = ? AND kind = 'draft' AND state = '待人工对账'
+              AND reconciliation_revision = ?
+              AND EXISTS (
+                SELECT 1 FROM shots
+                JOIN workspace_settings ON workspace_settings.key = 'active_project_id'
+                  AND workspace_settings.value = shots.project_id
+                JOIN projects ON projects.id = shots.project_id AND projects.archived = 0
+                WHERE shots.id = jobs.shot_id
+              )""",
+            (
+                next_state,
+                message,
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                int(retry_safe),
+                int(retry_safe),
+                now,
+                completed_at,
+                request.job_id,
+                shot_id,
+                request.expected_revision,
+            ),
+        )
+        if changed.rowcount != 1:
+            db.rollback()
             raise HTTPException(409, "对账任务被另一请求更新，请刷新")
-        return {"ok": True, "job": resolved, "message": resolved["message"]}
+        updated = db.execute("SELECT * FROM jobs WHERE id = ?", (request.job_id,)).fetchone()
+        if not updated:
+            db.rollback()
+            raise HTTPException(409, "对账任务在更新后不可用")
+        db.commit()
+        prepared = dict(updated)
+    if request.action == "confirm_not_submitted":
+        return {"ok": True, "job": prepared, "message": prepared["message"]}
 
-    prepared = update_reconciliation_job(
-        job,
-        "提交状态未知",
-        f"{request.resolved_by} 请求按当前 manifest/ComfyUI 证据重新对账：{request.note}",
-        evidence,
-        completed=False,
-    )
-    if prepared["state"] != "提交状态未知" or int(prepared.get("reconciliation_revision") or 0) != request.expected_revision + 1:
-        raise HTTPException(409, "对账任务被另一请求更新，请刷新")
     reconciled = reconcile_generation_job(prepared)
     return {
         "ok": reconciled["state"] not in {"待人工对账", "提交状态未知"},
@@ -4544,20 +5092,27 @@ def select_candidate(shot_id: str, request: ReviewRequest) -> dict[str, Any]:
         raise HTTPException(404, "候选版本不存在")
     if candidate.get("status") != "completed":
         raise HTTPException(409, "候选尚未生成完成")
-    if not candidate.get("selected"):
-        require_passed_review(DB_PATH, request.candidate_id, COMFY_OUTPUT_ROOT)
+    master_version = record_master_selection(
+        DB_PATH,
+        COMFY_OUTPUT_ROOT,
+        shot_id,
+        request.candidate_id,
+        note=request.note,
+        base_revision=request.base_revision,
+    )
+    h3_warning = None
     if candidate.get("source") == "h3" and candidate.get("external_id"):
         project = h3_project_for_shot(shot_id)
-        if request.note.strip():
-            run_h3(
-                ["review", "--project", project, "--candidate", candidate["external_id"], "--notes", request.note.strip()],
-                timeout=30,
-            )
-        run_h3(["select", "--project", project, "--candidate", candidate["external_id"]], timeout=30)
-
+        try:
+            if request.note.strip():
+                run_h3(
+                    ["review", "--project", project, "--candidate", candidate["external_id"], "--notes", request.note.strip()],
+                    timeout=30,
+                )
+            run_h3(["select", "--project", project, "--candidate", candidate["external_id"]], timeout=30)
+        except HTTPException as exc:
+            h3_warning = f"平台母版已保存；H3 manifest 选择标记同步失败：{exc.detail}"
     with closing(connect()) as db:
-        db.execute("UPDATE candidates SET selected = 0 WHERE shot_id = ?", (shot_id,))
-        db.execute("UPDATE candidates SET selected = 1, note = ? WHERE id = ?", (request.note, request.candidate_id))
         selected_thumbnail = (
             f"/api/candidates/{request.candidate_id}/thumbnail"
             if candidate.get("thumbnail_file") else candidate.get("thumbnail")
@@ -4577,7 +5132,12 @@ def select_candidate(shot_id: str, request: ReviewRequest) -> dict[str, Any]:
             (shot_id, f"候选 {candidate['label']} 已选为定稿", utc_now(), utc_now()),
         )
         db.commit()
-    return {"ok": True, "selected": request.candidate_id}
+    return {
+        "ok": True,
+        "selected": request.candidate_id,
+        "master_version": master_version,
+        "warning": h3_warning,
+    }
 
 
 @app.post("/api/shots/{shot_id}/finalize-promotion")
