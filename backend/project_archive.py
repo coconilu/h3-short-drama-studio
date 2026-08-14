@@ -91,6 +91,7 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
     batches = _rows(db, "SELECT * FROM production_batches WHERE project_id = ? ORDER BY created_at", (project_id,))
     batch_ids = _ids(batches)
     batch_items = _by_ids(db, "production_batch_items", "batch_id", batch_ids)
+    batch_item_ids = _ids(batch_items)
     documents = _rows(db, "SELECT * FROM script_documents WHERE project_id = ?", (project_id,))
     document_ids = _ids(documents)
     delivery_plans = _rows(db, "SELECT * FROM delivery_plans WHERE project_id = ?", (project_id,))
@@ -122,6 +123,9 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
         "shot_references": shot_references,
         "candidates": candidates,
         "candidate_reviews": candidate_reviews,
+        "candidate_master_versions": _rows(
+            db, "SELECT * FROM candidate_master_versions WHERE project_id = ? ORDER BY shot_id, revision", (project_id,)
+        ),
         "promotions": promotions,
         "jobs": jobs,
         "h3_prompt_plans": prompt_plans,
@@ -131,6 +135,7 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
         "production_bible_versions": _by_ids(db, "production_bible_versions", "entry_id", bible_ids),
         "production_batches": batches,
         "production_batch_items": batch_items,
+        "production_item_attempts": _by_ids(db, "production_item_attempts", "item_id", batch_item_ids),
         "production_batch_events": _by_ids(db, "production_batch_events", "batch_id", batch_ids),
         "script_documents": documents,
         "script_sections": _by_ids(db, "script_sections", "document_id", document_ids),

@@ -17,6 +17,7 @@ BATCH_ACTIVE_STATES = ("running", "paused", "cancelling")
 BATCH_TERMINAL_STATES = ("completed", "completed_with_errors", "cancelled")
 ITEM_ACTIVE_STATES = ("submitting", "running")
 ITEM_TERMINAL_STATES = ("completed", "failed", "cancelled")
+LOW_RESOLUTION_LIMIT = 768
 
 PlanProvider = Callable[[str], dict[str, Any]]
 Submitter = Callable[[str], dict[str, Any]]
@@ -104,6 +105,30 @@ def init_production_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_production_events_batch
           ON production_batch_events(batch_id, id DESC);
+        CREATE TABLE IF NOT EXISTS production_item_attempts (
+          id TEXT PRIMARY KEY,
+          item_id TEXT NOT NULL REFERENCES production_batch_items(id) ON DELETE CASCADE,
+          batch_id TEXT NOT NULL REFERENCES production_batches(id) ON DELETE CASCADE,
+          shot_id TEXT NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
+          attempt INTEGER NOT NULL,
+          state TEXT NOT NULL CHECK(state IN (
+            'submitting', 'running', 'completed', 'failed', 'submission_unknown'
+          )),
+          plan_hash TEXT NOT NULL,
+          plan_snapshot TEXT NOT NULL,
+          h3_project TEXT,
+          prompt_ids TEXT NOT NULL DEFAULT '[]',
+          candidate_ids TEXT NOT NULL DEFAULT '[]',
+          source_snapshot TEXT NOT NULL DEFAULT '{}',
+          media_evidence TEXT NOT NULL DEFAULT '[]',
+          error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          UNIQUE(item_id, attempt)
+        );
+        CREATE INDEX IF NOT EXISTS idx_production_attempts_item
+          ON production_item_attempts(item_id, attempt DESC);
         """
     )
 
@@ -163,6 +188,99 @@ def _decode_json(value: str | None, fallback: Any) -> Any:
         return fallback
 
 
+def _table_exists(db: sqlite3.Connection, table: str) -> bool:
+    return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone())
+
+
+def _candidate_evidence(
+    db: sqlite3.Connection, shot_id: str, prompt_ids: list[str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    if not _table_exists(db, "candidates"):
+        return [], []
+    candidates = [
+        dict(row)
+        for row in db.execute(
+            """SELECT id, external_id, prompt_id, seed, status, output_file, elapsed_seconds, metadata
+            FROM candidates WHERE shot_id = ? AND archived = 0 ORDER BY created_at, id""",
+            (shot_id,),
+        ).fetchall()
+    ]
+    if prompt_ids:
+        candidates = [item for item in candidates if item.get("prompt_id") in prompt_ids]
+    candidate_ids = [str(item.get("external_id") or item["id"]) for item in candidates]
+    media: list[dict[str, Any]] = []
+    for item in candidates:
+        output = str(item.get("output_file") or "")
+        path = Path(output) if output else None
+        exists = bool(path and path.is_file())
+        media.append({
+            "candidate_id": str(item.get("external_id") or item["id"]),
+            "record_id": item["id"],
+            "prompt_id": item.get("prompt_id"),
+            "seed": item.get("seed"),
+            "status": item.get("status"),
+            "output_file": output or None,
+            "file_exists": exists,
+            "size_bytes": path.stat().st_size if exists and path else None,
+            "elapsed_seconds": item.get("elapsed_seconds"),
+            "metadata": _decode_json(item.get("metadata"), {}),
+        })
+    return candidate_ids, media
+
+
+def _latest_draft_job(db: sqlite3.Connection, shot_id: str) -> dict[str, Any] | None:
+    if not _table_exists(db, "jobs"):
+        return None
+    row = db.execute(
+        "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1", (shot_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _refresh_attempt_evidence(
+    db: sqlite3.Connection,
+    item: dict[str, Any],
+    *,
+    state: str,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    result = result or {}
+    job = _latest_draft_job(db, item["shot_id"]) or {}
+    prompt_ids = (
+        result.get("prompt_ids")
+        or _decode_json(job.get("prompt_ids"), [])
+        or _decode_json(item.get("prompt_ids"), [])
+    )
+    candidate_ids = _decode_json(job.get("candidate_ids"), [])
+    observed_ids, media = _candidate_evidence(db, item["shot_id"], prompt_ids)
+    if observed_ids:
+        candidate_ids = observed_ids
+    source_snapshot = _decode_json(job.get("source_snapshot"), {}) or {
+        "plan_hash": item["plan_hash"],
+        "plan": _decode_json(item.get("plan_snapshot"), {}),
+    }
+    completed_at = utc_now() if state in {"completed", "failed", "submission_unknown"} else None
+    db.execute(
+        """UPDATE production_item_attempts SET state = ?, h3_project = ?, prompt_ids = ?,
+        candidate_ids = ?, source_snapshot = ?, media_evidence = ?, error = ?, updated_at = ?, completed_at = ?
+        WHERE item_id = ? AND attempt = ?""",
+        (
+            state,
+            result.get("h3_project") or job.get("h3_project") or item.get("h3_project"),
+            json.dumps(prompt_ids, ensure_ascii=False),
+            json.dumps(candidate_ids, ensure_ascii=False),
+            json.dumps(source_snapshot, ensure_ascii=False, sort_keys=True),
+            json.dumps(media, ensure_ascii=False, sort_keys=True),
+            error,
+            utc_now(),
+            completed_at,
+            item["id"],
+            int(item.get("attempts") or 0),
+        ),
+    )
+
+
 def _refresh_batch(db: sqlite3.Connection, batch_id: str) -> None:
     batch = db.execute("SELECT * FROM production_batches WHERE id = ?", (batch_id,)).fetchone()
     if not batch:
@@ -220,6 +338,17 @@ def _batch_public(db: sqlite3.Connection, row: sqlite3.Row, include_events: bool
         item = dict(item_row)
         item["prompt_ids"] = _decode_json(item.get("prompt_ids"), [])
         item["plan_snapshot"] = _decode_json(item.get("plan_snapshot"), {})
+        item["attempt_history"] = []
+        for attempt_row in db.execute(
+            "SELECT * FROM production_item_attempts WHERE item_id = ? ORDER BY attempt DESC", (item["id"],),
+        ).fetchall():
+            attempt = dict(attempt_row)
+            for field, fallback in (
+                ("plan_snapshot", {}), ("prompt_ids", []), ("candidate_ids", []),
+                ("source_snapshot", {}), ("media_evidence", []),
+            ):
+                attempt[field] = _decode_json(attempt.get(field), fallback)
+            item["attempt_history"].append(attempt)
         batch["items"].append(item)
     batch["events"] = []
     if include_events:
@@ -281,10 +410,16 @@ def create_batch(
         for shot_row in shots:
             shot = dict(shot_row)
             plan = plan_provider(shot["id"])
+            spec = plan.get("spec") or {}
+            resolution_numbers = [int(value) for value in str(spec.get("resolution") or "").replace("x", "×").split("×") if value.isdigit()]
             if plan.get("status") != "approved":
                 issues.append({"shot_id": shot["id"], "message": "当前生成计划尚未批准"})
             elif not plan.get("ready"):
                 issues.append({"shot_id": shot["id"], "message": "当前生成计划存在阻断项"})
+            elif int(spec.get("candidate_count") or 0) < 2:
+                issues.append({"shot_id": shot["id"], "message": "低清生产批次每镜至少需要 2 条候选"})
+            elif resolution_numbers and max(resolution_numbers) > LOW_RESOLUTION_LIMIT:
+                issues.append({"shot_id": shot["id"], "message": "生产批次只接受最长边不超过 768 的低清候选规格"})
             elif shot.get("status") in ("生成中", "已定稿"):
                 issues.append({"shot_id": shot["id"], "message": f"镜头当前状态为{shot['status']}"})
             items.append((shot, plan))
@@ -303,7 +438,13 @@ def create_batch(
                 project["id"],
                 name.strip() or f"{project['episode']} 生产批次",
                 len(items),
-                json.dumps({"concurrency": 1, "candidate_total": candidate_total, "snapshot_policy": "immutable"}, ensure_ascii=False),
+                json.dumps({
+                    "concurrency": 1,
+                    "candidate_total": candidate_total,
+                    "snapshot_policy": "immutable",
+                    "minimum_candidates_per_shot": 2,
+                    "resolution_policy": "low_resolution_max_768",
+                }, ensure_ascii=False),
                 now,
                 now,
                 now,
@@ -343,6 +484,9 @@ def recover_batches(db_path: Path) -> int:
                 updated_at = ?, completed_at = ? WHERE id = ?""",
                 (message, "submission_outcome_unknown", now, now, item["id"]),
             )
+            _refresh_attempt_evidence(
+                db, dict(item), state="submission_unknown", error="submission_outcome_unknown",
+            )
             db.execute(
                 """UPDATE production_batches SET state = 'paused', message = ?, updated_at = ?
                 WHERE id = ? AND state = 'running'""",
@@ -374,11 +518,24 @@ def claim_next_item(db_path: Path) -> dict[str, Any] | None:
             db.commit()
             return None
         now = utc_now()
-        db.execute(
+        cursor = db.execute(
             """UPDATE production_batch_items SET state = 'submitting', attempts = attempts + 1,
             message = '正在提交到 ComfyUI', error = NULL, started_at = COALESCE(started_at, ?),
             updated_at = ? WHERE id = ? AND state = 'queued'""",
             (now, now, item["id"]),
+        )
+        if cursor.rowcount != 1:
+            db.rollback()
+            return None
+        attempt = int(item["attempts"]) + 1
+        db.execute(
+            """INSERT INTO production_item_attempts
+            (id, item_id, batch_id, shot_id, attempt, state, plan_hash, plan_snapshot, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'submitting', ?, ?, ?, ?)""",
+            (
+                f"production-attempt-{uuid.uuid4().hex[:12]}", item["id"], item["batch_id"], item["shot_id"],
+                attempt, item["plan_hash"], item["plan_snapshot"], now, now,
+            ),
         )
         _event(db, item["batch_id"], "submitting", f"开始提交镜头 {item['title']}", item_id=item["id"])
         db.commit()
@@ -394,6 +551,7 @@ def _fail_item(db_path: Path, item: dict[str, Any], message: str, error: str) ->
             updated_at = ?, completed_at = ? WHERE id = ?""",
             (message, error[-5000:], now, now, item["id"]),
         )
+        _refresh_attempt_evidence(db, item, state="failed", error=error[-5000:])
         _event(db, item["batch_id"], "failed", message, item_id=item["id"], level="error")
         _refresh_batch(db, item["batch_id"])
         db.commit()
@@ -423,6 +581,7 @@ def submit_claimed_item(db_path: Path, item: dict[str, Any], plan_provider: Plan
                     item["id"],
                 ),
             )
+            _refresh_attempt_evidence(db, item, state="completed" if completed else "running", result=result)
             _event(
                 db, item["batch_id"], "completed" if completed else "submitted",
                 result.get("message") or result_state, item_id=item["id"],
@@ -465,6 +624,13 @@ def poll_running_items(db_path: Path, syncer: Syncer) -> int:
                     now,
                     item["id"],
                 ),
+            )
+            _refresh_attempt_evidence(
+                db,
+                item,
+                state=next_state,
+                result=result,
+                error=(result.get("message") or "H3 生成失败") if next_state == "failed" else None,
             )
             if next_state != "running":
                 changed += 1

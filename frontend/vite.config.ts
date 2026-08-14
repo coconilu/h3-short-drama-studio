@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+const apiTarget = process.env.JINGCHANG_API_URL || 'http://127.0.0.1:8765'
+
 export default defineConfig({
   plugins: [react()],
   preview: {
@@ -8,12 +10,12 @@ export default defineConfig({
     port: 4173,
     strictPort: true,
     proxy: {
-      '/api': 'http://127.0.0.1:8765',
+      '/api': apiTarget,
     },
   },
   server: {
     proxy: {
-      '/api': 'http://127.0.0.1:8765',
+      '/api': apiTarget,
     },
   },
 })

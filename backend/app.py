@@ -51,7 +51,7 @@ try:
         start_production_worker,
         stop_production_worker,
     )
-    from .review_gate import create_review_router, init_review_schema, require_passed_review
+    from .review_gate import create_review_router, init_review_schema, record_master_selection, require_passed_review
     from .script_workspace import create_script_router, init_script_schema
     from .runtime_control import request_supervisor_action, supervisor_status
 except ImportError:  # Support `uvicorn app:app` when backend is the working directory.
@@ -80,7 +80,7 @@ except ImportError:  # Support `uvicorn app:app` when backend is the working dir
         start_production_worker,
         stop_production_worker,
     )
-    from review_gate import create_review_router, init_review_schema, require_passed_review
+    from review_gate import create_review_router, init_review_schema, record_master_selection, require_passed_review
     from script_workspace import create_script_router, init_script_schema
     from runtime_control import request_supervisor_action, supervisor_status
 
@@ -1550,6 +1550,22 @@ def sync_manifest_to_db(
         shot = db.execute("SELECT * FROM shots WHERE id = ?", (shot_id,)).fetchone()
         if not shot:
             raise HTTPException(404, "镜头不存在")
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'candidate_master_versions'"
+        ).fetchone():
+            authoritative_master = db.execute(
+                """SELECT candidates.external_id FROM candidate_master_versions versions
+                JOIN candidates ON candidates.id = versions.candidate_id
+                WHERE versions.shot_id = ? ORDER BY versions.revision DESC LIMIT 1""",
+                (shot_id,),
+            ).fetchone()
+            if authoritative_master and authoritative_master["external_id"]:
+                master_external_id = authoritative_master["external_id"]
+                tracked_selected_id = (
+                    master_external_id
+                    if tracked_ids is None or master_external_id in tracked_ids
+                    else None
+                )
         expected_job = None
         if job_id is not None:
             if expected_job_state is None or expected_job_revision is None:
@@ -2067,6 +2083,7 @@ class FrameExtractRequest(BaseModel):
 class ReviewRequest(BaseModel):
     candidate_id: str
     note: str = ""
+    base_revision: int | None = Field(None, ge=0)
 
 
 class FinalizePromotionRequest(BaseModel):
@@ -2374,9 +2391,11 @@ def project_detail(project: dict[str, Any]) -> dict[str, Any]:
         item["shot_id"]: item
         for item in rows(
             """SELECT links.shot_id, links.section_id, links.last_synced_revision,
-            sections.title AS section_title, sections.revision AS current_section_revision
+            sections.title AS section_title, sections.revision AS current_section_revision,
+            sections.chapter_id, chapters.title AS chapter_title
             FROM creative_storyboard_links links
             JOIN creative_sections sections ON sections.id = links.section_id
+            JOIN creative_chapters chapters ON chapters.id = sections.chapter_id
             WHERE links.project_id = ?""",
             (project["id"],),
         )
@@ -4544,20 +4563,30 @@ def select_candidate(shot_id: str, request: ReviewRequest) -> dict[str, Any]:
         raise HTTPException(404, "候选版本不存在")
     if candidate.get("status") != "completed":
         raise HTTPException(409, "候选尚未生成完成")
-    if not candidate.get("selected"):
-        require_passed_review(DB_PATH, request.candidate_id, COMFY_OUTPUT_ROOT)
+    if candidate.get("selected"):
+        return {"ok": True, "selected": request.candidate_id, "unchanged": True}
+    require_passed_review(DB_PATH, request.candidate_id, COMFY_OUTPUT_ROOT)
+    master_version = record_master_selection(
+        DB_PATH,
+        COMFY_OUTPUT_ROOT,
+        shot_id,
+        request.candidate_id,
+        note=request.note,
+        base_revision=request.base_revision,
+    )
+    h3_warning = None
     if candidate.get("source") == "h3" and candidate.get("external_id"):
         project = h3_project_for_shot(shot_id)
-        if request.note.strip():
-            run_h3(
-                ["review", "--project", project, "--candidate", candidate["external_id"], "--notes", request.note.strip()],
-                timeout=30,
-            )
-        run_h3(["select", "--project", project, "--candidate", candidate["external_id"]], timeout=30)
-
+        try:
+            if request.note.strip():
+                run_h3(
+                    ["review", "--project", project, "--candidate", candidate["external_id"], "--notes", request.note.strip()],
+                    timeout=30,
+                )
+            run_h3(["select", "--project", project, "--candidate", candidate["external_id"]], timeout=30)
+        except HTTPException as exc:
+            h3_warning = f"平台母版已保存；H3 manifest 选择标记同步失败：{exc.detail}"
     with closing(connect()) as db:
-        db.execute("UPDATE candidates SET selected = 0 WHERE shot_id = ?", (shot_id,))
-        db.execute("UPDATE candidates SET selected = 1, note = ? WHERE id = ?", (request.note, request.candidate_id))
         selected_thumbnail = (
             f"/api/candidates/{request.candidate_id}/thumbnail"
             if candidate.get("thumbnail_file") else candidate.get("thumbnail")
@@ -4577,7 +4606,12 @@ def select_candidate(shot_id: str, request: ReviewRequest) -> dict[str, Any]:
             (shot_id, f"候选 {candidate['label']} 已选为定稿", utc_now(), utc_now()),
         )
         db.commit()
-    return {"ok": True, "selected": request.candidate_id}
+    return {
+        "ok": True,
+        "selected": request.candidate_id,
+        "master_version": master_version,
+        "warning": h3_warning,
+    }
 
 
 @app.post("/api/shots/{shot_id}/finalize-promotion")

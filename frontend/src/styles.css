@@ -1610,7 +1610,47 @@ textarea { line-height: 1.55; }
 .shot-copy .shot-source { display: block; margin-top: 5px; color: #65b98c; }
 .shot-copy .shot-source.manual { color: #6f7883; }
 
+.batch-spec-controls { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)) auto; gap: 8px; align-items: end; padding-top: 10px; border-top: 1px solid var(--line-soft); }
+.batch-spec-controls label { display: grid; gap: 5px; color: #777f89; font-size: 8px; }
+.batch-spec-controls select { min-height: 32px; border: 1px solid #303640; background: #0d1014; color: #c5cad0; padding: 0 8px; }
+.review-debt { display: flex; gap: 10px; margin: 10px 0; padding: 9px 11px; border: 1px solid #6a4c2d; background: #251d13; color: #d5a968; font-size: 9px; }
+.candidate-compare { margin: 14px 0; border: 1px solid #303640; background: #101419; }
+.candidate-compare > header { display: flex; justify-content: space-between; align-items: center; padding: 9px 12px; border-bottom: 1px solid #292f38; }
+.candidate-compare > header span { display: grid; gap: 3px; }
+.candidate-compare > header strong, .candidate-compare article strong { color: #c9ced4; font-size: 9px; }
+.candidate-compare > header small { color: #6f7883; font-size: 8px; }
+.candidate-compare > header label { display: flex; align-items: center; gap: 8px; color: #7d8792; font-size: 8px; }
+.candidate-compare > header select { border: 1px solid #343b46; background: #0d1116; color: #c5cad0; padding: 5px 7px; }
+.candidate-compare > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: #292f38; }
+.candidate-compare article { display: grid; gap: 7px; padding: 9px; background: #0c1014; }
+.candidate-compare video { width: 100%; aspect-ratio: 19/11; background: #050607; object-fit: contain; }
+.candidate-trace { margin: 10px 0; padding: 10px; border: 1px solid #303640; background: #101419; }
+.candidate-trace.verified { border-color: #315f49; }
+.candidate-trace.debt { border-color: #6a4c2d; }
+.candidate-trace header { display: flex; justify-content: space-between; color: #9da6b1; font-size: 8px; }
+.candidate-trace dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 9px 0 0; }
+.candidate-trace dl div { min-width: 0; padding: 6px; background: #151a20; }
+.candidate-trace dt { color: #69727e; font-size: 7px; }
+.candidate-trace dd { margin: 3px 0 0; color: #b6bdc6; font-size: 8px; overflow: hidden; text-overflow: ellipsis; }
+.review-revisions, .master-history { margin-top: 9px; color: #7c8590; font-size: 8px; }
+.review-revisions span { display: block; padding: 6px 0; border-top: 1px solid #282e37; }
+.master-history article { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid #282e37; }
+.master-history article span { display: grid; gap: 3px; }
+.master-history article strong { color: #b7bec7; font-size: 8px; }
+.master-history article small { color: #69727e; font-size: 7px; }
+.master-history article em { color: #67bd8f; font-size: 8px; font-style: normal; }
+.master-history article button { border: 1px solid #3a424e; background: transparent; color: #aeb6c0; font-size: 8px; padding: 5px 7px; }
+.assembly-list { overflow-x: auto; }
+.assembly-row { min-width: 1320px; grid-template-columns: 34px 30px minmax(190px, 1fr) minmax(235px, 1.1fr) 72px 72px 92px 130px 118px 42px; }
+.assembly-source { display: grid; gap: 4px; min-width: 0; }
+.assembly-source strong { color: #6bbf92; font-size: 8px; }
+.assembly-source small { color: #717b87; font-size: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.assembly-source:not(.ready) strong { color: #d3a05b; }
+.clip-point, .dialogue-mode { display: grid; gap: 4px; color: #737c87; font-size: 7px; }
+.clip-point input, .dialogue-mode select { width: 100%; min-height: 28px; border: 1px solid #303640; background: #0d1116; color: #c3c9d0; padding: 0 6px; }
+
 @media (max-width: 1100px) {
+  .batch-spec-controls { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
   .planning-progress { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .planning-progress article:nth-child(3) { border-left: 0; border-top: 1px solid #2c313b; }
   .planning-progress article:nth-child(4) { border-top: 1px solid #2c313b; }

@@ -64,6 +64,8 @@ export type Shot = {
     shot_id: string
     section_id: string
     section_title: string
+    chapter_id: string
+    chapter_title: string
     last_synced_revision: number
     current_section_revision: number
   }
@@ -671,6 +673,26 @@ export type DeliveryPlanItem = {
   subtitle_enabled: boolean
   subtitle_start_seconds?: number
   transition: 'cut'
+  in_point_seconds: number
+  out_point_seconds?: number
+  dialogue_mode: 'original' | 'mute'
+  section_id?: string
+  candidate_id?: string
+  master_version_id?: string
+  source_snapshot: {
+    section_id?: string
+    storyboard_revision?: number
+    shot_id: string
+    candidate_id?: string
+    candidate_external_id?: string
+    candidate_prompt_id?: string
+    master_version_id?: string
+    master_revision?: number
+    review_id?: string
+    review_revision?: number
+    source_status: 'ready' | 'historical_debt' | 'missing' | 'unavailable'
+    source_reason?: string
+  }
   title: string
   scene_code: string
   dialogue: string
@@ -845,13 +867,52 @@ export type CandidateReview = {
   stale: boolean
   can_select: boolean
   created_at?: string
+  history?: CandidateReview[]
+}
+
+export type CandidateComparison = {
+  candidate_id: string
+  label: string
+  selected: boolean
+  status: string
+  trace: {
+    evidence_status: 'verified' | 'historical_debt'
+    debt_reason?: string
+    prompt?: string
+    seed?: string | number
+    spec: { width?: number; height?: number; actual_seconds?: number }
+    plan_hash?: string
+    h3_project?: string
+    prompt_id?: string
+    candidate_id?: string
+    media: { output_file?: string; file_exists: boolean; size_bytes?: number }
+  }
+}
+
+export type CandidateMasterVersion = {
+  id: string
+  revision: number
+  candidate_id: string
+  candidate_snapshot: Record<string, unknown>
+  action: 'select' | 'rollback'
+  rollback_of_revision?: number
+  review_id: string
+  review_revision: number
+  note: string
+  created_at: string
+  current: boolean
 }
 
 export type ReviewWorkspace = {
   shot_id: string
   reviews: CandidateReview[]
+  comparison: CandidateComparison[]
+  master_versions: CandidateMasterVersion[]
+  selected_debt: { active: boolean; candidate_id?: string; message?: string }
   summary: {
     candidate_count: number
+    comparable_count: number
+    evidence_debt_count: number
     passed_count: number
     needs_changes_count: number
     rejected_count: number
@@ -896,6 +957,21 @@ export type ProductionBatchItem = {
   updated_at: string
   started_at?: string
   completed_at?: string
+  attempt_history: Array<{
+    id: string
+    attempt: number
+    state: 'submitting' | 'running' | 'completed' | 'failed' | 'submission_unknown'
+    plan_hash: string
+    plan_snapshot: PromptPlan
+    h3_project?: string
+    prompt_ids: string[]
+    candidate_ids: string[]
+    source_snapshot: Record<string, unknown>
+    media_evidence: Array<{ candidate_id: string; prompt_id?: string; seed?: number; status: string; output_file?: string; file_exists: boolean; size_bytes?: number }>
+    error?: string
+    created_at: string
+    completed_at?: string
+  }>
 }
 
 export type ProductionBatchEvent = {
@@ -918,7 +994,7 @@ export type ProductionBatch = {
   completed_count: number
   failed_count: number
   cancelled_count: number
-  config: { concurrency: number; candidate_total: number; snapshot_policy: string }
+  config: { concurrency: number; candidate_total: number; snapshot_policy: string; minimum_candidates_per_shot?: number; resolution_policy?: string }
   message: string
   created_at: string
   updated_at: string

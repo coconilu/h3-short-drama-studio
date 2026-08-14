@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import subprocess
@@ -56,6 +57,23 @@ def init_review_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_candidate_reviews_latest
           ON candidate_reviews(candidate_id, revision DESC);
+        CREATE TABLE IF NOT EXISTS candidate_master_versions (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          shot_id TEXT NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL,
+          candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE RESTRICT,
+          action TEXT NOT NULL CHECK(action IN ('select', 'rollback')),
+          rollback_of_revision INTEGER,
+          review_id TEXT NOT NULL REFERENCES candidate_reviews(id) ON DELETE RESTRICT,
+          review_revision INTEGER NOT NULL,
+          note TEXT NOT NULL,
+          candidate_snapshot TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(shot_id, revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_master_versions_shot
+          ON candidate_master_versions(shot_id, revision DESC);
         """
     )
     columns = {row[1] for row in db.execute("PRAGMA table_info(candidate_reviews)").fetchall()}
@@ -184,6 +202,13 @@ class CandidateReviewRequest(BaseModel):
     watched_seconds: float = Field(0, ge=0, le=3600)
 
 
+class CandidateMasterRollbackRequest(BaseModel):
+    target_revision: int = Field(ge=1)
+    base_revision: int = Field(ge=1)
+    note: str = Field(min_length=2, max_length=2000)
+    confirm: bool = False
+
+
 def _active_project(db: sqlite3.Connection) -> dict[str, Any]:
     setting = db.execute("SELECT value FROM workspace_settings WHERE key = 'active_project_id'").fetchone()
     if not setting:
@@ -196,6 +221,10 @@ def _active_project(db: sqlite3.Connection) -> dict[str, Any]:
 
 def _candidate_snapshot(candidate: dict[str, Any], path: Path) -> dict[str, Any]:
     stat = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
     return {
         "candidate_id": candidate["id"],
         "shot_id": candidate["shot_id"],
@@ -204,6 +233,7 @@ def _candidate_snapshot(candidate: dict[str, Any], path: Path) -> dict[str, Any]
         "output_file": str(path),
         "size_bytes": stat.st_size,
         "modified_ns": stat.st_mtime_ns,
+        "checksum_sha256": digest.hexdigest(),
     }
 
 
@@ -237,7 +267,10 @@ def _review_public(review: sqlite3.Row | dict[str, Any] | None, candidate: dict[
     try:
         path = _allowed_candidate_path(candidate, output_root)
         current = _candidate_snapshot(candidate, path)
-        stale = any(current.get(key) != snapshot.get(key) for key in ("output_file", "size_bytes", "modified_ns", "prompt_id"))
+        stale = any(
+            current.get(key) != snapshot.get(key)
+            for key in ("output_file", "size_bytes", "modified_ns", "prompt_id", "checksum_sha256")
+        )
     except HTTPException:
         stale = True
     item["status"] = "stale" if stale else "reviewed"
@@ -261,6 +294,91 @@ def latest_candidate_review(db_path: Path, candidate_id: str, output_root: Path)
         return _review_public(review, candidate, output_root)
 
 
+def _review_history(
+    db: sqlite3.Connection, candidate: dict[str, Any], output_root: Path,
+) -> list[dict[str, Any]]:
+    return [
+        _review_public(review, candidate, output_root)
+        for review in db.execute(
+            "SELECT * FROM candidate_reviews WHERE candidate_id = ? ORDER BY revision DESC", (candidate["id"],),
+        ).fetchall()
+    ]
+
+
+def _candidate_trace(
+    db: sqlite3.Connection, candidate: dict[str, Any], output_root: Path,
+) -> dict[str, Any]:
+    media_path: Path | None = None
+    media_reason: str | None = None
+    try:
+        media_path = _allowed_candidate_path(candidate, output_root)
+    except HTTPException as exc:
+        media_reason = str(exc.detail)
+    metadata = {}
+    try:
+        metadata = json.loads(candidate.get("metadata") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        pass
+    job: dict[str, Any] | None = None
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone():
+        for job_row in db.execute(
+            "SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft' ORDER BY id DESC", (candidate["shot_id"],),
+        ).fetchall():
+            current = dict(job_row)
+            try:
+                prompt_ids = json.loads(current.get("prompt_ids") or "[]")
+                candidate_ids = json.loads(current.get("candidate_ids") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                prompt_ids, candidate_ids = [], []
+            if candidate.get("prompt_id") in prompt_ids or candidate.get("external_id") in candidate_ids:
+                job = current
+                break
+    source_snapshot = {}
+    if job:
+        try:
+            source_snapshot = json.loads(job.get("source_snapshot") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            pass
+    return {
+        "evidence_status": "verified" if media_path else "historical_debt",
+        "debt_reason": media_reason,
+        "prompt": metadata.get("prompt") or source_snapshot.get("prompt"),
+        "seed": candidate.get("seed"),
+        "spec": {
+            "width": metadata.get("width"),
+            "height": metadata.get("height"),
+            "actual_seconds": metadata.get("actual_seconds"),
+        },
+        "plan_hash": job.get("plan_hash") if job else None,
+        "h3_project": job.get("h3_project") if job else None,
+        "prompt_id": candidate.get("prompt_id"),
+        "candidate_id": candidate.get("external_id"),
+        "media": {
+            "output_file": str(media_path) if media_path else candidate.get("output_file"),
+            "file_exists": bool(media_path),
+            "size_bytes": media_path.stat().st_size if media_path else None,
+        },
+    }
+
+
+def _master_versions(db: sqlite3.Connection, shot_id: str) -> list[dict[str, Any]]:
+    versions = []
+    for row in db.execute(
+        """SELECT versions.*, candidates.label, candidates.status AS candidate_status,
+        candidates.selected AS candidate_selected
+        FROM candidate_master_versions versions JOIN candidates ON candidates.id = versions.candidate_id
+        WHERE versions.shot_id = ? ORDER BY versions.revision DESC""",
+        (shot_id,),
+    ).fetchall():
+        item = dict(row)
+        item["candidate_snapshot"] = json.loads(item.get("candidate_snapshot") or "{}")
+        item["current"] = False
+        versions.append(item)
+    if versions and versions[0].get("candidate_selected"):
+        versions[0]["current"] = True
+    return versions
+
+
 def review_workspace(db_path: Path, shot_id: str, output_root: Path) -> dict[str, Any]:
     with closing(connect(db_path)) as db:
         project = _active_project(db)
@@ -275,17 +393,36 @@ def review_workspace(db_path: Path, shot_id: str, output_root: Path) -> dict[str
             ).fetchall()
         ]
         reviews: list[dict[str, Any]] = []
+        comparison: list[dict[str, Any]] = []
         for candidate in candidates:
-            latest = db.execute(
-                "SELECT * FROM candidate_reviews WHERE candidate_id = ? ORDER BY revision DESC LIMIT 1",
-                (candidate["id"],),
-            ).fetchone()
-            reviews.append(_review_public(latest, candidate, output_root))
+            history = _review_history(db, candidate, output_root)
+            latest = history[0] if history else _review_public(None, candidate, output_root)
+            latest["history"] = history
+            reviews.append(latest)
+            comparison.append({
+                "candidate_id": candidate["id"],
+                "label": candidate.get("label"),
+                "selected": bool(candidate.get("selected")),
+                "status": candidate.get("status"),
+                "trace": _candidate_trace(db, candidate, output_root),
+            })
+        masters = _master_versions(db, shot_id)
+        legacy_selected = next((candidate for candidate in candidates if candidate.get("selected")), None)
+        selected_debt = bool(legacy_selected and not masters)
         return {
             "shot_id": shot_id,
             "reviews": reviews,
+            "comparison": comparison,
+            "master_versions": masters,
+            "selected_debt": {
+                "active": selected_debt,
+                "candidate_id": legacy_selected["id"] if selected_debt else None,
+                "message": "历史母版没有 append-only 选择凭证；保留可用，但下一次切换必须通过结构化审片。" if selected_debt else None,
+            },
             "summary": {
                 "candidate_count": len(candidates),
+                "comparable_count": sum(item["trace"]["evidence_status"] == "verified" for item in comparison),
+                "evidence_debt_count": sum(item["trace"]["evidence_status"] == "historical_debt" for item in comparison),
                 "passed_count": sum(item["can_select"] for item in reviews),
                 "needs_changes_count": sum(item.get("decision") == "needs_changes" and not item["stale"] for item in reviews),
                 "rejected_count": sum(item.get("decision") == "reject" and not item["stale"] for item in reviews),
@@ -377,6 +514,110 @@ def require_passed_review(db_path: Path, candidate_id: str, output_root: Path) -
     return review
 
 
+def record_master_selection(
+    db_path: Path,
+    output_root: Path,
+    shot_id: str,
+    candidate_id: str,
+    *,
+    note: str,
+    base_revision: int | None = None,
+    action: Literal["select", "rollback"] = "select",
+    rollback_of_revision: int | None = None,
+) -> dict[str, Any]:
+    passed = require_passed_review(db_path, candidate_id, output_root)
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        project = _active_project(db)
+        candidate_row = db.execute(
+            """SELECT candidates.* FROM candidates JOIN shots ON shots.id = candidates.shot_id
+            WHERE candidates.id = ? AND candidates.shot_id = ? AND shots.project_id = ?
+            AND candidates.archived = 0""",
+            (candidate_id, shot_id, project["id"]),
+        ).fetchone()
+        if not candidate_row:
+            raise HTTPException(404, "当前镜头中没有这个候选")
+        candidate = dict(candidate_row)
+        current_revision = int(db.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM candidate_master_versions WHERE shot_id = ?", (shot_id,),
+        ).fetchone()[0])
+        if base_revision is not None and base_revision != current_revision:
+            raise HTTPException(409, f"草稿母版已变化，当前修订为 {current_revision}")
+
+        comparable = 0
+        for row in db.execute(
+            "SELECT * FROM candidates WHERE shot_id = ? AND archived = 0 AND status = 'completed'", (shot_id,),
+        ).fetchall():
+            try:
+                _allowed_candidate_path(dict(row), output_root)
+                comparable += 1
+            except HTTPException:
+                continue
+        if comparable < 2:
+            raise HTTPException(409, "至少需要 2 条有真实媒体证据的完成候选，才能选择草稿母版")
+
+        latest_review = db.execute(
+            "SELECT * FROM candidate_reviews WHERE candidate_id = ? ORDER BY revision DESC LIMIT 1", (candidate_id,),
+        ).fetchone()
+        if not latest_review or int(latest_review["revision"]) != int(passed["revision"]):
+            raise HTTPException(409, "审片结论已变化，请刷新后再选择")
+        snapshot = _candidate_snapshot(candidate, _allowed_candidate_path(candidate, output_root))
+        now = utc_now()
+        next_revision = current_revision + 1
+        version_id = f"candidate-master-{uuid.uuid4().hex[:12]}"
+        db.execute("UPDATE candidates SET selected = 0 WHERE shot_id = ?", (shot_id,))
+        db.execute("UPDATE candidates SET selected = 1, note = ? WHERE id = ?", (note.strip(), candidate_id))
+        db.execute(
+            "UPDATE shots SET status = '草稿已选', updated_at = ? WHERE id = ? AND project_id = ?",
+            (now, shot_id, project["id"]),
+        )
+        db.execute(
+            """INSERT INTO candidate_master_versions
+            (id, project_id, shot_id, revision, candidate_id, action, rollback_of_revision,
+             review_id, review_revision, note, candidate_snapshot, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                version_id, project["id"], shot_id, next_revision, candidate_id, action, rollback_of_revision,
+                latest_review["id"], latest_review["revision"], note.strip(),
+                json.dumps(snapshot, ensure_ascii=False, sort_keys=True), now,
+            ),
+        )
+        db.commit()
+        result = dict(db.execute(
+            "SELECT * FROM candidate_master_versions WHERE id = ?", (version_id,),
+        ).fetchone())
+        result["candidate_snapshot"] = json.loads(result["candidate_snapshot"])
+        result["current"] = True
+        return result
+
+
+def rollback_master_selection(
+    db_path: Path, output_root: Path, shot_id: str, payload: CandidateMasterRollbackRequest,
+) -> dict[str, Any]:
+    if not payload.confirm:
+        raise HTTPException(400, "回滚草稿母版前必须显式确认")
+    with closing(connect(db_path)) as db:
+        project = _active_project(db)
+        target = db.execute(
+            """SELECT * FROM candidate_master_versions
+            WHERE shot_id = ? AND project_id = ? AND revision = ?""",
+            (shot_id, project["id"], payload.target_revision),
+        ).fetchone()
+        if not target:
+            raise HTTPException(404, "目标草稿母版版本不存在")
+        target_candidate = target["candidate_id"]
+    return record_master_selection(
+        db_path,
+        output_root,
+        shot_id,
+        target_candidate,
+        note=payload.note,
+        base_revision=payload.base_revision,
+        action="rollback",
+        rollback_of_revision=payload.target_revision,
+    )
+
+
 def create_review_router(db_path: Path, output_root: Path) -> APIRouter:
     router = APIRouter()
 
@@ -387,5 +628,9 @@ def create_review_router(db_path: Path, output_root: Path) -> APIRouter:
     @router.post("/api/shots/{shot_id}/candidate-reviews")
     def api_save_review(shot_id: str, payload: CandidateReviewRequest) -> dict[str, Any]:
         return save_candidate_review(db_path, output_root, shot_id, payload)
+
+    @router.post("/api/shots/{shot_id}/candidate-master/rollback")
+    def api_rollback_master(shot_id: str, payload: CandidateMasterRollbackRequest) -> dict[str, Any]:
+        return rollback_master_selection(db_path, output_root, shot_id, payload)
 
     return router

@@ -107,6 +107,53 @@ class ProjectArchiveTests(unittest.TestCase):
         self.assertEqual(result["state"], "invalid")
         self.assertIn("SHA-256", result["errors"][0])
 
+    def test_archive_contains_candidate_master_and_generation_attempt_history(self) -> None:
+        shot_id = self.project["shots"][0]["id"]
+        now = studio.utc_now()
+        with closing(studio.connect()) as db:
+            db.execute(
+                """INSERT INTO candidates
+                (id, shot_id, label, seed, created_at, thumbnail, selected, scores, note, status, source, archived, metadata)
+                VALUES ('c1', ?, 'A', 42, ?, '', 1, '{}', '', 'completed', 'h3', 0, '{}')""",
+                (shot_id, now),
+            )
+            db.execute(
+                """INSERT INTO candidate_reviews
+                (id, candidate_id, shot_id, project_id, revision, decision, scores, issues, note,
+                 watched_seconds, candidate_snapshot, media_probe, created_at)
+                VALUES ('r1', 'c1', ?, ?, 1, 'pass', '{}', '[]', '', 5, '{}', '{}', ?)""",
+                (shot_id, self.project["id"], now),
+            )
+            db.execute(
+                """INSERT INTO candidate_master_versions
+                (id, project_id, shot_id, revision, candidate_id, action, review_id, review_revision,
+                 note, candidate_snapshot, created_at)
+                VALUES ('m1', ?, ?, 1, 'c1', 'select', 'r1', 1, 'master', '{}', ?)""",
+                (self.project["id"], shot_id, now),
+            )
+            db.execute(
+                """INSERT INTO production_batches
+                (id, project_id, name, state, item_count, config, message, created_at, updated_at)
+                VALUES ('b1', ?, 'batch', 'completed', 1, '{}', 'done', ?, ?)""",
+                (self.project["id"], now, now),
+            )
+            db.execute(
+                """INSERT INTO production_batch_items
+                (id, batch_id, shot_id, ordinal, title, state, plan_hash, plan_snapshot, message, created_at, updated_at)
+                VALUES ('i1', 'b1', ?, 1, 'shot', 'completed', ?, '{}', 'done', ?, ?)""",
+                (shot_id, "a" * 64, now, now),
+            )
+            db.execute(
+                """INSERT INTO production_item_attempts
+                (id, item_id, batch_id, shot_id, attempt, state, plan_hash, plan_snapshot, created_at, updated_at)
+                VALUES ('a1', 'i1', 'b1', ?, 1, 'completed', ?, '{}', ?, ?)""",
+                (shot_id, "a" * 64, now, now),
+            )
+            db.commit()
+        archive = create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
+        self.assertEqual(archive["row_counts"]["candidate_master_versions"], 1)
+        self.assertEqual(archive["row_counts"]["production_item_attempts"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,16 @@ class ProductionSchedulerTests(unittest.TestCase):
                   id TEXT PRIMARY KEY, shot_id TEXT NOT NULL, project_id TEXT NOT NULL,
                   plan_hash TEXT NOT NULL, status TEXT NOT NULL
                 );
+                CREATE TABLE jobs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, shot_id TEXT NOT NULL, kind TEXT NOT NULL,
+                  state TEXT NOT NULL, h3_project TEXT, prompt_ids TEXT NOT NULL DEFAULT '[]',
+                  candidate_ids TEXT NOT NULL DEFAULT '[]', source_snapshot TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE candidates (
+                  id TEXT PRIMARY KEY, shot_id TEXT NOT NULL, external_id TEXT, prompt_id TEXT, seed INTEGER,
+                  status TEXT NOT NULL, output_file TEXT, elapsed_seconds REAL, metadata TEXT NOT NULL DEFAULT '{}',
+                  archived INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+                );
                 """
             )
             db.execute("INSERT INTO projects VALUES ('p1', '测试剧', 'EP01', 'logline', 60, 'now')")
@@ -49,6 +59,8 @@ class ProductionSchedulerTests(unittest.TestCase):
             init_production_schema(db)
             db.commit()
         self.hashes = {"s1": "a" * 64, "s2": "b" * 64}
+        self.candidate_counts = {"s1": 2, "s2": 2}
+        self.resolutions = {"s1": "608×352", "s2": "608×352"}
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -60,7 +72,10 @@ class ProductionSchedulerTests(unittest.TestCase):
             "status": "approved",
             "ready": True,
             "mode": "FL2VA",
-            "spec": {"candidate_count": 2},
+            "spec": {
+                "candidate_count": self.candidate_counts[shot_id],
+                "resolution": self.resolutions[shot_id],
+            },
         }
 
     def make_batch(self) -> dict:
@@ -105,6 +120,8 @@ class ProductionSchedulerTests(unittest.TestCase):
         self.assertEqual(finished["state"], "completed")
         self.assertEqual(finished["completed_count"], 2)
         self.assertEqual(finished["submitted_count"], 2)
+        self.assertEqual(finished["items"][0]["attempt_history"][0]["state"], "completed")
+        self.assertEqual(finished["items"][0]["attempt_history"][0]["plan_hash"], "a" * 64)
 
     def test_pause_resume_and_cancel_never_cancel_a_running_gpu_job(self) -> None:
         batch = self.make_batch()
@@ -153,6 +170,43 @@ class ProductionSchedulerTests(unittest.TestCase):
         self.assertEqual(current["items"][0]["state"], "failed")
         with self.assertRaises(Exception):
             retry_item(self.db_path, current["items"][0]["id"], self.plan)
+
+    def test_batch_requires_two_low_resolution_candidates_per_shot(self) -> None:
+        self.candidate_counts["s1"] = 1
+        with self.assertRaises(Exception):
+            self.make_batch()
+        self.candidate_counts["s1"] = 2
+        self.resolutions["s1"] = "1344×768"
+        with self.assertRaises(Exception):
+            self.make_batch()
+
+    def test_attempt_persists_prompt_candidate_and_real_media_evidence(self) -> None:
+        video = Path(self.temp_dir.name) / "candidate.mp4"
+        video.write_bytes(b"controlled-fake-media")
+        batch = self.make_batch()
+        item = claim_next_item(self.db_path)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute(
+                "INSERT INTO jobs (shot_id, kind, state, h3_project, prompt_ids, candidate_ids, source_snapshot) VALUES (?, 'draft', '完成', ?, ?, ?, ?)",
+                ("s1", "h3-s1", '["prompt-s1"]', '["draft-1"]', '{"prompt":"frozen prompt","seed":42}'),
+            )
+            db.execute(
+                "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, 'completed', ?, 12.5, ?, 0, 'now')",
+                ("s1-draft-1", "s1", "draft-1", "prompt-s1", 42, str(video), '{"width":608,"height":352}'),
+            )
+            db.commit()
+        submit_claimed_item(
+            self.db_path,
+            item,
+            self.plan,
+            lambda _: {"state": "完成", "message": "完成", "h3_project": "h3-s1", "prompt_ids": ["prompt-s1"]},
+        )
+        attempt = get_batch(self.db_path, batch["id"])["items"][0]["attempt_history"][0]
+        self.assertEqual(attempt["prompt_ids"], ["prompt-s1"])
+        self.assertEqual(attempt["candidate_ids"], ["draft-1"])
+        self.assertEqual(attempt["source_snapshot"]["seed"], 42)
+        self.assertTrue(attempt["media_evidence"][0]["file_exists"])
+        self.assertEqual(attempt["media_evidence"][0]["size_bytes"], len(b"controlled-fake-media"))
 
 
 if __name__ == "__main__":

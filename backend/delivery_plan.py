@@ -45,6 +45,13 @@ def init_delivery_schema(db: sqlite3.Connection) -> None:
           subtitle_enabled INTEGER NOT NULL,
           subtitle_start_seconds REAL,
           transition TEXT NOT NULL DEFAULT 'cut' CHECK(transition = 'cut'),
+          in_point_seconds REAL NOT NULL DEFAULT 0,
+          out_point_seconds REAL,
+          dialogue_mode TEXT NOT NULL DEFAULT 'original' CHECK(dialogue_mode IN ('original', 'mute')),
+          section_id TEXT,
+          candidate_id TEXT,
+          master_version_id TEXT,
+          source_snapshot TEXT NOT NULL DEFAULT '{}',
           PRIMARY KEY(plan_id, shot_id),
           UNIQUE(plan_id, ordinal)
         );
@@ -63,6 +70,19 @@ def init_delivery_schema(db: sqlite3.Connection) -> None:
           ON delivery_plan_versions(plan_id, revision DESC);
         """
     )
+    columns = {row[1] for row in db.execute("PRAGMA table_info(delivery_plan_items)").fetchall()}
+    migrations = (
+        ("in_point_seconds", "REAL NOT NULL DEFAULT 0"),
+        ("out_point_seconds", "REAL"),
+        ("dialogue_mode", "TEXT NOT NULL DEFAULT 'original'"),
+        ("section_id", "TEXT"),
+        ("candidate_id", "TEXT"),
+        ("master_version_id", "TEXT"),
+        ("source_snapshot", "TEXT NOT NULL DEFAULT '{}'"),
+    )
+    for column, definition in migrations:
+        if column not in columns:
+            db.execute(f"ALTER TABLE delivery_plan_items ADD COLUMN {column} {definition}")
 
 
 class DeliveryPlanItemInput(BaseModel):
@@ -70,6 +90,9 @@ class DeliveryPlanItemInput(BaseModel):
     subtitle_enabled: bool = True
     subtitle_start_seconds: float | None = Field(None, ge=0, le=30)
     transition: Literal["cut"] = "cut"
+    in_point_seconds: float = Field(0, ge=0, le=30)
+    out_point_seconds: float | None = Field(None, gt=0, le=30)
+    dialogue_mode: Literal["original", "mute"] = "original"
 
 
 class DeliveryPlanPatch(BaseModel):
@@ -91,32 +114,102 @@ def _active_project(db: sqlite3.Connection) -> dict[str, Any]:
     return dict(project)
 
 
-def _default_items(db: sqlite3.Connection, project_id: str) -> list[dict[str, Any]]:
+def _table_exists(db: sqlite3.Connection, table: str) -> bool:
+    return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone())
+
+
+def _source_for_shot(db: sqlite3.Connection, shot_id: str) -> dict[str, Any]:
+    if not _table_exists(db, "candidates"):
+        return {
+            "candidate_id": None, "master_version_id": None, "section_id": None,
+            "source_status": "unavailable", "source_reason": "旧数据库没有候选追溯表",
+        }
+    candidate = db.execute(
+        "SELECT * FROM candidates WHERE shot_id = ? AND selected = 1 AND archived = 0", (shot_id,),
+    ).fetchone()
+    mapping = None
+    if _table_exists(db, "creative_storyboard_links"):
+        mapping = db.execute(
+            "SELECT section_id, last_synced_revision FROM creative_storyboard_links WHERE shot_id = ?", (shot_id,),
+        ).fetchone()
+    master = None
+    if candidate and _table_exists(db, "candidate_master_versions"):
+        master = db.execute(
+            """SELECT id, revision, review_id, review_revision, candidate_snapshot, created_at
+            FROM candidate_master_versions WHERE shot_id = ? AND candidate_id = ? ORDER BY revision DESC LIMIT 1""",
+            (shot_id, candidate["id"]),
+        ).fetchone()
+    source_status = "ready" if candidate and master else "historical_debt" if candidate else "missing"
+    source_reason = None
+    if not candidate:
+        source_reason = "镜头尚未选择草稿母版"
+    elif not master:
+        source_reason = "历史已选候选没有 append-only 母版版本"
+    return {
+        "section_id": mapping["section_id"] if mapping else None,
+        "storyboard_revision": mapping["last_synced_revision"] if mapping else None,
+        "shot_id": shot_id,
+        "candidate_id": candidate["id"] if candidate else None,
+        "candidate_external_id": candidate["external_id"] if candidate and "external_id" in candidate.keys() else None,
+        "candidate_prompt_id": candidate["prompt_id"] if candidate and "prompt_id" in candidate.keys() else None,
+        "master_version_id": master["id"] if master else None,
+        "master_revision": master["revision"] if master else None,
+        "review_id": master["review_id"] if master else None,
+        "review_revision": master["review_revision"] if master else None,
+        "source_status": source_status,
+        "source_reason": source_reason,
+    }
+
+
+def _bind_sources(db: sqlite3.Connection, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
+        {
+            **item,
+            **{
+                "section_id": source["section_id"],
+                "candidate_id": source["candidate_id"],
+                "master_version_id": source["master_version_id"],
+                "source_snapshot": source,
+            },
+        }
+        for item in items
+        for source in [_source_for_shot(db, item["shot_id"])]
+    ]
+
+
+def _default_items(db: sqlite3.Connection, project_id: str) -> list[dict[str, Any]]:
+    items = [
         {
             "shot_id": shot["id"], "ordinal": index,
             "subtitle_enabled": bool(shot["dialogue"] and shot["subtitle_enabled"]),
             "subtitle_start_seconds": shot["subtitle_start_seconds"] if shot["dialogue"] else None, "transition": "cut",
             "title": shot["title"], "scene_code": shot["scene_code"], "dialogue": shot["dialogue"],
             "seconds": shot["seconds"], "shot_status": shot["status"],
+            "in_point_seconds": 0.0, "out_point_seconds": shot["seconds"], "dialogue_mode": "original",
         }
         for index, shot in enumerate(
             db.execute("SELECT * FROM shots WHERE project_id = ? ORDER BY ordinal, id", (project_id,)).fetchall(),
             start=1,
         )
     ]
+    return _bind_sources(db, items)
 
 
 def _plan_items(db: sqlite3.Connection, plan_id: str) -> list[dict[str, Any]]:
-    return [
-        {**dict(row), "subtitle_enabled": bool(row["subtitle_enabled"])}
-        for row in db.execute(
+    items = []
+    for row in db.execute(
             """SELECT items.*, shots.title, shots.scene_code, shots.dialogue, shots.seconds, shots.status AS shot_status
             FROM delivery_plan_items items JOIN shots ON shots.id = items.shot_id
             WHERE items.plan_id = ? ORDER BY items.ordinal""",
             (plan_id,),
-        ).fetchall()
-    ]
+        ).fetchall():
+        item = {**dict(row), "subtitle_enabled": bool(row["subtitle_enabled"])}
+        try:
+            item["source_snapshot"] = json.loads(item.get("source_snapshot") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            item["source_snapshot"] = {}
+        items.append(item)
+    return items
 
 
 def _hash_items(items: list[dict[str, Any]]) -> str:
@@ -125,6 +218,12 @@ def _hash_items(items: list[dict[str, Any]]) -> str:
             "shot_id": item["shot_id"], "ordinal": item["ordinal"],
             "subtitle_enabled": bool(item["subtitle_enabled"]),
             "subtitle_start_seconds": item.get("subtitle_start_seconds"), "transition": item.get("transition", "cut"),
+            "in_point_seconds": item.get("in_point_seconds", 0),
+            "out_point_seconds": item.get("out_point_seconds"),
+            "dialogue_mode": item.get("dialogue_mode", "original"),
+            "section_id": item.get("section_id"),
+            "candidate_id": item.get("candidate_id"),
+            "master_version_id": item.get("master_version_id"),
         }
         for item in items
     ]
@@ -156,6 +255,31 @@ def _validate_items(db: sqlite3.Connection, project_id: str, items: list[dict[st
         start = item.get("subtitle_start_seconds")
         if start is not None and float(start) >= float(current[item["shot_id"]]["seconds"]):
             raise HTTPException(422, f"镜头“{current[item['shot_id']]['title']}”字幕起点必须早于镜头时长")
+        in_point = float(item.get("in_point_seconds") or 0)
+        out_point = float(item.get("out_point_seconds") or current[item["shot_id"]]["seconds"])
+        if in_point >= out_point or out_point > float(current[item["shot_id"]]["seconds"]) + 0.001:
+            raise HTTPException(422, f"镜头“{current[item['shot_id']]['title']}”入出点必须位于候选时长内且入点早于出点")
+        item["in_point_seconds"] = in_point
+        item["out_point_seconds"] = out_point
+
+
+def _validate_locked_sources(db: sqlite3.Connection, items: list[dict[str, Any]]) -> None:
+    if not _table_exists(db, "candidate_master_versions"):
+        return
+    issues: list[str] = []
+    for item in items:
+        current = _source_for_shot(db, item["shot_id"])
+        if current["source_status"] != "ready":
+            issues.append(f"{item['title']}：{current['source_reason']}")
+            continue
+        if (
+            item.get("candidate_id") != current["candidate_id"]
+            or item.get("master_version_id") != current["master_version_id"]
+            or item.get("section_id") != current["section_id"]
+        ):
+            issues.append(f"{item['title']}：母版或小节映射已变化，请重新保存装配草稿")
+    if issues:
+        raise HTTPException(409, {"message": "装配来源门禁未通过", "issues": issues})
 
 
 def _snapshot(plan: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -220,7 +344,9 @@ def save_delivery_plan(db_path: Path, payload: DeliveryPlanPatch) -> dict[str, A
             raise HTTPException(409, "已锁定装配不能直接修改，请先创建新修订")
         raw_items = [item.model_dump() for item in payload.items]
         _validate_items(db, project["id"], raw_items)
-        items = [{**item, "ordinal": index} for index, item in enumerate(raw_items, start=1)]
+        items = _bind_sources(
+            db, [{**item, "ordinal": index} for index, item in enumerate(raw_items, start=1)],
+        )
         plan_hash = _hash_items(items)
         now = utc_now()
         if current:
@@ -243,11 +369,16 @@ def save_delivery_plan(db_path: Path, payload: DeliveryPlanPatch) -> dict[str, A
         for item in items:
             db.execute(
                 """INSERT INTO delivery_plan_items
-                (plan_id, shot_id, ordinal, subtitle_enabled, subtitle_start_seconds, transition)
-                VALUES (?, ?, ?, ?, ?, ?)""",
+                (plan_id, shot_id, ordinal, subtitle_enabled, subtitle_start_seconds, transition,
+                 in_point_seconds, out_point_seconds, dialogue_mode, section_id, candidate_id,
+                 master_version_id, source_snapshot)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     plan_id, item["shot_id"], item["ordinal"], int(item["subtitle_enabled"]),
-                    item["subtitle_start_seconds"], item["transition"],
+                    item["subtitle_start_seconds"], item["transition"], item["in_point_seconds"],
+                    item["out_point_seconds"], item["dialogue_mode"], item.get("section_id"),
+                    item.get("candidate_id"), item.get("master_version_id"),
+                    json.dumps(item.get("source_snapshot") or {}, ensure_ascii=False, sort_keys=True),
                 ),
             )
         plan = dict(db.execute("SELECT * FROM delivery_plans WHERE id = ?", (plan_id,)).fetchone())
@@ -269,6 +400,7 @@ def lock_delivery_plan(db_path: Path, base_revision: int) -> dict[str, Any]:
             return delivery_workspace(db_path)
         items = _plan_items(db, current["id"])
         _validate_items(db, project["id"], items)
+        _validate_locked_sources(db, items)
         now = utc_now()
         revision = current["revision"] + 1
         db.execute(
