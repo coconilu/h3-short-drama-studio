@@ -47,6 +47,7 @@ export type Shot = {
   title: string
   description: string
   dialogue: string
+  sound: string
   prompt: string
   status: string
   width: number
@@ -59,6 +60,13 @@ export type Shot = {
   subtitle_enabled: number
   subtitle_start_seconds?: number
   final_output?: Promotion
+  source_mapping?: {
+    shot_id: string
+    section_id: string
+    section_title: string
+    last_synced_revision: number
+    current_section_revision: number
+  }
 }
 
 export type Promotion = {
@@ -148,9 +156,16 @@ export type CreativeSection = {
   title: string
   summary: string
   content: string
+  scene: string
+  action: string
+  dialogue: string
+  sound: string
+  visual: string
   pacing_goal: string
   planned_seconds: number
   status: 'draft' | 'approved'
+  review_note: string
+  approved_at?: string
   revision: number
   version_count: number
   created_at: string
@@ -188,6 +203,51 @@ export type CreativePlanningWorkspace = {
     ready: boolean
   }
   next_actions: Array<{ id: string; label: string; complete: boolean; action: string }>
+}
+
+export type CreativeStoryboardAction =
+  | 'create' | 'update' | 'delete' | 'reorder' | 'unchanged' | 'protected' | 'preserve'
+
+export type CreativeStoryboardFieldDiff = {
+  field: 'title' | 'description' | 'dialogue' | 'sound' | 'seconds' | 'ordinal'
+  label: string
+  before: string | number | null
+  after: string | number | null
+  changed: boolean
+  decision: 'create' | 'update' | 'delete' | 'protected' | 'keep'
+}
+
+export type CreativeStoryboardRow = {
+  action: CreativeStoryboardAction
+  section: null | {
+    id: string
+    chapter_id?: string
+    chapter_title?: string
+    title?: string
+    status: 'draft' | 'approved' | 'archived'
+    revision?: number
+  }
+  shot_id?: string
+  mapping_id?: string
+  current?: Record<string, string | number | null>
+  proposed?: Record<string, string | number | null>
+  field_diffs: CreativeStoryboardFieldDiff[]
+  protected_reasons: string[]
+}
+
+export type CreativeStoryboardPreview = {
+  project_id: string
+  plan_hash: string
+  rows: CreativeStoryboardRow[]
+  blockers: string[]
+  can_apply: boolean
+  summary: Record<CreativeStoryboardAction, number>
+  section_revisions: Record<string, number>
+  safety: {
+    preview_has_side_effects: false
+    explicit_confirmation_required: true
+    historical_manual_shots_preserved: true
+  }
 }
 
 export type CreativeRevisionHistory = {
@@ -433,6 +493,9 @@ export type BibleEntry = {
   archived: boolean
   created_at: string
   updated_at: string
+  source_type?: 'manual' | 'creative_character'
+  source_id?: string
+  source_revision?: number
   assets: BibleAsset[]
   shots: BibleShotLink[]
   version_count: number
@@ -488,12 +551,16 @@ export type PromptPlanReference = {
 }
 
 export type PromptPlan = {
-  shot: Pick<Shot, 'id' | 'ordinal' | 'scene_code' | 'title' | 'description' | 'dialogue' | 'prompt' | 'width' | 'height' | 'seconds' | 'candidate_count' | 'strategy'>
+  shot: Pick<Shot, 'id' | 'ordinal' | 'scene_code' | 'title' | 'description' | 'dialogue' | 'sound' | 'prompt' | 'width' | 'height' | 'seconds' | 'candidate_count' | 'strategy'>
   plan_hash: string
   ready: boolean
   status: PromptPlanStatus
   validated_at?: string
   approved_at?: string
+  stale: boolean
+  stale_reasons: string[]
+  stale_plan_hash?: string
+  superseded_at?: string
   mode: 'FL2VA' | 'REF2VA'
   sections: Array<{ id: string; label: string; content: string }>
   compiled_prompt: string
@@ -506,7 +573,16 @@ export type PromptPlan = {
     revision: number
     apply_globally: boolean
     asset_ids: string[]
+    source_type?: 'manual' | 'creative_character'
+    source_id?: string
+    source_revision?: number
   }>
+  storyboard_source?: {
+    section_id: string
+    section_title: string
+    last_synced_revision: number
+    current_section_revision: number
+  }
   blocking: string[]
   warnings: string[]
   spec: {
@@ -795,6 +871,10 @@ export type Job = {
   completed_at?: string
   h3_project?: string
   prompt_ids: string[]
+  candidate_ids?: string[]
+  retry_safe?: number
+  reconciliation_snapshot?: string
+  reconciliation_revision?: number
 }
 
 export type ProductionBatchItem = {

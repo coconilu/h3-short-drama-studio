@@ -152,6 +152,12 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
         "creative_sections": creative_sections,
         "creative_revisions": creative_revisions,
         "creative_agent_runs": creative_agent_runs,
+        "creative_storyboard_links": _rows(
+            db, "SELECT * FROM creative_storyboard_links WHERE project_id = ? ORDER BY section_id", (project_id,)
+        ),
+        "creative_storyboard_syncs": _rows(
+            db, "SELECT * FROM creative_storyboard_syncs WHERE project_id = ? ORDER BY applied_at", (project_id,)
+        ),
     }
 
 

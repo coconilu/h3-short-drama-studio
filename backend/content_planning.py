@@ -11,6 +11,13 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+try:
+    from .creative_storyboard import invalidate_sections
+    from .production_bible import archive_creative_character_rules, sync_creative_character_rules
+except ImportError:  # Support `uvicorn app:app` from the backend directory.
+    from creative_storyboard import invalidate_sections
+    from production_bible import archive_creative_character_rules, sync_creative_character_rules
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -100,8 +107,15 @@ def init_content_schema(db: sqlite3.Connection) -> None:
           title TEXT NOT NULL,
           summary TEXT NOT NULL DEFAULT '',
           content TEXT NOT NULL DEFAULT '',
+          scene TEXT NOT NULL DEFAULT '',
+          action TEXT NOT NULL DEFAULT '',
+          dialogue TEXT NOT NULL DEFAULT '',
+          sound TEXT NOT NULL DEFAULT '',
+          visual TEXT NOT NULL DEFAULT '',
           pacing_goal TEXT NOT NULL DEFAULT '',
           planned_seconds REAL NOT NULL DEFAULT 0,
+          review_note TEXT NOT NULL DEFAULT '',
+          approved_at TEXT,
           status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'approved', 'archived')),
           revision INTEGER NOT NULL DEFAULT 1,
           created_at TEXT NOT NULL,
@@ -127,8 +141,22 @@ def init_content_schema(db: sqlite3.Connection) -> None:
         """
     )
     columns = {row[1] for row in db.execute("PRAGMA table_info(creative_sections)").fetchall()}
-    if "content" not in columns:
-        db.execute("ALTER TABLE creative_sections ADD COLUMN content TEXT NOT NULL DEFAULT ''")
+    for name, definition in (
+        ("content", "TEXT NOT NULL DEFAULT ''"),
+        ("scene", "TEXT NOT NULL DEFAULT ''"),
+        ("action", "TEXT NOT NULL DEFAULT ''"),
+        ("dialogue", "TEXT NOT NULL DEFAULT ''"),
+        ("sound", "TEXT NOT NULL DEFAULT ''"),
+        ("visual", "TEXT NOT NULL DEFAULT ''"),
+        ("review_note", "TEXT NOT NULL DEFAULT ''"),
+        ("approved_at", "TEXT"),
+    ):
+        if name not in columns:
+            db.execute(f"ALTER TABLE creative_sections ADD COLUMN {name} {definition}")
+    # Legacy free-form bodies remain available and seed editable structured fields without inventing approval.
+    db.execute("UPDATE creative_sections SET scene = summary WHERE scene = '' AND summary <> ''")
+    db.execute("UPDATE creative_sections SET action = content WHERE action = '' AND content <> ''")
+    db.execute("UPDATE creative_sections SET visual = summary WHERE visual = '' AND summary <> ''")
 
 
 ContentStatus = Literal["draft", "approved"]
@@ -210,6 +238,11 @@ class SectionCreate(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     summary: str = Field("", max_length=6000)
     content: str = Field("", max_length=24000)
+    scene: str = Field("", max_length=6000)
+    action: str = Field("", max_length=12000)
+    dialogue: str = Field("", max_length=12000)
+    sound: str = Field("", max_length=6000)
+    visual: str = Field("", max_length=12000)
     pacing_goal: str = Field("", max_length=1200)
     planned_seconds: float = Field(0, ge=0, le=36000)
     source: str = Field("human:create", min_length=2, max_length=120)
@@ -219,9 +252,18 @@ class SectionUpdate(RevisionBase):
     title: str | None = Field(None, min_length=1, max_length=160)
     summary: str | None = Field(None, max_length=6000)
     content: str | None = Field(None, max_length=24000)
+    scene: str | None = Field(None, max_length=6000)
+    action: str | None = Field(None, max_length=12000)
+    dialogue: str | None = Field(None, max_length=12000)
+    sound: str | None = Field(None, max_length=6000)
+    visual: str | None = Field(None, max_length=12000)
     pacing_goal: str | None = Field(None, max_length=1200)
     planned_seconds: float | None = Field(None, ge=0, le=36000)
     status: ContentStatus | None = None
+
+
+class SectionDecision(RevisionBase):
+    note: str = Field("", max_length=2000)
 
 
 class OrderUpdate(BaseModel):
@@ -270,6 +312,24 @@ def _active_project(db: sqlite3.Connection) -> dict[str, Any]:
 
 def _clean(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value.strip() if isinstance(value, str) else value for key, value in values.items()}
+
+
+def _validate_section_for_approval(section: sqlite3.Row | dict[str, Any]) -> None:
+    item = dict(section)
+    missing = [
+        label
+        for key, label in (
+            ("scene", "场景"),
+            ("action", "动作"),
+            ("sound", "声音提示"),
+            ("visual", "视觉意图"),
+        )
+        if not str(item.get(key) or "").strip()
+    ]
+    if float(item.get("planned_seconds") or 0) <= 0:
+        missing.append("预计时长")
+    if missing:
+        raise HTTPException(422, "批准小节前请补全：" + "、".join(missing))
 
 
 def _row_for_project(
@@ -415,15 +475,19 @@ def _bootstrap_project(db: sqlite3.Connection, project: dict[str, Any]) -> None:
                 section_id = f"section-{uuid.uuid4().hex[:12]}"
                 db.execute(
                     """INSERT INTO creative_sections
-                    (id, project_id, chapter_id, ordinal, title, summary, pacing_goal, planned_seconds,
-                     status, revision, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?)""",
+                    (id, project_id, chapter_id, ordinal, title, summary, content, scene, action, visual,
+                     pacing_goal, planned_seconds, status, revision, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?)""",
                     (
                         section_id,
                         project_id,
                         chapter_id,
                         section_ordinal,
                         scene["title"],
+                        scene["summary"],
+                        scene["content"],
+                        scene["summary"],
+                        scene["content"],
                         scene["summary"],
                         scene["goal"],
                         float(scene["planned_seconds"] or 0),
@@ -457,15 +521,21 @@ def _bootstrap_project(db: sqlite3.Connection, project: dict[str, Any]) -> None:
         section_id = f"section-{uuid.uuid4().hex[:12]}"
         db.execute(
             """INSERT INTO creative_sections
-            (id, project_id, chapter_id, ordinal, title, summary, pacing_goal, planned_seconds,
-             status, revision, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, '承接现有镜头', ?, 'draft', 1, ?, ?)""",
+            (id, project_id, chapter_id, ordinal, title, summary, content, scene, action, dialogue, sound,
+             visual, pacing_goal, planned_seconds, status, revision, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '承接现有镜头', ?, 'draft', 1, ?, ?)""",
             (
                 section_id,
                 project_id,
                 chapter_id,
                 ordinal,
                 shot["title"],
+                shot["description"],
+                shot["prompt"],
+                shot["description"],
+                shot["prompt"],
+                shot["dialogue"],
+                shot["sound"] if "sound" in shot.keys() else "",
                 shot["description"],
                 float(shot["seconds"] or 0),
                 now,
@@ -639,6 +709,17 @@ def _verify_parent_revision(record: sqlite3.Row, expected: int | None, label: st
         raise HTTPException(422, f"{label}操作缺少父级修订前置条件")
     if int(record["revision"]) != int(expected):
         raise HTTPException(409, f"{label}父级已在其他操作中更新，请刷新后重试")
+
+
+def _merge_section_value(first: sqlite3.Row, second: sqlite3.Row, field: str) -> str:
+    """Preserve both section values in narrative order without duplicating identical text."""
+    ordered = sorted((first, second), key=lambda item: (int(item["ordinal"]), str(item["id"])))
+    parts: list[str] = []
+    for item in ordered:
+        value = str(item[field] or "").strip()
+        if value and value not in parts:
+            parts.append(value)
+    return "\n\n".join(parts)
 
 
 def _shift_ordinals(
@@ -842,6 +923,13 @@ def create_content_router(db_path: Path) -> APIRouter:
             values = payload.model_dump(exclude_none=True, exclude={"base_revision", "source"})
             if values:
                 _advance(db, "creative_characters", "character", character_id, project["id"], payload.base_revision, payload.source, values)
+                updated = _row_for_project(db, "creative_characters", character_id, project["id"])
+                if updated["status"] == "approved":
+                    sync_creative_character_rules(db, updated)
+                else:
+                    archive_creative_character_rules(
+                        db, project["id"], character_id, f"角色卡“{updated['name']}”已退回草稿",
+                    )
             db.commit()
         return _workspace(db_path)
 
@@ -850,8 +938,11 @@ def create_content_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _row_for_project(db, "creative_characters", character_id, project["id"])
+            character = _row_for_project(db, "creative_characters", character_id, project["id"])
             _archive_entity(db, "creative_characters", "character", character_id, project["id"], payload)
+            archive_creative_character_rules(
+                db, project["id"], character_id, f"角色卡“{character['name']}”已归档",
+            )
             db.commit()
         return _workspace(db_path)
 
@@ -905,6 +996,9 @@ def create_content_router(db_path: Path) -> APIRouter:
                     db, "creative_sections", "section", section["id"], project["id"], section["revision"],
                     f"{payload.source}:chapter", {"status": "archived"},
                 )
+            invalidate_sections(
+                db, project["id"], f"章节已归档：{chapter_id}", [str(section["id"]) for section in section_rows],
+            )
             _archive_entity(db, "creative_chapters", "chapter", chapter_id, project["id"], payload)
             db.commit()
         return _workspace(db_path)
@@ -921,6 +1015,7 @@ def create_content_router(db_path: Path) -> APIRouter:
             ).fetchall()
             _verify_revision_map(chapters, payload.base_revisions, "章节排序")
             _normalize_order(db, "creative_chapters", "chapter", project["id"], payload.ids, payload.source)
+            invalidate_sections(db, project["id"], "章节顺序已变化")
             db.commit()
         return _workspace(db_path)
 
@@ -939,9 +1034,9 @@ def create_content_router(db_path: Path) -> APIRouter:
             values = _clean(payload.model_dump(exclude={"source"}))
             db.execute(
                 """INSERT INTO creative_sections
-                (id, project_id, chapter_id, ordinal, title, summary, content, pacing_goal, planned_seconds,
-                 status, revision, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?)""",
+                (id, project_id, chapter_id, ordinal, title, summary, content, scene, action, dialogue,
+                 sound, visual, pacing_goal, planned_seconds, status, revision, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?)""",
                 (section_id, project["id"], chapter_id, ordinal, *values.values(), now, now),
             )
             _save_revision(db, project["id"], "section", section_id, payload.source)
@@ -958,10 +1053,50 @@ def create_content_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _row_for_project(db, "creative_sections", section_id, project["id"])
+            current = _row_for_project(db, "creative_sections", section_id, project["id"])
             values = payload.model_dump(exclude_none=True, exclude={"base_revision", "source"})
             if values:
+                production_fields = {"title", "scene", "action", "dialogue", "sound", "visual", "planned_seconds"}
+                if current["status"] == "approved" and production_fields.intersection(values) and values.get("status") != "approved":
+                    values.update({"status": "draft", "review_note": "内容已变化，请重新批准", "approved_at": None})
+                if values.get("status") == "approved":
+                    _validate_section_for_approval({**dict(current), **values})
+                    values.update({"review_note": "", "approved_at": utc_now()})
                 _advance(db, "creative_sections", "section", section_id, project["id"], payload.base_revision, payload.source, values)
+                invalidate_sections(
+                    db, project["id"], f"小节“{current['title']}”内容或批准状态已变化", [section_id],
+                )
+            db.commit()
+        return _workspace(db_path)
+
+    @router.post("/sections/{section_id}/approve")
+    def approve_section(section_id: str, payload: SectionDecision) -> dict[str, Any]:
+        with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            project = _active_project(db)
+            section = _row_for_project(db, "creative_sections", section_id, project["id"])
+            _validate_section_for_approval(section)
+            _advance(
+                db, "creative_sections", "section", section_id, project["id"], payload.base_revision,
+                payload.source, {"status": "approved", "review_note": payload.note, "approved_at": utc_now()},
+            )
+            invalidate_sections(db, project["id"], f"小节“{section['title']}”已批准为 R{section['revision'] + 1}", [section_id])
+            db.commit()
+        return _workspace(db_path)
+
+    @router.post("/sections/{section_id}/return")
+    def return_section(section_id: str, payload: SectionDecision) -> dict[str, Any]:
+        if not payload.note.strip():
+            raise HTTPException(422, "退回小节时必须填写修改意见")
+        with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            project = _active_project(db)
+            section = _row_for_project(db, "creative_sections", section_id, project["id"])
+            _advance(
+                db, "creative_sections", "section", section_id, project["id"], payload.base_revision,
+                payload.source, {"status": "draft", "review_note": payload.note, "approved_at": None},
+            )
+            invalidate_sections(db, project["id"], f"小节“{section['title']}”已退回：{payload.note.strip()}", [section_id])
             db.commit()
         return _workspace(db_path)
 
@@ -972,6 +1107,7 @@ def create_content_router(db_path: Path) -> APIRouter:
             project = _active_project(db)
             section = _row_for_project(db, "creative_sections", section_id, project["id"])
             _archive_entity(db, "creative_sections", "section", section_id, project["id"], payload)
+            invalidate_sections(db, project["id"], f"小节“{section['title']}”已归档", [section_id])
             db.execute(
                 "UPDATE creative_chapters SET revision = revision + 1, updated_at = ? WHERE id = ?",
                 (utc_now(), section["chapter_id"]),
@@ -996,6 +1132,7 @@ def create_content_router(db_path: Path) -> APIRouter:
             _normalize_order(
                 db, "creative_sections", "section", project["id"], payload.ids, payload.source, chapter_id=chapter_id,
             )
+            invalidate_sections(db, project["id"], f"章节“{chapter['title']}”的小节顺序已变化", payload.ids)
             db.execute(
                 "UPDATE creative_chapters SET revision = revision + 1, updated_at = ? WHERE id = ?",
                 (utc_now(), chapter_id),
@@ -1047,6 +1184,9 @@ def create_content_router(db_path: Path) -> APIRouter:
                     (new_id, ordinal, utc_now(), section["id"]),
                 )
                 _save_revision(db, project["id"], "section", section["id"], payload.source)
+            invalidate_sections(
+                db, project["id"], "章节拆分改变了小节的分镜排序", [str(item["id"]) for item in sections],
+            )
             db.execute(
                 "UPDATE creative_chapters SET revision = revision + 1, updated_at = ? WHERE id = ?",
                 (utc_now(), chapter_id),
@@ -1089,6 +1229,9 @@ def create_content_router(db_path: Path) -> APIRouter:
                     (target["id"], start + offset, utc_now(), section["id"]),
                 )
                 _save_revision(db, project["id"], "section", section["id"], payload.source)
+            invalidate_sections(
+                db, project["id"], "章节合并改变了小节的分镜排序", [str(item["id"]) for item in source_sections],
+            )
             combined_summary = "\n\n".join(part for part in (target["summary"], source["summary"]) if part.strip())
             _advance(
                 db, "creative_chapters", "chapter", target["id"], project["id"], target["revision"], payload.source,
@@ -1131,8 +1274,9 @@ def create_content_router(db_path: Path) -> APIRouter:
             half_seconds = round(float(section["planned_seconds"]) / 2, 3)
             _advance(
                 db, "creative_sections", "section", section_id, project["id"], section["revision"], payload.source,
-                {"summary": payload.summary_before, "planned_seconds": half_seconds},
+                {"summary": payload.summary_before, "planned_seconds": half_seconds, "status": "draft", "approved_at": None},
             )
+            invalidate_sections(db, project["id"], f"小节“{section['title']}”已拆分", [section_id])
             new_id = f"section-{uuid.uuid4().hex[:12]}"
             now = utc_now()
             db.execute(
@@ -1177,19 +1321,28 @@ def create_content_router(db_path: Path) -> APIRouter:
                 raise HTTPException(422, "小节不能合并到自身")
             if source["chapter_id"] != target["chapter_id"]:
                 raise HTTPException(422, "只能合并同一章节内的小节")
-            combined = "\n\n".join(part for part in (target["summary"], source["summary"]) if part.strip())
-            combined_content = "\n\n".join(part for part in (target["content"], source["content"]) if part.strip())
             _advance(
                 db, "creative_sections", "section", target["id"], project["id"], target["revision"], payload.source,
                 {
-                    "summary": combined,
-                    "content": combined_content,
+                    "summary": _merge_section_value(target, source, "summary"),
+                    "content": _merge_section_value(target, source, "content"),
+                    "scene": _merge_section_value(target, source, "scene"),
+                    "action": _merge_section_value(target, source, "action"),
+                    "dialogue": _merge_section_value(target, source, "dialogue"),
+                    "sound": _merge_section_value(target, source, "sound"),
+                    "visual": _merge_section_value(target, source, "visual"),
                     "planned_seconds": float(target["planned_seconds"]) + float(source["planned_seconds"]),
+                    "status": "draft",
+                    "review_note": "由两个小节合并生成，请重新检查全部结构化字段并批准",
+                    "approved_at": None,
                 },
             )
             _advance(
                 db, "creative_sections", "section", source["id"], project["id"], source["revision"], payload.source,
                 {"status": "archived"},
+            )
+            invalidate_sections(
+                db, project["id"], "小节合并改变了分镜来源", [str(target["id"]), str(source["id"])],
             )
             remaining = [
                 item["id"]

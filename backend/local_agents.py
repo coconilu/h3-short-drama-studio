@@ -24,8 +24,10 @@ from pydantic import BaseModel, Field
 
 try:
     from .content_planning import _active_project, _advance, _save_revision, connect
+    from .creative_storyboard import invalidate_sections
 except ImportError:  # Support `uvicorn app:app` from backend/.
     from content_planning import _active_project, _advance, _save_revision, connect
+    from creative_storyboard import invalidate_sections
 
 
 ProviderAdapter = Literal["codex", "kimi"]
@@ -1238,7 +1240,8 @@ def apply_agent_proposal(db_path: Path, run_id: str, confirmed_by: str) -> dict[
             if run["target_id"]:
                 revisions = _json(run["base_revisions"], [])
                 _advance(
-                    db, "creative_sections", "section", run["target_id"], project["id"], revisions[0]["revision"], source, value,
+                    db, "creative_sections", "section", run["target_id"], project["id"], revisions[0]["revision"],
+                    source, {**value, "status": "draft", "review_note": "Agent 提案已应用，请重新批准", "approved_at": None},
                 )
             else:
                 chapter = db.execute(
@@ -1256,8 +1259,13 @@ def apply_agent_proposal(db_path: Path, run_id: str, confirmed_by: str) -> dict[
             revisions = _json(run["base_revisions"], [])
             _advance(
                 db, "creative_sections", "section", run["target_id"], project["id"], revisions[0]["revision"],
-                source, {"content": value["content"]},
+                source, {
+                    "content": value["content"], "status": "draft",
+                    "review_note": "正文已变化，请重新批准", "approved_at": None,
+                },
             )
+        if run["scope"] in ("outline", "chapter", "section", "body"):
+            invalidate_sections(db, project["id"], f"Agent 已确认修改{run['scope']}内容")
         db.commit()
         return _run_public(db.execute("SELECT * FROM creative_agent_runs WHERE id = ?", (run_id,)).fetchone())
 

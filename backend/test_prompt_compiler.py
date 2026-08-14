@@ -11,7 +11,9 @@ from fastapi import HTTPException
 from backend.production_bible import init_bible_schema
 from backend.prompt_compiler import (
     approve_plan,
+    begin_validation_lease,
     compile_prompt_plan,
+    end_validation_lease,
     init_prompt_schema,
     record_validation,
 )
@@ -74,7 +76,10 @@ class PromptCompilerTests(unittest.TestCase):
             init_bible_schema(db)
             init_prompt_schema(db)
             db.execute(
-                """INSERT INTO production_bible_entries VALUES
+                """INSERT INTO production_bible_entries
+                (id, project_id, entry_type, name, summary, canonical_description, prompt_fragment,
+                 negative_prompt, continuity_rules, apply_globally, status, revision, archived, created_at, updated_at)
+                VALUES
                 ('char-1', 'p1', 'character', '林夏', '红雨衣女性', '二十多岁东亚女性，红色雨衣',
                  '<Picture 9> young East Asian woman in a wet red raincoat', 'no costume changes',
                  '脸型、发型和雨衣必须跨镜一致', 0, 'locked', 2, 0, 'now', 'now'),
@@ -138,6 +143,66 @@ class PromptCompilerTests(unittest.TestCase):
         plan = compile_prompt_plan(self.db_path, "p1-S01-001")
         self.assertFalse(plan["ready"])
         self.assertTrue(any("2–15 秒" in item for item in plan["blocking"]))
+
+    def test_late_validation_never_revives_superseded_plan(self) -> None:
+        original = compile_prompt_plan(self.db_path, "p1-S01-001")
+        self.assertTrue(record_validation(self.db_path, original, {"attempt": "initial"}))
+        approve_plan(self.db_path, "p1-S01-001", original["plan_hash"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            from backend.prompt_compiler import mark_prompt_plans_stale
+            mark_prompt_plans_stale(db, "p1", "镜头输入在 dry-run 期间变化", shot_ids=["p1-S01-001"])
+            db.commit()
+
+        self.assertFalse(record_validation(self.db_path, original, {"attempt": "late"}))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                "SELECT * FROM h3_prompt_plans WHERE plan_hash = ?", (original["plan_hash"],)
+            ).fetchone()
+        self.assertEqual(row["status"], "superseded")
+        self.assertIn("镜头输入在 dry-run 期间变化", row["stale_reasons"])
+        self.assertNotIn("late", row["adapter_output"])
+
+    def test_validation_that_returns_after_input_change_is_historical_only(self) -> None:
+        original = compile_prompt_plan(self.db_path, "p1-S01-001")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("UPDATE shots SET prompt = 'changed during dry-run' WHERE id = 'p1-S01-001'")
+            db.commit()
+        self.assertFalse(record_validation(self.db_path, original, {"attempt": "late"}))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                "SELECT * FROM h3_prompt_plans WHERE plan_hash = ?", (original["plan_hash"],)
+            ).fetchone()
+        self.assertEqual(row["status"], "superseded")
+        self.assertIn("输入已变化", row["stale_reasons"])
+        self.assertEqual(compile_prompt_plan(self.db_path, "p1-S01-001")["status"], "preview")
+
+    def test_late_validation_after_shot_delete_is_controlled_and_writes_nothing(self) -> None:
+        original = compile_prompt_plan(self.db_path, "p1-S01-001")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("PRAGMA foreign_keys = ON")
+            db.execute("DELETE FROM shots WHERE id = 'p1-S01-001'")
+            db.commit()
+        self.assertFalse(record_validation(self.db_path, original, {"attempt": "too-late"}))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_prompt_plans").fetchone()[0], 0)
+
+    def test_validation_lease_is_unique_and_released_explicitly(self) -> None:
+        plan = compile_prompt_plan(self.db_path, "p1-S01-001")
+        lease_id = begin_validation_lease(self.db_path, plan)
+        with self.assertRaises(HTTPException) as duplicate:
+            begin_validation_lease(self.db_path, plan)
+        self.assertEqual(duplicate.exception.status_code, 409)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("DELETE FROM shots WHERE id = 'p1-S01-001'")
+        end_validation_lease(self.db_path, lease_id)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM h3_validation_leases").fetchone()[0], 0)
 
 
 if __name__ == "__main__":

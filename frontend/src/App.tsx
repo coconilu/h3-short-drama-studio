@@ -70,7 +70,9 @@ const projectNavItems = [
 
 const globalPageIds = new Set(['projects', 'activity', 'global-queue', 'settings'])
 
-const activeGenerationStates = new Set(['已提交', '排队中', '运行中'])
+export const activeGenerationStates = new Set([
+  '提交中', '已提交待对账', '提交状态未知', '已提交', '排队中', '运行中',
+])
 const activeExportStates = new Set(['排队中', '恢复排队', '导出中', '取消中'])
 
 type ApiOptions = RequestInit & { timeoutMs?: number }
@@ -320,6 +322,32 @@ function App() {
       await refresh()
     } catch (error) {
       if (announce) setNotice(error instanceof Error ? error.message : '同步失败')
+    }
+  }, [refresh])
+
+  const resolveReconciliation = useCallback(async (
+    job: Job,
+    action: 'confirm_not_submitted' | 'accept_current_manifest',
+  ) => {
+    const label = action === 'confirm_not_submitted' ? '确认 ComfyUI 未收到本次提交' : '接受当前 manifest 与 ComfyUI 证据'
+    const note = window.prompt(`${label}\n请输入人工核验依据（会写入审计记录）：`, '')?.trim()
+    if (!note) return
+    if (!window.confirm(`${label}？\n该动作会被记录，且不会静默重复提交 GPU。`)) return
+    try {
+      const result = await api<{ message: string }>(`/api/shots/${job.shot_id}/reconciliation/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({
+          action,
+          expected_revision: job.reconciliation_revision || 0,
+          note,
+          resolved_by: 'human:workbench',
+          confirm: true,
+        }),
+      })
+      setNotice(result.message)
+      await refresh()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '人工对账失败')
     }
   }, [refresh])
 
@@ -606,7 +634,7 @@ function App() {
         {activePage === 'global-queue' && <GlobalQueuePage workbench={workbench} onOpenProject={switchProject} />}
         {activePage === 'settings' && <SettingsPage settings={settings} health={health} onSave={saveSettings} onTest={testConnection} onRestartApi={restartApi} />}
 
-        {activePage === 'planning' && <CreativePlanning key={project.id} projectId={project.id} setNotice={setNotice} onOpenScript={() => setActivePage('script')} />}
+        {activePage === 'planning' && <CreativePlanning key={project.id} projectId={project.id} setNotice={setNotice} onOpenScript={() => setActivePage('script')} onOpenStoryboard={async () => { await refresh(); setActivePage('storyboard') }} />}
         {activePage === 'script' && <ScriptStudio project={project} setNotice={setNotice} onProjectRefresh={refresh} onOpenStoryboard={() => setActivePage('storyboard')} />}
         {activePage === 'bible' && <ProductionBible key={project.id} projectId={project.id} assets={assets} setNotice={setNotice} />}
         {activePage === 'compiler' && <PromptCompiler key={project.id} projectId={project.id} setNotice={setNotice} onOpenStoryboard={(shotId) => { setSelectedShotId(shotId); setActivePage('storyboard') }} />}
@@ -631,7 +659,7 @@ function App() {
         {activePage === 'storyboard' && !selectedShot && <main className="empty-project-stage"><BookOpenText size={28} /><h1>先完成创作规划</h1><p>这个项目还没有镜头。请先确定剧情、角色、章节与小节，再进入剧本开发。</p><button className="button primary" onClick={() => setActivePage('planning')}>打开创作规划</button></main>}
         {activePage === 'overview' && <Overview project={project} health={health} assets={assets} jobs={jobs} acceptance={acceptance} onOpenStoryboard={() => setActivePage('script')} onRunAcceptance={runAcceptance} onSignoff={signoffDelivery} />}
         {activePage === 'assets' && <AssetsPage assets={assets} onRefresh={refresh} setNotice={setNotice} />}
-        {activePage === 'queue' && <QueuePage jobs={jobs} onSync={syncShot} />}
+        {activePage === 'queue' && <QueuePage jobs={jobs} onSync={syncShot} onResolve={resolveReconciliation} />}
         {activePage === 'review' && selectedShot && <ReviewPage project={project} shot={selectedShot} candidates={candidates} promotions={promotions} reviewWorkspace={reviewWorkspace} onSelectShot={setSelectedShotId} onRefresh={async () => { await Promise.all([refresh(), refreshShotReview(selectedShot.id)]) }} setNotice={setNotice} />}
         {activePage === 'review' && !selectedShot && <main className="empty-project-stage"><Film size={28} /><h1>还没有可审片的镜头</h1><p>完成创作规划和剧本开发后，再同步分镜并生成候选。</p><button className="button primary" onClick={() => setActivePage('planning')}>返回创作规划</button></main>}
         {activePage === 'timeline' && <TimelinePage shots={project.shots} roughCut={roughCut} preflight={exportPreflight} exportRuns={exportRuns} deliveryWorkspace={deliveryWorkspace} onExport={submitExport} onRunAction={mutateExport} onRefresh={refresh} setNotice={setNotice} />}
@@ -840,7 +868,7 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
               <button className={`batch-check ${batchSelection.has(shot.id) ? 'checked' : ''}`} aria-label={`${batchSelection.has(shot.id) ? '取消选择' : '选择'} ${displayShotId(shot.id)}`} onClick={(event) => { event.stopPropagation(); changeBatchSelection(shot.id) }}>{batchSelection.has(shot.id) && <Check size={13} />}</button>
               <div className="shot-code"><strong>{displayShotId(shot.id)}</strong><span>{shot.scene_code}</span></div>
               <ShotThumbnail shot={shot} />
-              <div className="shot-copy"><strong>{shot.title}</strong><p>{shot.description}</p>{shot.dialogue && <em>{shot.dialogue}</em>}</div>
+              <div className="shot-copy"><strong>{shot.title}</strong><p>{shot.description}</p>{shot.dialogue && <em>{shot.dialogue}</em>}{shot.sound && <small>声音：{shot.sound}</small>}{shot.source_mapping ? <small className="shot-source">来源：小节“{shot.source_mapping.section_title}” · 同步 R{shot.source_mapping.last_synced_revision}</small> : <small className="shot-source manual">历史手工分镜 · 无小节映射</small>}</div>
               <div className="shot-spec"><span>{shot.width}×{shot.height}</span><span>{shot.seconds} 秒</span><span>{shot.candidate_count} 条候选</span></div>
               <StatusPill status={shot.status} />
               <ChevronRight size={16} />
@@ -852,6 +880,7 @@ function Storyboard({ project, selectedShot, selectedShotId, assets, references,
         <div className="inspector-title"><div><span>镜头检查器</span><strong>{displayShotId(selectedShot.id)}</strong></div><button title="保存" onClick={() => onUpdate(draft.id, draft)}><Save size={18} /></button></div>
         <label>镜头标题<input value={draft.title} onChange={(event) => { setDraft({ ...draft, title: event.target.value }); setDryRun(null) }} /></label>
         <label>画面提示词<textarea rows={6} value={draft.prompt} onChange={(event) => { setDraft({ ...draft, prompt: event.target.value }); setDryRun(null) }} /></label>
+        <label>声音提示<textarea rows={3} value={draft.sound || ''} onChange={(event) => { setDraft({ ...draft, sound: event.target.value }); setDryRun(null) }} /></label>
         <div className="reference-section">
           <div className="label-line"><span>生成路线与参考</span><button className="text-action" onClick={() => setPickerOpen(true)}><Link2 size={13} />绑定素材</button></div>
           <div className={`generation-route ${references.length ? 'reference' : 'text-only'}`}><span>{references.length ? 'REF2VA · 多模态参考' : 'FL2VA · 纯文本生成'}</span><p>{references.length ? '提示词与已排序的图片、视频或音频共同驱动生成。' : '无需任何素材；仅使用下面的画面提示词生成视频与音频。'}</p></div>
@@ -958,7 +987,11 @@ function AssetsPage({ assets, onRefresh, setNotice }: { assets: Asset[]; onRefre
   return <main className="page"><div className="page-heading"><div><span className="eyebrow">一致性控制</span><h1>参考素材库</h1><p>受管素材会复制到项目目录并记录校验值；Ref2VA 按每类素材的绑定顺序解释引用标签。</p></div><button className="button secondary" onClick={() => setImportOpen(true)}><Upload size={17} />导入资产</button></div><div className="asset-list">{assets.map(asset => <article key={asset.id}><AssetPreview asset={asset} /><div><span>{asset.kind} · {asset.source === 'managed' ? '受管文件' : '演示占位'}</span><h3>{asset.name}</h3><p>{asset.description || '未填写说明'}</p><small>{asset.source === 'managed' ? assetMeta(asset) : '仅用于界面演示，不能绑定 Ref2VA'}</small></div><button className={asset.bindable ? 'locked' : ''} disabled>{asset.bindable ? <><Check size={15} />可绑定</> : '不可绑定'}</button></article>)}</div>{importOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setImportOpen(false) }}><form className="modal" onSubmit={submit}><div className="modal-title"><div><span className="eyebrow">本地受管目录</span><h2>导入参考素材</h2></div><button type="button" disabled={busy} onClick={() => setImportOpen(false)}><X /></button></div><label className="file-drop"><input type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/x-matroska,video/webm,audio/wav,audio/mpeg,audio/flac,audio/mp4,audio/aac,audio/ogg" onChange={(event) => { const selected = event.target.files?.[0] || null; setFile(selected); if (selected && !name) setName(selected.name.replace(/\.[^.]+$/, '')) }} /><Upload size={24} /><strong>{file?.name || '选择图片、视频或音频'}</strong><span>图片 ≤ 50 MB · 视频 ≤ 2 GB · 音频 ≤ 250 MB</span></label><div className="form-grid"><label>素材名称<input required minLength={2} maxLength={80} value={name} onChange={(event) => setName(event.target.value)} /></label><label>素材分类<select value={kind} onChange={(event) => setKind(event.target.value)}><option>角色参考</option><option>场景参考</option><option>画风参考</option><option>道具参考</option><option>动作参考</option><option>声音参考</option></select></label></div><label>备注<textarea rows={3} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明身份、服装、场景、镜头语言或声音用途" /></label><div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={() => setImportOpen(false)}>取消</button><button className="button primary" disabled={busy || !file || name.length < 2}>{busy ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}导入并探测</button></div></form></div>}</main>
 }
 
-function QueuePage({ jobs, onSync }: { jobs: Job[]; onSync: (shotId: string) => Promise<void> }) {
+function QueuePage({ jobs, onSync, onResolve }: {
+  jobs: Job[]
+  onSync: (shotId: string) => Promise<void>
+  onResolve: (job: Job, action: 'confirm_not_submitted' | 'accept_current_manifest') => Promise<void>
+}) {
   const [batches, setBatches] = useState<ProductionBatch[]>([])
   const [selectedBatchId, setSelectedBatchId] = useState('')
   const [selectedBatch, setSelectedBatch] = useState<ProductionBatch | null>(null)
@@ -1055,7 +1088,7 @@ function QueuePage({ jobs, onSync }: { jobs: Job[]; onSync: (shotId: string) => 
         </> : <div className="production-detail-empty"><ListVideo size={26} /><strong>选择一个生产批次</strong><span>查看逐镜提交、生成、恢复和失败重试状态。</span></div>}
       </section>
     </section>
-    <details className="legacy-job-log"><summary>底层 H3 任务日志 <span>{jobs.length}</span></summary><div className="queue-table"><div className="queue-head"><span>镜头</span><span>任务</span><span>说明</span><span>状态</span><span>时间</span><span>操作</span></div>{jobs.map(job => <div className="queue-row" key={job.id}><strong>{displayShotId(job.shot_id)}</strong><span>{job.kind}</span><span><b>{job.message}</b>{job.prompt_ids?.length ? <small>{job.prompt_ids.length} 个 prompt_id</small> : null}</span><StatusPill status={job.state} /><time>{new Date(job.updated_at || job.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time><button className="queue-sync" disabled={!job.h3_project || job.kind !== 'draft'} onClick={() => onSync(job.shot_id)}><RefreshCw size={14} />同步</button></div>)}</div></details>
+    <details className="legacy-job-log"><summary>底层 H3 任务日志 <span>{jobs.length}</span></summary><div className="queue-table"><div className="queue-head"><span>镜头</span><span>任务</span><span>说明</span><span>状态</span><span>时间</span><span>操作</span></div>{jobs.map(job => <div className="queue-row" key={job.id}><strong>{displayShotId(job.shot_id)}</strong><span>{job.kind}</span><span><b>{job.message}</b>{job.prompt_ids?.length ? <small>{job.prompt_ids.length} 个 prompt_id</small> : null}</span><StatusPill status={job.state} /><time>{new Date(job.updated_at || job.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time><span className="queue-reconciliation-actions">{job.state === '待人工对账' ? <><button onClick={() => void onResolve(job, 'accept_current_manifest')}><RefreshCw size={14} />接受证据</button><button className="danger" onClick={() => void onResolve(job, 'confirm_not_submitted')}>确认未提交</button></> : <button className="queue-sync" disabled={!job.h3_project || job.kind !== 'draft'} onClick={() => onSync(job.shot_id)}><RefreshCw size={14} />同步</button>}</span></div>)}</div></details>
   </main>
 }
 

@@ -11,6 +11,11 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+try:
+    from .prompt_compiler import mark_prompt_plans_stale
+except ImportError:  # Support `uvicorn app:app` from the backend directory.
+    from prompt_compiler import mark_prompt_plans_stale
+
 
 BibleType = Literal["character", "location", "prop", "style", "voice"]
 BIBLE_TYPES: tuple[str, ...] = ("character", "location", "prop", "style", "voice")
@@ -82,6 +87,18 @@ def init_bible_schema(db: sqlite3.Connection) -> None:
         );
         """
     )
+    columns = {row[1] for row in db.execute("PRAGMA table_info(production_bible_entries)").fetchall()}
+    for name, definition in (
+        ("source_type", "TEXT NOT NULL DEFAULT 'manual'"),
+        ("source_id", "TEXT"),
+        ("source_revision", "INTEGER"),
+    ):
+        if name not in columns:
+            db.execute(f"ALTER TABLE production_bible_entries ADD COLUMN {name} {definition}")
+    db.execute(
+        """CREATE INDEX IF NOT EXISTS idx_bible_entries_source
+        ON production_bible_entries(project_id, source_type, source_id, entry_type)"""
+    )
 
 
 class BibleEntryCreate(BaseModel):
@@ -141,6 +158,11 @@ def _entry_for_project(db: sqlite3.Connection, entry_id: str, project_id: str) -
     return entry
 
 
+def _require_manual_entry(entry: sqlite3.Row) -> None:
+    if entry["source_type"] == "creative_character":
+        raise HTTPException(409, "该条目由已批准角色卡派生；请回到创作规划修改角色卡")
+
+
 def _entry_snapshot(db: sqlite3.Connection, entry_id: str) -> dict[str, Any]:
     entry = db.execute("SELECT * FROM production_bible_entries WHERE id = ?", (entry_id,)).fetchone()
     if not entry:
@@ -183,6 +205,138 @@ def _save_version(db: sqlite3.Connection, entry_id: str, source: str) -> None:
     )
 
 
+def _invalidate_entry_plans(db: sqlite3.Connection, entry_id: str, reason: str) -> int:
+    entry = db.execute("SELECT * FROM production_bible_entries WHERE id = ?", (entry_id,)).fetchone()
+    if not entry:
+        return 0
+    shot_ids = None
+    if not bool(entry["apply_globally"]):
+        shot_ids = [
+            str(row["shot_id"])
+            for row in db.execute(
+                "SELECT shot_id FROM production_bible_shots WHERE entry_id = ?", (entry_id,)
+            ).fetchall()
+        ]
+    return mark_prompt_plans_stale(db, entry["project_id"], reason, shot_ids=shot_ids)
+
+
+def sync_creative_character_rules(db: sqlite3.Connection, character: sqlite3.Row | dict[str, Any]) -> list[str]:
+    """Materialize an approved character card as locked, traceable H3 bible inputs."""
+    item = dict(character)
+    if item.get("status") != "approved":
+        return archive_creative_character_rules(db, item["project_id"], item["id"], "角色卡已退回草稿")
+    appearance = str(item.get("appearance") or "").strip()
+    voice = str(item.get("voice") or "").strip()
+    if not appearance or not voice:
+        raise HTTPException(422, "批准角色卡前必须填写视觉连续性与声音连续性")
+    identity = str(item.get("identity") or "").strip()
+    definitions = (
+        (
+            "character",
+            f"{item['name']} · 视觉规则",
+            "\n".join(part for part in (identity, appearance) if part),
+            appearance,
+            appearance,
+        ),
+        ("voice", f"{item['name']} · 声音规则", voice, voice, voice),
+    )
+    changed: list[str] = []
+    wrote = False
+    now = utc_now()
+    for entry_type, name, canonical, prompt, continuity in definitions:
+        entry_id = f"creative-{item['id']}-{entry_type}"
+        existing = db.execute("SELECT * FROM production_bible_entries WHERE id = ?", (entry_id,)).fetchone()
+        expected = {
+            "project_id": item["project_id"],
+            "entry_type": entry_type,
+            "name": name,
+            "summary": f"来自已批准角色卡“{item['name']}”",
+            "canonical_description": canonical,
+            "prompt_fragment": prompt,
+            "negative_prompt": "",
+            "continuity_rules": continuity,
+            "apply_globally": 1,
+            "status": "locked",
+            "archived": 0,
+            "source_type": "creative_character",
+            "source_id": item["id"],
+            "source_revision": int(item["revision"]),
+        }
+        bindings = 0
+        if existing:
+            bindings = int(db.execute(
+                "SELECT COUNT(*) FROM production_bible_assets WHERE entry_id = ?", (entry_id,)
+            ).fetchone()[0]) + int(db.execute(
+                "SELECT COUNT(*) FROM production_bible_shots WHERE entry_id = ?", (entry_id,)
+            ).fetchone()[0])
+        if existing and not bindings and all(existing[key] == value for key, value in expected.items()):
+            changed.append(entry_id)
+            continue
+        if existing:
+            db.execute("DELETE FROM production_bible_assets WHERE entry_id = ?", (entry_id,))
+            db.execute("DELETE FROM production_bible_shots WHERE entry_id = ?", (entry_id,))
+            db.execute(
+                """UPDATE production_bible_entries SET name = ?, summary = ?, canonical_description = ?,
+                prompt_fragment = ?, negative_prompt = '', continuity_rules = ?, apply_globally = 1, status = 'locked',
+                archived = 0, source_type = 'creative_character', source_id = ?, source_revision = ?,
+                revision = revision + 1, updated_at = ? WHERE id = ? AND project_id = ?""",
+                (
+                    name, f"来自已批准角色卡“{item['name']}”", canonical, prompt, continuity,
+                    item["id"], item["revision"], now, entry_id, item["project_id"],
+                ),
+            )
+        else:
+            db.execute(
+                """INSERT INTO production_bible_entries
+                (id, project_id, entry_type, name, summary, canonical_description, prompt_fragment,
+                 negative_prompt, continuity_rules, apply_globally, status, revision, archived,
+                 created_at, updated_at, source_type, source_id, source_revision)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 1, 'locked', 1, 0, ?, ?,
+                        'creative_character', ?, ?)""",
+                (
+                    entry_id, item["project_id"], entry_type, name,
+                    f"来自已批准角色卡“{item['name']}”", canonical, prompt, continuity,
+                    now, now, item["id"], item["revision"],
+                ),
+            )
+        _save_version(db, entry_id, f"creative-character:{item['id']}:R{item['revision']}")
+        wrote = True
+        changed.append(entry_id)
+    if wrote:
+        mark_prompt_plans_stale(
+            db,
+            item["project_id"],
+            f"角色卡“{item['name']}”视觉/声音规则更新为 R{item['revision']}",
+        )
+    return changed
+
+
+def archive_creative_character_rules(
+    db: sqlite3.Connection,
+    project_id: str,
+    character_id: str,
+    reason: str,
+) -> list[str]:
+    entries = db.execute(
+        """SELECT * FROM production_bible_entries
+        WHERE project_id = ? AND source_type = 'creative_character' AND source_id = ? AND archived = 0""",
+        (project_id, character_id),
+    ).fetchall()
+    now = utc_now()
+    changed: list[str] = []
+    for entry in entries:
+        db.execute(
+            """UPDATE production_bible_entries SET archived = 1, status = 'draft', revision = revision + 1,
+            updated_at = ? WHERE id = ?""",
+            (now, entry["id"]),
+        )
+        _save_version(db, entry["id"], f"creative-character:{character_id}:archive")
+        changed.append(str(entry["id"]))
+    if entries:
+        mark_prompt_plans_stale(db, project_id, reason)
+    return changed
+
+
 def _advance_revision(
     db: sqlite3.Connection,
     entry_id: str,
@@ -201,6 +355,7 @@ def _advance_revision(
     if cursor.rowcount != 1:
         raise HTTPException(409, "该条目已在其他操作中更新，请刷新后重试")
     _save_version(db, entry_id, source)
+    _invalidate_entry_plans(db, entry_id, f"生产圣经条目已更新：{source}")
 
 
 def _asset_public(item: dict[str, Any]) -> dict[str, Any]:
@@ -321,7 +476,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
     def update_entry(entry_id: str, payload: BibleEntryPatch) -> dict[str, Any]:
         with closing(connect(db_path)) as db:
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             updates = payload.model_dump(exclude_none=True)
             base_revision = updates.pop("base_revision")
             if updates:
@@ -337,6 +493,7 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             project = _active_project(db)
             entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             if not entry["canonical_description"].strip() or not entry["prompt_fragment"].strip():
                 raise HTTPException(422, "锁定前必须填写标准设定与 H3 提示词片段")
             _advance_revision(db, entry_id, project["id"], payload.base_revision, "human:lock", status="locked")
@@ -347,7 +504,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
     def archive_entry(entry_id: str, payload: RevisionRequest) -> dict[str, Any]:
         with closing(connect(db_path)) as db:
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             cursor = db.execute(
                 """UPDATE production_bible_entries SET archived = 1, revision = revision + 1,
                 status = 'draft', updated_at = ? WHERE id = ? AND project_id = ? AND revision = ?""",
@@ -364,7 +522,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             asset = db.execute(
                 """SELECT * FROM assets WHERE id = ? AND project_id = ? AND archived = 0
                 AND source = 'managed' AND managed_path IS NOT NULL""",
@@ -392,7 +551,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             cursor = db.execute(
                 "DELETE FROM production_bible_assets WHERE entry_id = ? AND asset_id = ?",
                 (entry_id, payload.asset_id),
@@ -408,7 +568,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             shot = db.execute(
                 "SELECT id FROM shots WHERE id = ? AND project_id = ?",
                 (payload.shot_id, project["id"]),
@@ -431,7 +592,8 @@ def create_bible_router(db_path: Path) -> APIRouter:
         with closing(connect(db_path)) as db:
             db.execute("BEGIN IMMEDIATE")
             project = _active_project(db)
-            _entry_for_project(db, entry_id, project["id"])
+            entry = _entry_for_project(db, entry_id, project["id"])
+            _require_manual_entry(entry)
             cursor = db.execute(
                 "DELETE FROM production_bible_shots WHERE entry_id = ? AND shot_id = ?",
                 (entry_id, payload.shot_id),
