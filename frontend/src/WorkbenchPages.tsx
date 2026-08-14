@@ -208,6 +208,11 @@ export function ProjectsWorkbench({ workbench, health, search, onOpenProject, on
             <p>{reconciliationReason[record.reason] || record.reason}</p>
             {record.cleanup_error && <p className="archive-reconciliation-error">上次清理未完成：{record.cleanup_error}</p>}
             <small>lease {record.lease_id}{record.task_id ? ` · task ${record.task_id}` : ' · 无 task'}</small>
+            {record.resolution_stage && <small>
+              阶段 {record.resolution_stage}
+              {record.resolution_owner_pid ? ` · resolver PID ${record.resolution_owner_pid}` : ''}
+              {record.resolution_heartbeat_at ? ` · 心跳 ${relativeTime(record.resolution_heartbeat_at)}` : ''}
+            </small>}
             <textarea
               aria-label={`${record.project_title || record.project_id}归档对账说明`}
               placeholder="记录检查过的进程、日志和判断依据（至少 8 个字符）"

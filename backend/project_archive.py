@@ -110,10 +110,16 @@ def init_archive_schema(db: sqlite3.Connection) -> None:
           resolved_by TEXT,
           resolution_note TEXT,
           resolution_owner TEXT,
+          resolution_owner_instance TEXT,
+          resolution_owner_host TEXT,
+          resolution_owner_pid INTEGER,
+          resolution_owner_process_identity TEXT,
           resolution_task_id TEXT,
           resolution_task_revision INTEGER,
           resolution_paths TEXT NOT NULL DEFAULT '{}',
           resolution_started_at TEXT,
+          resolution_stage TEXT,
+          resolution_heartbeat_at TEXT,
           cleanup_error TEXT,
           cleanup_attempts INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
@@ -167,10 +173,16 @@ def _ensure_archive_reconciliation_schema(db: sqlite3.Connection) -> None:
               resolved_by TEXT,
               resolution_note TEXT,
               resolution_owner TEXT,
+              resolution_owner_instance TEXT,
+              resolution_owner_host TEXT,
+              resolution_owner_pid INTEGER,
+              resolution_owner_process_identity TEXT,
               resolution_task_id TEXT,
               resolution_task_revision INTEGER,
               resolution_paths TEXT NOT NULL DEFAULT '{}',
               resolution_started_at TEXT,
+              resolution_stage TEXT,
+              resolution_heartbeat_at TEXT,
               cleanup_error TEXT,
               cleanup_attempts INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
@@ -200,10 +212,16 @@ def _ensure_archive_reconciliation_schema(db: sqlite3.Connection) -> None:
         }
         for name, definition in (
             ("resolution_owner", "TEXT"),
+            ("resolution_owner_instance", "TEXT"),
+            ("resolution_owner_host", "TEXT"),
+            ("resolution_owner_pid", "INTEGER"),
+            ("resolution_owner_process_identity", "TEXT"),
             ("resolution_task_id", "TEXT"),
             ("resolution_task_revision", "INTEGER"),
             ("resolution_paths", "TEXT NOT NULL DEFAULT '{}'"),
             ("resolution_started_at", "TEXT"),
+            ("resolution_stage", "TEXT"),
+            ("resolution_heartbeat_at", "TEXT"),
             ("cleanup_error", "TEXT"),
             ("cleanup_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ):
@@ -240,6 +258,8 @@ def _process_identity(pid: int) -> tuple[bool | None, str | None]:
             ctypes.POINTER(wintypes.FILETIME),
         )
         kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
         kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
@@ -249,6 +269,11 @@ def _process_identity(pid: int) -> tuple[bool | None, str | None]:
                 return False, None
             return None, None
         try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return None, None
+            if int(exit_code.value) != 259:  # STILL_ACTIVE
+                return False, None
             created = wintypes.FILETIME()
             exited = wintypes.FILETIME()
             kernel = wintypes.FILETIME()
@@ -402,8 +427,11 @@ def _audit_archive_lease_reconciliations(db: sqlite3.Connection) -> int:
                 SET project_id = ?, task_id = ?, reason = ?, state = 'unresolved', evidence = ?,
                     confirmed_no_live_process = 0, resolved_by = NULL, resolution_note = NULL,
                     resolution_owner = NULL, resolution_task_id = NULL,
+                    resolution_owner_instance = NULL, resolution_owner_host = NULL,
+                    resolution_owner_pid = NULL, resolution_owner_process_identity = NULL,
                     resolution_task_revision = NULL, resolution_paths = '{}',
-                    resolution_started_at = NULL, cleanup_error = NULL,
+                    resolution_started_at = NULL, resolution_stage = NULL,
+                    resolution_heartbeat_at = NULL, cleanup_error = NULL,
                     resolved_at = NULL, updated_at = ?, revision = revision + 1
                 WHERE id = ? AND revision = ?""",
                 (
@@ -696,7 +724,13 @@ def archive_reconciliation_public(record: dict[str, Any]) -> dict[str, Any]:
         "confirmed_no_live_process": bool(record.get("confirmed_no_live_process")),
         "resolved_by": record.get("resolved_by"),
         "resolution_note": record.get("resolution_note"),
+        "resolution_owner_instance": record.get("resolution_owner_instance"),
+        "resolution_owner_host": record.get("resolution_owner_host"),
+        "resolution_owner_pid": record.get("resolution_owner_pid"),
+        "resolution_owner_process_identity": record.get("resolution_owner_process_identity"),
         "resolution_started_at": record.get("resolution_started_at"),
+        "resolution_stage": record.get("resolution_stage"),
+        "resolution_heartbeat_at": record.get("resolution_heartbeat_at"),
         "cleanup_error": record.get("cleanup_error"),
         "cleanup_attempts": int(record.get("cleanup_attempts") or 0),
         "created_at": record["created_at"],
@@ -749,6 +783,155 @@ def _owner_is_definitely_current(task: dict[str, Any]) -> bool:
     return stored_kind in {"win-filetime", "proc-start"} and current_kind == stored_kind and stored == current
 
 
+def _resolver_owner_crash_reason(record: dict[str, Any]) -> str | None:
+    """Return a proof-backed crash reason; uncertainty always keeps the freeze."""
+    if record.get("resolution_owner_instance") == ARCHIVE_OWNER_INSTANCE:
+        return None
+    if str(record.get("resolution_owner_host") or "").casefold() != ARCHIVE_OWNER_HOST:
+        return None
+    stored_identity = str(record.get("resolution_owner_process_identity") or "")
+    stored_kind = stored_identity.split(":", 1)[0] if ":" in stored_identity else ""
+    if stored_kind not in {"win-filetime", "proc-start"}:
+        # Runtime fallbacks are process-lifetime hints, not OS-verifiable proof.
+        return None
+    try:
+        pid = int(record.get("resolution_owner_pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    alive, current_identity_value = _process_identity(pid)
+    if alive is False:
+        return "resolver_process_dead"
+    if alive is not True:
+        return None
+    current_identity = str(current_identity_value or "")
+    current_kind = current_identity.split(":", 1)[0] if ":" in current_identity else ""
+    if current_kind != stored_kind or not current_identity:
+        return None
+    if current_identity != stored_identity:
+        return "resolver_pid_reused"
+    return None
+
+
+def _touch_reconciliation_stage(
+    db_path: Path,
+    project_id: str,
+    reconciliation_id: str,
+    resolution_owner: str,
+    expected_revision: int,
+    stage: str,
+) -> None:
+    now = utc_now()
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        cursor = db.execute(
+            """UPDATE project_archive_reconciliations
+            SET resolution_stage = ?, resolution_heartbeat_at = ?, updated_at = ?
+            WHERE id = ? AND project_id = ? AND state = 'resolving'
+              AND resolution_owner = ? AND revision = ?""",
+            (
+                stage, now, now, reconciliation_id, project_id,
+                resolution_owner, expected_revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "归档冻结对账清理所有权已变化")
+        db.commit()
+
+
+def recover_archive_reconciliations(db_path: Path) -> int:
+    """Make provably abandoned resolver attempts manually retryable.
+
+    This recovery never cleans files or releases a lease. It only transitions
+    the exact abandoned resolver attempt to ``cleanup_failed`` with crash
+    evidence, so a human can inspect and retry the idempotent cleanup.
+    """
+    with closing(connect(db_path)) as db:
+        candidates = [dict(row) for row in db.execute(
+            """SELECT * FROM project_archive_reconciliations
+            WHERE state = 'resolving' ORDER BY updated_at, id"""
+        ).fetchall()]
+    recovered = 0
+    for candidate in candidates:
+        crash_reason = _resolver_owner_crash_reason(candidate)
+        if crash_reason is None:
+            continue
+        now = utc_now()
+        with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                """SELECT * FROM project_archive_reconciliations
+                WHERE id = ? AND project_id = ?""",
+                (candidate["id"], candidate["project_id"]),
+            ).fetchone()
+            if (
+                not current
+                or current["state"] != "resolving"
+                or int(current["revision"]) != int(candidate["revision"])
+                or current["resolution_owner"] != candidate.get("resolution_owner")
+                or current["resolution_owner_instance"] != candidate.get("resolution_owner_instance")
+                or current["resolution_owner_host"] != candidate.get("resolution_owner_host")
+                or current["resolution_owner_pid"] != candidate.get("resolution_owner_pid")
+                or current["resolution_owner_process_identity"]
+                != candidate.get("resolution_owner_process_identity")
+            ):
+                db.rollback()
+                continue
+            lease = db.execute(
+                """SELECT 1 FROM project_archive_leases
+                WHERE project_id = ? AND lease_id = ?""",
+                (current["project_id"], current["lease_id"]),
+            ).fetchone()
+            if not lease:
+                # Without the exact freeze there is no safe recovery claim.
+                db.rollback()
+                continue
+            try:
+                evidence = json.loads(current["evidence"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                evidence = {}
+            crashes = evidence.setdefault("resolver_crash_recoveries", [])
+            crashes.append({
+                "reason": crash_reason,
+                "resolution_owner": current["resolution_owner"],
+                "owner_instance": current["resolution_owner_instance"],
+                "owner_host": current["resolution_owner_host"],
+                "owner_pid": current["resolution_owner_pid"],
+                "owner_process_identity": current["resolution_owner_process_identity"],
+                "stage": current["resolution_stage"],
+                "heartbeat_at": current["resolution_heartbeat_at"],
+                "detected_by": _current_owner(),
+                "detected_at": now,
+                "lease_preserved": True,
+            })
+            message = "归档对账进程异常退出，已保留冻结与清理快照，请人工核对后重试"
+            cursor = db.execute(
+                """UPDATE project_archive_reconciliations
+                SET state = 'cleanup_failed', evidence = ?, cleanup_error = ?,
+                    resolution_owner = NULL, resolution_stage = 'crash_recovered',
+                    resolution_heartbeat_at = ?, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND project_id = ? AND state = 'resolving'
+                  AND resolution_owner = ? AND revision = ?
+                  AND resolution_owner_instance = ? AND resolution_owner_host = ?
+                  AND resolution_owner_pid = ? AND resolution_owner_process_identity = ?""",
+                (
+                    json.dumps(evidence, ensure_ascii=False, sort_keys=True), message, now, now,
+                    current["id"], current["project_id"], current["resolution_owner"],
+                    int(current["revision"]), current["resolution_owner_instance"],
+                    current["resolution_owner_host"], current["resolution_owner_pid"],
+                    current["resolution_owner_process_identity"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                db.rollback()
+                continue
+            db.commit()
+            recovered += 1
+    return recovered
+
+
 def resolve_archive_reconciliation(
     db_path: Path,
     backup_root: Path,
@@ -759,6 +942,7 @@ def resolve_archive_reconciliation(
     if not payload.confirm_no_live_archive_process:
         raise HTTPException(400, "必须明确确认没有存活的归档进程")
     resolution_owner = f"archive-resolution-{uuid.uuid4().hex}"
+    resolver_owner = _current_owner()
     cleanup_task: dict[str, Any] | None = None
     same_project_task = False
     frozen_snapshot: dict[str, Any] = {}
@@ -815,13 +999,19 @@ def resolve_archive_reconciliation(
         acquired = db.execute(
             """UPDATE project_archive_reconciliations
             SET state = 'resolving', resolution_owner = ?, resolution_task_id = ?,
+                resolution_owner_instance = ?, resolution_owner_host = ?,
+                resolution_owner_pid = ?, resolution_owner_process_identity = ?,
                 resolution_task_revision = ?, resolution_paths = ?, resolution_started_at = ?,
+                resolution_stage = 'acquired', resolution_heartbeat_at = ?,
                 cleanup_error = NULL, cleanup_attempts = cleanup_attempts + 1,
                 updated_at = ?, revision = revision + 1
             WHERE id = ? AND project_id = ? AND state IN ('unresolved','cleanup_failed') AND revision = ?""",
             (
-                resolution_owner, lease_row["task_id"], int(task["revision"]) if same_project_task and task else None,
-                json.dumps(frozen_snapshot, ensure_ascii=False, sort_keys=True), now, now,
+                resolution_owner, lease_row["task_id"], resolver_owner["owner_instance"],
+                resolver_owner["owner_host"], resolver_owner["owner_pid"],
+                resolver_owner["owner_process_identity"],
+                int(task["revision"]) if same_project_task and task else None,
+                json.dumps(frozen_snapshot, ensure_ascii=False, sort_keys=True), now, now, now,
                 reconciliation_id, project_id, payload.expected_revision,
             ),
         )
@@ -833,6 +1023,9 @@ def resolve_archive_reconciliation(
 
     cleanup_errors: list[str] = []
     if cleanup_task:
+        _touch_reconciliation_stage(
+            db_path, project_id, reconciliation_id, resolution_owner, resolving_revision, "cleaning",
+        )
         try:
             cleanup_errors = _cleanup_archive_task_paths(db_path, backup_root, cleanup_task)
         except Exception as exc:  # noqa: BLE001 - unexpected cleanup failures must remain auditable.
@@ -843,6 +1036,9 @@ def resolve_archive_reconciliation(
         )
         raise HTTPException(409, "无法安全清理异常归档任务文件，冻结保持：" + "；".join(cleanup_errors))
 
+    _touch_reconciliation_stage(
+        db_path, project_id, reconciliation_id, resolution_owner, resolving_revision, "finalizing",
+    )
     final_error: str | None = None
     now = utc_now()
     with closing(connect(db_path)) as db:
@@ -954,12 +1150,13 @@ def resolve_archive_reconciliation(
             """UPDATE project_archive_reconciliations
             SET state = 'resolved', confirmed_no_live_process = 1, resolved_by = ?, resolution_note = ?,
                 evidence = ?, cleanup_error = NULL, resolution_owner = NULL,
+                resolution_stage = 'resolved', resolution_heartbeat_at = ?,
                 updated_at = ?, resolved_at = ?, revision = revision + 1
             WHERE id = ? AND project_id = ? AND state = 'resolving'
               AND resolution_owner = ? AND revision = ?""",
             (
                 payload.confirmed_by.strip(), payload.note.strip(),
-                json.dumps(reconciliation_audit, ensure_ascii=False, sort_keys=True), now, now,
+                json.dumps(reconciliation_audit, ensure_ascii=False, sort_keys=True), now, now, now,
                 reconciliation_id, project_id, resolution_owner, resolving_revision,
             ),
         )
@@ -1011,11 +1208,12 @@ def _mark_reconciliation_cleanup_failed(
         cursor = db.execute(
             """UPDATE project_archive_reconciliations
             SET state = 'cleanup_failed', evidence = ?, cleanup_error = ?,
-                resolution_owner = NULL, updated_at = ?, revision = revision + 1
+                resolution_owner = NULL, resolution_stage = 'cleanup_failed',
+                resolution_heartbeat_at = ?, updated_at = ?, revision = revision + 1
             WHERE id = ? AND project_id = ? AND state = 'resolving'
               AND resolution_owner = ? AND revision = ?""",
             (
-                json.dumps(evidence, ensure_ascii=False, sort_keys=True), "；".join(errors), now,
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True), "；".join(errors), now, now,
                 reconciliation_id, project_id, resolution_owner, expected_revision,
             ),
         )
@@ -1280,6 +1478,9 @@ def _task_owner_is_dead(task: dict[str, Any]) -> bool:
 
 def recover_archive_tasks(db_path: Path, backup_root: Path) -> int:
     """Fail and clean only tasks whose local owner process is proven dead."""
+    # Resolver recovery is deliberately database-only: it preserves the lease
+    # and frozen paths for an explicit, idempotent manual retry.
+    recover_archive_reconciliations(db_path)
     with closing(connect(db_path)) as db:
         db.execute("BEGIN IMMEDIATE")
         _audit_archive_lease_reconciliations(db)

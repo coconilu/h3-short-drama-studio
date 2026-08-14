@@ -410,7 +410,13 @@ export type ArchiveReconciliation = {
   confirmed_no_live_process: boolean
   resolved_by?: string
   resolution_note?: string
+  resolution_owner_instance?: string
+  resolution_owner_host?: string
+  resolution_owner_pid?: number
+  resolution_owner_process_identity?: string
   resolution_started_at?: string
+  resolution_stage?: string
+  resolution_heartbeat_at?: string
   cleanup_error?: string
   cleanup_attempts: number
   created_at: string

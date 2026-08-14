@@ -5,6 +5,7 @@ import hashlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,7 @@ from backend.project_archive import (
     create_archive_router,
     create_project_archive,
     list_archive_reconciliations,
+    recover_archive_reconciliations,
     recover_archive_tasks,
     verify_project_archive,
 )
@@ -204,6 +206,45 @@ class ProjectArchiveTests(unittest.TestCase):
             studio.DB_PATH, project["id"], include_resolved=False,
         )[0]
         return acquired, reconciliation
+
+    def crash_resolver_in_child(self, conflict: dict, mode: str) -> subprocess.CompletedProcess[str]:
+        repo_root = Path(__file__).resolve().parents[1]
+        script = f"""
+import os
+from pathlib import Path
+from backend import project_archive as archive
+
+mode = {mode!r}
+if mode == "after-claim":
+    original_touch = archive._touch_reconciliation_stage
+    def crash_before_cleanup(db_path, project_id, reconciliation_id, owner, revision, stage):
+        if stage == "cleaning":
+            os._exit(41)
+        return original_touch(db_path, project_id, reconciliation_id, owner, revision, stage)
+    archive._touch_reconciliation_stage = crash_before_cleanup
+elif mode == "mid-cleanup":
+    def crash_during_cleanup(db_path, backup_root, task):
+        archive._cleanup_tree(Path(task["staging_path"]))
+        os._exit(42)
+    archive._cleanup_archive_task_paths = crash_during_cleanup
+else:
+    raise RuntimeError(mode)
+
+archive.resolve_archive_reconciliation(
+    Path({str(studio.DB_PATH)!r}), Path({str(self.backup_root)!r}),
+    {self.project["id"]!r}, {conflict["id"]!r},
+    archive.ArchiveReconciliationResolve(
+        expected_revision={int(conflict["revision"])},
+        confirmed_by="child-resolver",
+        note="controlled child resolver crash contract",
+        confirm_no_live_archive_process=True,
+    ),
+)
+"""
+        return subprocess.run(
+            [sys.executable, "-c", script], cwd=repo_root, text=True,
+            capture_output=True, timeout=20, check=False,
+        )
 
     def test_archive_package_contains_scoped_data_and_verifies(self) -> None:
         video = studio.EXPORT_ROOT / "delivery.mp4"
@@ -594,7 +635,11 @@ class ProjectArchiveTests(unittest.TestCase):
             columns = {row[1] for row in db.execute("PRAGMA table_info(project_archive_reconciliations)")}
             rows = [dict(row) for row in db.execute("SELECT * FROM project_archive_reconciliations")]
         self.assertIn("'resolving'", table_sql)
-        self.assertTrue({"resolution_owner", "resolution_paths", "cleanup_error", "cleanup_attempts"} <= columns)
+        self.assertTrue({
+            "resolution_owner", "resolution_owner_instance", "resolution_owner_host",
+            "resolution_owner_pid", "resolution_owner_process_identity", "resolution_paths",
+            "resolution_stage", "resolution_heartbeat_at", "cleanup_error", "cleanup_attempts",
+        } <= columns)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["id"], "v1-reconciliation")
         self.assertEqual(rows[0]["state"], "unresolved")
@@ -730,6 +775,43 @@ class ProjectArchiveTests(unittest.TestCase):
             str(paths[1]): paths[1].read_bytes(),
             str(paths[2]): paths[2].read_bytes(),
         }
+        now = studio.utc_now()
+        with closing(studio.connect()) as db:
+            cursor = db.execute(
+                """UPDATE project_archive_reconciliations
+                SET state = 'resolving', revision = revision + 1,
+                    resolution_owner = 'dead-cross-project-resolver',
+                    resolution_owner_instance = 'dead-cross-project-instance',
+                    resolution_owner_host = ?, resolution_owner_pid = 424242,
+                    resolution_owner_process_identity = 'win-filetime:111',
+                    resolution_stage = 'cleaning', resolution_heartbeat_at = ?,
+                    resolution_started_at = ?, resolution_paths = '{}'
+                WHERE id = ? AND state = 'unresolved' AND revision = ?""",
+                (
+                    archive_module.ARCHIVE_OWNER_HOST, now, now,
+                    conflict["id"], conflict["revision"],
+                ),
+            )
+            self.assertEqual(cursor.rowcount, 1)
+            db.commit()
+        with patch.object(archive_module, "_process_identity", return_value=(False, None)):
+            self.assertEqual(recover_archive_reconciliations(studio.DB_PATH), 1)
+        conflict = list_archive_reconciliations(
+            studio.DB_PATH, self.project["id"], include_resolved=False,
+        )[0]
+        self.assertEqual(conflict["state"], "cleanup_failed")
+        self.assertEqual(conflict["resolution_stage"], "crash_recovered")
+        with closing(studio.connect()) as db:
+            self.assertEqual(
+                dict(db.execute("SELECT * FROM project_archive_tasks WHERE id = 'archive-task-foreign'").fetchone()),
+                before_task,
+            )
+            self.assertEqual(
+                dict(db.execute("SELECT * FROM project_archive_leases WHERE lease_id = 'archive-lease-foreign'").fetchone()),
+                before_lease,
+            )
+        for path, contents in before_files.items():
+            self.assertEqual(Path(path).read_bytes(), contents)
         with patch.object(archive_module, "_cleanup_archive_task_paths", side_effect=AssertionError("foreign cleanup")) as cleanup:
             resolved = self.endpoint(
                 "/api/projects/{project_id}/archive-reconciliations/{reconciliation_id}/resolve", "POST",
@@ -868,6 +950,224 @@ class ProjectArchiveTests(unittest.TestCase):
         self.assertEqual(retried["revision"], conflict["revision"] + 4)
         for key in ("staging_path", "partial_path", "final_path"):
             self.assertFalse(Path(acquired[key]).exists())
+
+    def test_resolver_crash_after_claim_recovers_once_and_manual_retry_unblocks_all_workers(self) -> None:
+        acquired, conflict = self.create_same_project_owner_mismatch(self.project, "resolver-after-claim")
+        child = self.crash_resolver_in_child(conflict, "after-claim")
+        self.assertEqual(child.returncode, 41, child.stderr)
+        with closing(studio.connect()) as db:
+            abandoned = dict(db.execute(
+                "SELECT * FROM project_archive_reconciliations WHERE id = ?", (conflict["id"],),
+            ).fetchone())
+            self.assertEqual(abandoned["state"], "resolving")
+            self.assertEqual(abandoned["resolution_stage"], "acquired")
+            self.assertGreater(int(abandoned["resolution_owner_pid"]), 0)
+            self.assertTrue(str(abandoned["resolution_owner_process_identity"]).startswith(("win-filetime:", "proc-start:")))
+            frozen_paths = json.loads(abandoned["resolution_paths"])["paths"]
+            self.assertEqual(frozen_paths["staging_path"], str(acquired["staging_path"]))
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (self.project["id"],),
+            ).fetchone())
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            recovered_counts = list(pool.map(lambda _: recover_archive_reconciliations(studio.DB_PATH), range(2)))
+        self.assertEqual(sorted(recovered_counts), [0, 1])
+        recovered = list_archive_reconciliations(
+            studio.DB_PATH, self.project["id"], include_resolved=False,
+        )[0]
+        self.assertEqual(recovered["state"], "cleanup_failed")
+        self.assertEqual(recovered["revision"], conflict["revision"] + 2)
+        self.assertEqual(recovered["resolution_stage"], "crash_recovered")
+        self.assertIn("异常退出", recovered["cleanup_error"])
+        self.assertEqual(len(recovered["evidence"]["resolver_crash_recoveries"]), 1)
+        with closing(studio.connect()) as db:
+            before_restart = dict(db.execute(
+                "SELECT * FROM project_archive_reconciliations WHERE id = ?", (conflict["id"],),
+            ).fetchone())
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (self.project["id"],),
+            ).fetchone())
+        self.assertEqual(recover_archive_tasks(studio.DB_PATH, self.backup_root), 0)
+        self.assertEqual(recover_archive_tasks(studio.DB_PATH, self.backup_root), 0)
+        with closing(studio.connect()) as db:
+            after_restart = dict(db.execute(
+                "SELECT * FROM project_archive_reconciliations WHERE id = ?", (conflict["id"],),
+            ).fetchone())
+        self.assertEqual(after_restart, before_restart)
+
+        resolved = self.endpoint(
+            "/api/projects/{project_id}/archive-reconciliations/{reconciliation_id}/resolve", "POST",
+        )(
+            self.project["id"], conflict["id"],
+            ArchiveReconciliationResolve(
+                expected_revision=recovered["revision"], confirmed_by="本机操作员",
+                note="已确认崩溃 resolver 不再存活并重试幂等清理",
+                confirm_no_live_archive_process=True,
+            ),
+        )
+        self.assertEqual(resolved["state"], "resolved")
+        self.assertEqual(resolved["revision"], conflict["revision"] + 4)
+        for key in ("staging_path", "partial_path", "final_path"):
+            self.assertFalse(Path(acquired[key]).exists())
+        archive = create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
+        self.assertEqual(archive["revision"], 1)
+        self.assert_downstream_claims_resume()
+
+    def test_resolver_crash_mid_cleanup_is_idempotent_and_keeps_lease_until_retry(self) -> None:
+        acquired, conflict = self.create_same_project_owner_mismatch(self.project, "resolver-mid-cleanup")
+        child = self.crash_resolver_in_child(conflict, "mid-cleanup")
+        self.assertEqual(child.returncode, 42, child.stderr)
+        self.assertFalse(Path(acquired["staging_path"]).exists())
+        self.assertTrue(Path(acquired["partial_path"]).exists())
+        self.assertTrue(Path(acquired["final_path"]).exists())
+        # The real lifespan entrypoint calls recover_archive_tasks, which now
+        # performs resolver recovery before ordinary archive-task recovery.
+        self.assertEqual(recover_archive_tasks(studio.DB_PATH, self.backup_root), 0)
+        recovered = list_archive_reconciliations(
+            studio.DB_PATH, self.project["id"], include_resolved=False,
+        )[0]
+        self.assertEqual(recovered["state"], "cleanup_failed")
+        self.assertEqual(recovered["resolution_stage"], "crash_recovered")
+        self.assertEqual(recovered["evidence"]["resolver_crash_recoveries"][0]["stage"], "cleaning")
+        with closing(studio.connect()) as db:
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (self.project["id"],),
+            ).fetchone())
+        resolved = self.endpoint(
+            "/api/projects/{project_id}/archive-reconciliations/{reconciliation_id}/resolve", "POST",
+        )(
+            self.project["id"], conflict["id"],
+            ArchiveReconciliationResolve(
+                expected_revision=recovered["revision"], confirmed_by="本机操作员",
+                note="已检查部分清理结果，确认可安全执行幂等重试",
+                confirm_no_live_archive_process=True,
+            ),
+        )
+        self.assertEqual(resolved["state"], "resolved")
+        for key in ("staging_path", "partial_path", "final_path"):
+            self.assertFalse(Path(acquired[key]).exists())
+
+    def test_live_resolver_is_never_recovered_then_dead_child_becomes_retryable(self) -> None:
+        _, conflict = self.create_same_project_owner_mismatch(self.project, "resolver-live")
+        marker = self.root / "resolver-live.marker"
+        repo_root = Path(__file__).resolve().parents[1]
+        script = f"""
+import time
+from pathlib import Path
+from backend import project_archive as archive
+
+def block_cleanup(db_path, backup_root, task):
+    Path({str(marker)!r}).write_text("entered", encoding="utf-8")
+    while True:
+        time.sleep(0.1)
+
+archive._cleanup_archive_task_paths = block_cleanup
+archive.resolve_archive_reconciliation(
+    Path({str(studio.DB_PATH)!r}), Path({str(self.backup_root)!r}),
+    {self.project["id"]!r}, {conflict["id"]!r},
+    archive.ArchiveReconciliationResolve(
+        expected_revision={int(conflict["revision"])}, confirmed_by="live-child",
+        note="live child resolver must retain ownership",
+        confirm_no_live_archive_process=True,
+    ),
+)
+"""
+        child = subprocess.Popen(
+            [sys.executable, "-c", script], cwd=repo_root,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(marker.exists(), "live resolver did not reach cleanup")
+            self.assertIsNone(child.poll())
+            self.assertEqual(recover_archive_reconciliations(studio.DB_PATH), 0)
+            current = list_archive_reconciliations(
+                studio.DB_PATH, self.project["id"], include_resolved=False,
+            )[0]
+            self.assertEqual(current["state"], "resolving")
+            self.assertEqual(current["resolution_stage"], "cleaning")
+        finally:
+            child.terminate()
+            child.wait(timeout=10)
+        self.assertEqual(recover_archive_reconciliations(studio.DB_PATH), 1)
+        recovered = list_archive_reconciliations(
+            studio.DB_PATH, self.project["id"], include_resolved=False,
+        )[0]
+        self.assertEqual(recovered["state"], "cleanup_failed")
+        with closing(studio.connect()) as db:
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (self.project["id"],),
+            ).fetchone())
+
+    def test_resolver_recovery_requires_verified_local_death_or_same_kind_pid_reuse(self) -> None:
+        cases = (
+            ("alive", "other-resolver", archive_module.ARCHIVE_OWNER_HOST, "win-filetime:111", (True, "win-filetime:111"), False),
+            ("cross-host", "other-resolver", "another-host", "win-filetime:111", (False, None), False),
+            ("runtime-fallback", "other-resolver", archive_module.ARCHIVE_OWNER_HOST, "runtime:424242:old", (False, None), False),
+            ("unreadable", "other-resolver", archive_module.ARCHIVE_OWNER_HOST, "win-filetime:111", (None, None), False),
+            ("current-owner", archive_module.ARCHIVE_OWNER_INSTANCE, archive_module.ARCHIVE_OWNER_HOST, "win-filetime:111", (False, None), False),
+            ("pid-reuse", "other-resolver", archive_module.ARCHIVE_OWNER_HOST, "win-filetime:111", (True, "win-filetime:222"), True),
+            ("dead", "other-resolver", archive_module.ARCHIVE_OWNER_HOST, "win-filetime:111", (False, None), True),
+        )
+        for index, (label, owner_instance, owner_host, stored_identity, current_result, should_recover) in enumerate(cases, 1):
+            with self.subTest(label=label):
+                project = studio.create_project(
+                    studio.ProjectCreate(
+                        title=f"resolver identity {label}", episode=f"EP{30 + index}",
+                        logline="resolver identity recovery matrix", target_duration=5,
+                        shots=[studio.ShotCreate(title=label, description="identity", prompt="identity")],
+                    )
+                )
+                _, conflict = self.create_same_project_owner_mismatch(project, f"resolver-identity-{index}")
+                now = studio.utc_now()
+                with closing(studio.connect()) as db:
+                    cursor = db.execute(
+                        """UPDATE project_archive_reconciliations
+                        SET state = 'resolving', revision = revision + 1,
+                            resolution_owner = ?, resolution_owner_instance = ?,
+                            resolution_owner_host = ?, resolution_owner_pid = 424242,
+                            resolution_owner_process_identity = ?, resolution_stage = 'cleaning',
+                            resolution_heartbeat_at = ?, resolution_started_at = ?,
+                            resolution_paths = '{}'
+                        WHERE id = ? AND state = 'unresolved' AND revision = ?""",
+                        (
+                            f"resolver-token-{label}", owner_instance, owner_host, stored_identity,
+                            now, now, conflict["id"], conflict["revision"],
+                        ),
+                    )
+                    self.assertEqual(cursor.rowcount, 1)
+                    db.commit()
+                    before = dict(db.execute(
+                        "SELECT * FROM project_archive_reconciliations WHERE id = ?", (conflict["id"],),
+                    ).fetchone())
+                with patch.object(archive_module, "_process_identity", return_value=current_result):
+                    recovered = recover_archive_reconciliations(studio.DB_PATH)
+                with closing(studio.connect()) as db:
+                    after = dict(db.execute(
+                        "SELECT * FROM project_archive_reconciliations WHERE id = ?", (conflict["id"],),
+                    ).fetchone())
+                    lease_exists = db.execute(
+                        "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project["id"],),
+                    ).fetchone()
+                self.assertIsNotNone(lease_exists)
+                if should_recover:
+                    self.assertEqual(recovered, 1)
+                    self.assertEqual(after["state"], "cleanup_failed")
+                    self.assertEqual(after["revision"], before["revision"] + 1)
+                    self.assertEqual(after["resolution_stage"], "crash_recovered")
+                else:
+                    self.assertEqual(recovered, 0)
+                    self.assertEqual(after, before)
+                    with closing(studio.connect()) as db:
+                        db.execute(
+                            """UPDATE project_archive_reconciliations
+                            SET resolution_owner_host = 'retired-remote-host'
+                            WHERE id = ? AND state = 'resolving'""",
+                            (conflict["id"],),
+                        )
+                        db.commit()
 
     def test_owner_identity_requires_same_verified_os_identity_kind_before_pid_reuse_recovery(self) -> None:
         cases = (
