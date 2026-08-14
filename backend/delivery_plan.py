@@ -51,6 +51,8 @@ def init_delivery_schema(db: sqlite3.Connection) -> None:
           section_id TEXT,
           candidate_id TEXT,
           master_version_id TEXT,
+          hd_artifact_id TEXT,
+          hd_master_version_id TEXT,
           source_snapshot TEXT NOT NULL DEFAULT '{}',
           PRIMARY KEY(plan_id, shot_id),
           UNIQUE(plan_id, ordinal)
@@ -78,6 +80,8 @@ def init_delivery_schema(db: sqlite3.Connection) -> None:
         ("section_id", "TEXT"),
         ("candidate_id", "TEXT"),
         ("master_version_id", "TEXT"),
+        ("hd_artifact_id", "TEXT"),
+        ("hd_master_version_id", "TEXT"),
         ("source_snapshot", "TEXT NOT NULL DEFAULT '{}'"),
     )
     for column, definition in migrations:
@@ -159,6 +163,16 @@ def _source_for_shot(db: sqlite3.Connection, shot_id: str, output_root: Path | N
         }
     shot_row = db.execute("SELECT * FROM shots WHERE id = ?", (shot_id,)).fetchone()
     shot = dict(shot_row) if shot_row else {}
+    hd_source = None
+    if output_root is not None and _table_exists(db, "hd_master_versions"):
+        try:
+            try:
+                from .hd_delivery import selected_hd_source
+            except ImportError:
+                from hd_delivery import selected_hd_source
+            hd_source = selected_hd_source(db, shot_id, output_root)
+        except HTTPException:
+            raise
     candidate = db.execute(
         "SELECT * FROM candidates WHERE shot_id = ? AND selected = 1 AND archived = 0", (shot_id,),
     ).fetchone()
@@ -203,7 +217,7 @@ def _source_for_shot(db: sqlite3.Connection, shot_id: str, output_root: Path | N
     if mapping and _table_exists(db, "creative_sections"):
         section = db.execute("SELECT revision FROM creative_sections WHERE id = ?", (mapping["section_id"],)).fetchone()
         section_revision = section["revision"] if section else None
-    return {
+    base_source = {
         "section_id": mapping["section_id"] if mapping else None,
         "section_revision": section_revision,
         "storyboard_revision": mapping["last_synced_revision"] if mapping else None,
@@ -221,6 +235,27 @@ def _source_for_shot(db: sqlite3.Connection, shot_id: str, output_root: Path | N
         "source_status": source_status,
         "source_reason": source_reason,
     }
+    if not hd_source:
+        return {**base_source, "source_type": "candidate", "hd_artifact_id": None, "hd_master_version_id": None}
+    return {
+        **base_source,
+        "candidate_id": hd_source["source_candidate_id"],
+        "master_version_id": hd_source["source_master_version_id"],
+        "media": {
+            "status": "verified", "output_file": hd_source["media"]["path"],
+            "size_bytes": hd_source["media"]["size_bytes"], "modified_ns": hd_source["media"]["modified_ns"],
+            "checksum_sha256": hd_source["media"]["checksum_sha256"],
+        },
+        "source_status": "ready", "source_reason": None, "source_type": "hd_artifact",
+        "hd_artifact_id": hd_source["hd_artifact_id"],
+        "hd_master_version_id": hd_source["hd_master_version_id"],
+        "hd_master_revision": hd_source["hd_master_revision"],
+        "hd_review_id": hd_source["hd_review_id"], "hd_review_revision": hd_source["hd_review_revision"],
+        "hd_strategy_type": hd_source["strategy_type"], "hd_strategy_kind": hd_source["strategy_kind"],
+        "hd_plan_id": hd_source["plan_id"], "hd_plan_hash": hd_source["plan_hash"],
+        "hd_model_id": hd_source["model_id"], "hd_workflow_id": hd_source["workflow_id"],
+        "hd_provenance": hd_source["provenance"],
+    }
 
 
 def _bind_sources(
@@ -233,6 +268,8 @@ def _bind_sources(
                 "section_id": source["section_id"],
                 "candidate_id": source["candidate_id"],
                 "master_version_id": source["master_version_id"],
+                "hd_artifact_id": source.get("hd_artifact_id"),
+                "hd_master_version_id": source.get("hd_master_version_id"),
                 "source_snapshot": source,
             },
         }
@@ -288,6 +325,8 @@ def _hash_items(items: list[dict[str, Any]]) -> str:
             "section_id": item.get("section_id"),
             "candidate_id": item.get("candidate_id"),
             "master_version_id": item.get("master_version_id"),
+            "hd_artifact_id": item.get("hd_artifact_id"),
+            "hd_master_version_id": item.get("hd_master_version_id"),
             "source_snapshot": item.get("source_snapshot") or {},
         }
         for item in items
@@ -441,13 +480,14 @@ def save_delivery_plan(
                 """INSERT INTO delivery_plan_items
                 (plan_id, shot_id, ordinal, subtitle_enabled, subtitle_start_seconds, transition,
                  in_point_seconds, out_point_seconds, dialogue_mode, section_id, candidate_id,
-                 master_version_id, source_snapshot)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  master_version_id, hd_artifact_id, hd_master_version_id, source_snapshot)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     plan_id, item["shot_id"], item["ordinal"], int(item["subtitle_enabled"]),
                     item["subtitle_start_seconds"], item["transition"], item["in_point_seconds"],
                     item["out_point_seconds"], item["dialogue_mode"], item.get("section_id"),
                     item.get("candidate_id"), item.get("master_version_id"),
+                    item.get("hd_artifact_id"), item.get("hd_master_version_id"),
                     json.dumps(item.get("source_snapshot") or {}, ensure_ascii=False, sort_keys=True),
                 ),
             )

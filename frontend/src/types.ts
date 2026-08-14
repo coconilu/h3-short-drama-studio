@@ -376,7 +376,7 @@ export type WorkbenchProject = ProjectSummary & {
 
 export type WorkbenchActivity = {
   id: string
-  item_type: 'generation' | 'export'
+  item_type: 'generation' | 'export' | 'archive'
   kind: string
   state: string
   message: string
@@ -397,6 +397,33 @@ export type StorageStatus = {
   disk_free_bytes: number
 }
 
+export type ArchiveReconciliation = {
+  id: string
+  project_id: string
+  project_title?: string
+  lease_id: string
+  task_id?: string
+  reason: 'taskless_lease' | 'terminal_task_lease' | 'task_project_mismatch' | 'task_lease_owner_mismatch'
+  state: 'unresolved' | 'resolving' | 'cleanup_failed' | 'resolved'
+  revision: number
+  evidence: Record<string, unknown>
+  confirmed_no_live_process: boolean
+  resolved_by?: string
+  resolution_note?: string
+  resolution_owner_instance?: string
+  resolution_owner_host?: string
+  resolution_owner_pid?: number
+  resolution_owner_process_identity?: string
+  resolution_started_at?: string
+  resolution_stage?: string
+  resolution_heartbeat_at?: string
+  cleanup_error?: string
+  cleanup_attempts: number
+  created_at: string
+  updated_at: string
+  resolved_at?: string
+}
+
 export type Workbench = {
   summary: {
     project_count: number
@@ -408,6 +435,7 @@ export type Workbench = {
   projects: WorkbenchProject[]
   activities: WorkbenchActivity[]
   queue: WorkbenchActivity[]
+  archive_reconciliations: ArchiveReconciliation[]
   storage: StorageStatus
 }
 
@@ -641,6 +669,8 @@ export type RoughCut = {
   has_audio?: boolean
   shot_count?: number
   size_bytes?: number
+  sha256?: string
+  export_run_id?: string
   updated_at?: string
   quality_note?: string
   run?: ExportRun
@@ -650,13 +680,21 @@ export type ExportSource = {
   shot_id: string
   ordinal: number
   title: string
-  source_type: 'candidate' | 'promotion'
+  source_type: 'candidate' | 'promotion' | 'hd_artifact'
   source_id: string
   source_detail?: string
   duration_seconds: number
   width: number
   height: number
   has_audio: boolean
+  checksum_sha256?: string
+  hd_artifact_id?: string
+  hd_master_version_id?: string
+  hd_strategy_type?: 'ref2va_regenerate' | 'original_model_regenerate' | 'deterministic_scale'
+  hd_strategy_kind?: 'model_regeneration' | 'pixel_scaling'
+  hd_plan_hash?: string
+  hd_model_id?: string
+  hd_workflow_id?: string
 }
 
 export type ExportPreflight = {

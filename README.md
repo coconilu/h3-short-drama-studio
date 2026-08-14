@@ -600,3 +600,52 @@ append-only 草稿母版版本（可回滚，不覆盖候选）
 | 项目归档 | 归档包包含生产批次、逐次 attempt、审片修订、母版历史和全部装配版本，原始候选媒体继续按既有受管媒体规则校验 |
 
 本阶段不执行高分辨率精修，也不会把普通放大称为高清重生成。自动化测试通过受控 fake 适配器验证提交、恢复和证据合同，不调用真实 GPU 或本地 Agent 额度。
+
+## 逐镜高清策略与横屏交付（Issue #6）
+
+“高清交付”页把已锁定的低清母版推进为独立、可审阅的高清版本。只有存在 append-only 低清母版的镜头才能创建策略；草稿候选、历史证据债务或后来发生变化的来源都会失败关闭。
+
+| 高清策略 | 实际操作 | 证据与风险 |
+|---|---|---|
+| Ref2VA 高清精修 | 把低清母版作为视频参考，在目标分辨率重新生成 | 属于模型重生成；记录 prompt、seed、参考、模型、workflow、Comfy task 和媒体 SHA；必须人工确认身份、动作与运镜漂移 |
+| 原策略高清重生成 | 沿用低清母版的 FL2VA / Ref2VA 路线、prompt、seed 与参考重新采样 | 属于模型重生成；同样可能漂移，不能承诺复现原镜头 |
+| 确定性保真放大 | FFmpeg Lanczos 等比缩放并补边到目标画布，保留原时长和音轨 | 属于像素缩放，不调用 GPU，不会创造新细节，也不会伪称模型高清重生成 |
+
+每次策略保存都会创建新修订。`dry-run` 只冻结命令、模型/workflow、源媒体和计划哈希；模型策略必须在界面二次确认后才可进入 GPU 队列。dry-run、实际任务与归档分别持有持久 lease，归档冻结期间不会再认领高清、低清生成或导出任务。实际执行会先把低清母版和参考素材稳定复制到本次 attempt 私有 staging，再在 runner 前用短事务复核计划、母版、路径、大小与 SHA。任务采用逐镜 lease、幂等键和可恢复状态：确认未启动的失败可以安全重试，外部进程启动后结果未知则保持人工对账门禁。完成产物经过私有输出、内容寻址发布与 Windows 禁写/禁删句柄保护后，才与 job/artifact 在同一事务完成；记录输入/输出 SHA-256、真实规格、音轨、prompt/task ID、实际 seed/参考和完整 provenance。高清审片保存五维评分、观看时长、备注和漂移确认；定稿与回滚只追加 `hd_master_versions`，不覆盖历史产物。
+
+```text
+低清母版
+  → 选择三类高清策略之一
+  → dry-run（零 GPU）
+  → 模型策略人工确认 / 确定性缩放直接执行
+  → 高清与低清并排审片
+  → append-only 高清定稿
+  → 锁定装配（顺序、入出点、字幕、原声/静音）
+  → 1344×768 或更高横屏 FFmpeg 导出
+  → 画面与声音分别签署
+  → 冻结验收 JSON/SHA
+  → 创建并校验完整项目归档
+```
+
+交付装配只引用锁定时的高清 artifact、高清母版修订和媒体 SHA。导出仍使用每次 run 私有的内容寻址 staging；单镜头和多镜头的 `.sources.json` 都固定为 JSON 数组。当前成片必须至少为 1344×768 横屏、可解码、镜头覆盖完整且包含音轨，画面连续性与声音签署必须绑定精确 `export_run_id + video SHA-256`；切换或重新导出后旧签署不会授权新成片。项目归档包含全部高清计划、验证、任务、产物、审片、定稿历史和经 SHA 校验的高清媒体；归档媒体也先进入私有 staging，并对 ZIP 目录、项目数据和每个媒体的大小/SHA 做完整复验。任何媒体缺失、被替换或复制期间变化都会让本次归档失败关闭，既不发布不完整 ZIP，也不把项目标记为已归档。
+
+归档冻结由持久 `project_archive_tasks` 与项目级 lease 共同管理：任务记录进程 owner、阶段、heartbeat、私有 staging/partial/final 路径和 CAS revision。服务启动时只接管本机且已能证明 owner 进程死亡或 PID 身份变化的任务；只有存储值和当前值都属于同一种可验证 OS 身份（Windows `win-filetime` 或 Linux `/proc` start time）时，身份差异才可证明 PID 被复用。活进程、runtime fallback、身份不可读或不可比较时即使 heartbeat 陈旧也不会被其他实例清理。崩溃恢复会删除私有 staging、partial 和未登记 final，把任务保留为可审计失败记录并释放 lease，但绝不创建 `ready` 归档或修改项目归档状态；失败记录会出现在“所有项目”的最近活动中，也可通过 `/api/projects/{project_id}/archive-tasks` 查看。
+
+旧版本遗留的 taskless lease、终态任务仍占 lease、任务与 lease 的项目或 owner 不一致都不会被启动恢复静默删除。系统会把它们迁移为项目隔离的 `project_archive_reconciliations` 记录并继续冻结 H3、生产批次、HD 和导出认领；“所有项目”侧栏会展示归档冻结对账卡。操作员必须检查本机进程和日志，填写说明，显式勾选“我已确认没有存活归档进程”，再按记录 revision 提交。后端先以短事务取得精确 reconciliation/lease/task 的 CAS 清理所有权并冻结受管路径，进入 `resolving`，同时持久化 resolver 的 instance/host/PID、可验证进程身份、阶段与 heartbeat；只有同项目任务会在事务外清理，误指向异项目任务时绝不触碰对方任务、lease 或文件。若 resolver 在事务外清理期间崩溃，服务重启只在能证明本机 owner 已死亡或同类 OS 身份发生 PID 复用时，以 revision CAS 转为 `cleanup_failed` 并追加 crash audit；lease 和冻结路径保持不动，活 owner、跨主机、runtime fallback 或身份不可读一律继续 `resolving`。第二个短事务核验 owner、revision、lease 和路径快照后，才写任务失败审计、释放当前项目冻结并完成 `resolved`。文件清理失败或 crash recovery 都会递增 revision，可由操作员按新 revision 幂等重试；历史和解决结果可通过 `GET /api/projects/{project_id}/archive-reconciliations?include_resolved=true` 查询，不能安全确认时应保留冻结而不是直接删数据库记录。
+
+### 本地配置与能力边界
+
+| 依赖 | 配置/用途 | 边界 |
+|---|---|---|
+| ComfyUI | `COMFYUI_URL`，默认 `http://127.0.0.1:8188` | 仅模型重生成策略需要；平台不会把 dry-run 说成已生成 |
+| H3 工作流 | `H3_PIPELINE_SCRIPT`，默认查找本仓库或用户技能目录里的 `h3_video_pipeline.py` | Ref2VA / FL2VA 的真实能力取决于本地模型、节点和显存；不保证固定耗时或绝对连续性 |
+| ComfyUI 输出 | `COMFYUI_ROOT` 下的 `output` | 低清母版与高清产物必须在受管输出根内并通过 SHA 校验 |
+| FFmpeg / ffprobe | `PATH` 中可调用 | 用于确定性放大、媒体 QC、音轨/字幕装配和横屏导出；缩放不增加生成细节 |
+| 桌面/API | `scripts/start.ps1` 或 Release 客户端启动本地服务 | 当前是本机单用户工作区，不是云端多人协作或发布平台 |
+
+自动化端到端验收从空项目开始，覆盖简报、多个剧情提案及单一定案、角色、章节/结构化小节、批准同步、双候选审片、低清母版、高清策略、装配、真实小媒体 FFmpeg 导出、双签、验收与归档。测试里的 Agent/H3/Comfy 候选明确记录为 `controlled-fake-h3-no-gpu` 和 `real_model_output: false`，不调用真实 Agent 额度、ComfyUI 或 GPU，也不冒充模型生成；确定性放大与最终装配则实际执行本机 FFmpeg。
+
+```powershell
+python -m unittest backend.test_end_to_end_delivery -v
+python -m unittest backend.test_hd_ffmpeg -v
+```

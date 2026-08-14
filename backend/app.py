@@ -28,9 +28,23 @@ from pydantic import BaseModel, Field
 try:
     from .content_planning import create_content_router, init_content_schema
     from .creative_storyboard import create_storyboard_router, init_storyboard_schema
+    from .hd_delivery import (
+        HDRunnerError,
+        configure_hd_delivery,
+        create_hd_router,
+        init_hd_schema,
+        recover_hd_jobs,
+        start_hd_worker,
+        stop_hd_worker,
+    )
     from .local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from .delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
-    from .project_archive import create_archive_router, init_archive_schema
+    from .project_archive import (
+        create_archive_router,
+        init_archive_schema,
+        list_archive_reconciliations,
+        recover_archive_tasks,
+    )
     from .production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from .prompt_compiler import (
         approve_plan,
@@ -57,9 +71,18 @@ try:
 except ImportError:  # Support `uvicorn app:app` when backend is the working directory.
     from content_planning import create_content_router, init_content_schema
     from creative_storyboard import create_storyboard_router, init_storyboard_schema
+    from hd_delivery import (
+        HDRunnerError,
+        configure_hd_delivery,
+        create_hd_router,
+        init_hd_schema,
+        recover_hd_jobs,
+        start_hd_worker,
+        stop_hd_worker,
+    )
     from local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
-    from project_archive import create_archive_router, init_archive_schema
+    from project_archive import create_archive_router, init_archive_schema, list_archive_reconciliations, recover_archive_tasks
     from production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from prompt_compiler import (
         approve_plan,
@@ -181,6 +204,12 @@ def ensure_column(db: sqlite3.Connection, table: str, name: str, definition: str
         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
+def table_exists(db: sqlite3.Connection, name: str) -> bool:
+    return bool(db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,),
+    ).fetchone())
+
+
 def migrate_db(db: sqlite3.Connection) -> None:
     for name, definition in (
         ("subtitle_enabled", "INTEGER NOT NULL DEFAULT 1"),
@@ -242,6 +271,12 @@ def migrate_db(db: sqlite3.Connection) -> None:
         ("log_file", "TEXT"),
     ):
         ensure_column(db, "export_runs", name, definition)
+    for name, definition in (
+        ("export_run_id", "TEXT"),
+        ("export_sha256", "TEXT"),
+        ("export_snapshot", "TEXT NOT NULL DEFAULT '{}'"),
+    ):
+        ensure_column(db, "delivery_signoffs", name, definition)
     db.execute("UPDATE candidates SET source = 'mock' WHERE source IS NULL OR source = ''")
     db.execute("UPDATE candidates SET status = 'completed' WHERE status IS NULL OR status = ''")
     db.execute("UPDATE jobs SET updated_at = created_at WHERE updated_at IS NULL")
@@ -433,6 +468,9 @@ def init_db() -> None:
               decision TEXT NOT NULL CHECK(decision IN ('pass', 'reject')),
               note TEXT NOT NULL,
               source TEXT NOT NULL,
+              export_run_id TEXT,
+              export_sha256 TEXT,
+              export_snapshot TEXT NOT NULL DEFAULT '{}',
               created_at TEXT NOT NULL,
               UNIQUE(project_id, category, revision)
             );
@@ -456,6 +494,7 @@ def init_db() -> None:
         init_storyboard_schema(db)
         init_production_schema(db)
         init_review_schema(db)
+        init_hd_schema(db)
         init_delivery_schema(db)
         init_archive_schema(db)
         migrate_db(db)
@@ -688,12 +727,15 @@ def require_active_export_run(run_id: str) -> dict[str, Any]:
 
 
 def set_active_project(project_id: str) -> None:
-    project = row("SELECT id, archived FROM projects WHERE id = ?", (project_id,))
-    if not project:
-        raise HTTPException(404, "项目不存在")
-    if project["archived"]:
-        raise HTTPException(409, "归档项目不能直接打开，请先恢复到工作台")
     with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        project = db.execute("SELECT id, archived FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if not project:
+            raise HTTPException(404, "项目不存在")
+        if project["archived"]:
+            raise HTTPException(409, "归档项目不能直接打开，请先恢复到工作台")
+        if db.execute("SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project_id,)).fetchone():
+            raise HTTPException(409, "项目正在冻结归档，请稍后再打开")
         db.execute(
             """INSERT INTO workspace_settings (key, value, updated_at)
             VALUES ('active_project_id', ?, ?)
@@ -1432,6 +1474,239 @@ def run_h3(arguments: list[str], timeout: int = 90) -> subprocess.CompletedProce
         detail = completed.stderr.strip() or completed.stdout.strip() or "H3 适配器执行失败"
         raise H3AdapterError(502, detail, process_started=True)
     return completed
+
+
+def _hd_prompt_file(plan_hash: str, prompt: str) -> Path:
+    root = (RUNTIME_ROOT / "hd-prompts").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    path = (root / f"{plan_hash}.txt").resolve()
+    path.relative_to(root)
+    expected = prompt.encode("utf-8")
+    if path.exists() and path.read_bytes() != expected:
+        raise HDRunnerError("高清 prompt 冻结文件与 plan hash 不一致", process_started=False)
+    if not path.exists():
+        temporary = root / f".{plan_hash}-{uuid.uuid4().hex}.tmp"
+        temporary.write_bytes(expected)
+        temporary.replace(path)
+    return path
+
+
+def _safe_hd_project_slug(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) or value in {".", ".."}:
+        raise HDRunnerError("H3 高清项目标识只能包含字母、数字、点、下划线和连字符", process_started=False)
+    return value
+
+
+def _hd_attempt_output_root(request: dict[str, Any], *, required: bool) -> Path | None:
+    raw = str(request.get("attempt_output_root") or "")
+    if not raw:
+        if required:
+            raise HDRunnerError("高清实际执行缺少私有 attempt 输出目录", process_started=False)
+        return None
+    root = Path(raw).resolve()
+    allowed = (COMFY_OUTPUT_ROOT / "hd-delivery" / "attempts").resolve()
+    try:
+        root.relative_to(allowed)
+    except ValueError as exc:
+        raise HDRunnerError("高清 attempt 输出目录越过专用受管根", process_started=False) from exc
+    return root
+
+
+def _copy_h3_result_to_attempt(source_value: str | None, attempt_root: Path, name: str) -> Path:
+    source = allowed_output_file(source_value)
+    attempt_root.mkdir(parents=True, exist_ok=True)
+    suffix = source.suffix.lower() if re.fullmatch(r"\.[a-z0-9]{1,8}", source.suffix.lower()) else ".media"
+    destination = (attempt_root / f"{name}{suffix}").resolve()
+    try:
+        destination.relative_to(attempt_root)
+    except ValueError as exc:
+        raise HDRunnerError("高清 H3 staging 输出路径越界", process_started=True) from exc
+    temporary = attempt_root / f".{name}-{uuid.uuid4().hex}.tmp"
+    before_sha = file_sha256(source)
+    before_size = source.stat().st_size
+    try:
+        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        after_sha = file_sha256(source)
+        copied_sha = file_sha256(temporary)
+        if before_sha != after_sha or before_size != source.stat().st_size or copied_sha != before_sha:
+            raise HDRunnerError("H3 manifest 产物在复制到私有 staging 期间发生变化", process_started=True)
+        temporary.replace(destination)
+        return destination
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _hd_manifest_record(project: str, collection: str, before_ids: set[str]) -> dict[str, Any]:
+    manifest = read_manifest(project)
+    records = manifest.get(collection)
+    if not isinstance(records, list):
+        raise HDRunnerError(f"H3 manifest 缺少 {collection} 记录", process_started=True)
+    created = [record for record in records if str(record.get("id") or "") not in before_ids]
+    if len(created) != 1:
+        raise HDRunnerError(f"无法唯一识别本次 H3 高清产物（新增 {len(created)} 条）", process_started=True)
+    record = created[0]
+    if record.get("status") != "completed" or not record.get("output_file"):
+        raise HDRunnerError("H3 高清任务未返回已完成媒体", process_started=True)
+    return record
+
+
+def run_hd_operation(request: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    """Compile one frozen HD operation. Tests replace this boundary with a controlled fake."""
+    strategy = str(request.get("strategy_type") or "")
+    source = request.get("source") or {}
+    shot_id = str(source.get("shot_id") or "")
+    project = _safe_hd_project_slug(str(source.get("h3_project") or h3_project_for_shot(shot_id)))
+    width = int(request.get("target_width") or 0)
+    height = int(request.get("target_height") or 0)
+    prompt = str(source.get("prompt") or "")
+    plan_hash = str(request.get("plan_hash") or "")
+    attempt_root = _hd_attempt_output_root(request, required=not dry_run)
+    if strategy == "deterministic_scale":
+        safe_artifact = _safe_hd_project_slug(str(request.get("expected_artifact_id") or plan_hash))
+        output_root = attempt_root or (COMFY_OUTPUT_ROOT / "hd-delivery" / "dry-run" / project).resolve()
+        allowed_root = (COMFY_OUTPUT_ROOT / "hd-delivery").resolve()
+        try:
+            output_root.relative_to(allowed_root)
+        except ValueError as exc:
+            raise HDRunnerError("确定性缩放输出越过专用高清根目录", process_started=False) from exc
+        output_path = (output_root / f"{safe_artifact}-scale-{width}x{height}.mp4").resolve()
+        try:
+            output_path.relative_to(output_root)
+        except ValueError as exc:
+            raise HDRunnerError("确定性缩放文件名越过 attempt 目录", process_started=False) from exc
+        command = {
+            "adapter": "ffmpeg", "operation": "lanczos_scale", "input": source.get("media", {}).get("path"),
+            "output": str(output_path), "width": width, "height": height, "fit": "contain",
+        }
+        if dry_run:
+            return {
+                "gpu_submitted": False, "adapter": "ffmpeg", "model_id": "ffmpeg-lanczos",
+                "workflow_id": "deterministic-scale-contain-v1", "command": command,
+            }
+        output_root.mkdir(parents=True, exist_ok=True)
+        process_started = False
+        try:
+            process_started = True
+            completed = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error", "-i", str(source.get("media", {}).get("path") or ""),
+                    "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
+                    "-c:v", "libx264", "-preset", "slow", "-crf", "17", "-c:a", "aac", "-b:a", "192k", str(output_path),
+                ],
+                cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False,
+            )
+        except OSError as exc:
+            raise HDRunnerError(f"FFmpeg 未能启动：{exc}", process_started=False) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise HDRunnerError("FFmpeg 高清放大超时", process_started=process_started) from exc
+        if completed.returncode != 0:
+            raise HDRunnerError(completed.stderr.strip() or "FFmpeg 高清放大失败", process_started=True)
+        return {
+            "gpu_submitted": False, "adapter": "ffmpeg", "model_id": "ffmpeg-lanczos",
+            "workflow_id": "deterministic-scale-contain-v1", "command": command, "output_file": str(output_path),
+        }
+
+    prompt_file = _hd_prompt_file(plan_hash, prompt)
+    original_mode = str(source.get("original_mode") or "fl2va")
+    generation_seed = source.get("generation_seed")
+    if generation_seed is None:
+        raise HDRunnerError("模型重生成缺少提交前冻结 seed", process_started=False)
+    manifest = read_manifest(project)
+    collection = "candidates"
+    before_ids = {str(record.get("id")) for record in manifest.get(collection, []) if record.get("id")}
+    reference_options = {"image": "--ref-image", "video": "--ref-video", "audio": "--ref-audio"}
+    ref_images: list[str] = []
+    ref_videos: list[str] = []
+    ref_audios: list[str] = []
+
+    def append_reference(reference_type: str, path_value: str) -> None:
+        if reference_type == "image":
+            ref_images.append(path_value)
+        elif reference_type == "video":
+            ref_videos.append(path_value)
+        elif reference_type == "audio":
+            ref_audios.append(path_value)
+
+    if strategy == "ref2va_regenerate":
+        arguments = [
+            "draft", "--project", project, "--mode", "ref2va", "--count", "1", "--width", str(width),
+            "--height", str(height), "--seconds", str((source.get("spec") or {}).get("duration_seconds") or 5),
+            "--prompt-file", str(prompt_file), "--seed", str(generation_seed),
+        ]
+        source_video = str((source.get("media") or {}).get("path") or "")
+        arguments.extend(["--ref-video", source_video])
+        ref_videos.append(source_video)
+        for reference in source.get("references") or []:
+            option = reference_options.get(str(reference.get("reference_type")))
+            if option and reference.get("managed_path"):
+                path_value = str(reference["managed_path"])
+                arguments.extend([option, path_value])
+                append_reference(str(reference.get("reference_type")), path_value)
+        model_id = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+        workflow_id = "h3-ref2va-regenerate-v2"
+    elif strategy == "original_model_regenerate":
+        arguments = [
+            "draft", "--project", project, "--mode", original_mode, "--count", "1", "--width", str(width),
+            "--height", str(height), "--seconds", str((source.get("spec") or {}).get("duration_seconds") or 5),
+            "--prompt-file", str(prompt_file), "--seed", str(generation_seed),
+        ]
+        if original_mode == "ref2va":
+            for reference in source.get("references") or []:
+                option = reference_options.get(str(reference.get("reference_type")))
+                if option and reference.get("managed_path"):
+                    path_value = str(reference["managed_path"])
+                    arguments.extend([option, path_value])
+                    append_reference(str(reference.get("reference_type")), path_value)
+        model_id = (
+            "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+            if original_mode == "ref2va" else "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+        )
+        workflow_id = f"h3-draft-{original_mode}-target-v2"
+    else:
+        raise HDRunnerError("不支持的高清策略", process_started=False)
+    command = {
+        "adapter": "h3-video-draft-refine", "arguments": arguments, "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "model_id": model_id, "workflow_id": workflow_id, "source_candidate_id": source.get("candidate_external_id"),
+        "seed": generation_seed,
+        "references": {
+            "ref_images": ref_images, "ref_videos": ref_videos, "ref_audios": ref_audios,
+            "first_frame": None, "last_frame": None,
+        },
+    }
+    if dry_run:
+        try:
+            run_h3([*arguments, "--dry-run"], timeout=120)
+        except H3AdapterError as exc:
+            raise HDRunnerError(str(exc.detail), process_started=exc.process_started) from exc
+        return {
+            "gpu_submitted": False, "adapter": "h3-video-draft-refine", "model_id": model_id,
+            "workflow_id": workflow_id, "command": command,
+        }
+    try:
+        run_h3([*arguments, "--wait", "--timeout-minutes", "60"], timeout=3660)
+    except H3AdapterError as exc:
+        raise HDRunnerError(str(exc.detail), process_started=exc.process_started) from exc
+    record = _hd_manifest_record(project, collection, before_ids)
+    if (
+        record.get("seed") != generation_seed
+        or str(record.get("prompt") or "") != prompt
+        or int(record.get("width") or 0) != width
+        or int(record.get("height") or 0) != height
+        or record.get("references") != command["references"]
+        or record.get("mode") != ("ref2va" if strategy == "ref2va_regenerate" else original_mode)
+    ):
+        raise HDRunnerError("H3 manifest 与冻结的 seed、prompt、参考素材或规格不一致", process_started=True)
+    if attempt_root is None:
+        raise HDRunnerError("高清实际执行缺少私有 attempt 输出目录", process_started=True)
+    staged_output = _copy_h3_result_to_attempt(record.get("output_file"), attempt_root, str(request.get("expected_artifact_id") or "hd-output"))
+    return {
+        "gpu_submitted": True, "adapter": "h3-video-draft-refine", "model_id": model_id,
+        "workflow_id": workflow_id, "command": command, "adapter_input": command, "output_file": str(staged_output),
+        "prompt_id": record.get("prompt_id"), "comfy_task_id": record.get("prompt_id"), "manifest_record": record,
+    }
 
 
 def candidate_public(item: dict[str, Any]) -> dict[str, Any]:
@@ -2205,7 +2480,10 @@ async def lifespan(_: FastAPI):
     EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
     EXPORT_JOB_ROOT.mkdir(parents=True, exist_ok=True)
     init_db()
+    recover_archive_tasks(DB_PATH, BACKUP_ROOT)
     recover_local_agent_runs(DB_PATH)
+    configure_hd_delivery(DB_PATH, COMFY_OUTPUT_ROOT, run_hd_operation, probe_media)
+    recover_hd_jobs(DB_PATH)
     start_export_worker()
     configure_production_scheduler(
         DB_PATH,
@@ -2218,9 +2496,11 @@ async def lifespan(_: FastAPI):
         output_root=COMFY_OUTPUT_ROOT,
     )
     start_production_worker()
+    start_hd_worker()
     try:
         yield
     finally:
+        stop_hd_worker()
         stop_production_worker()
         stop_export_worker()
 
@@ -2240,6 +2520,7 @@ app.include_router(create_script_router(DB_PATH, ROOT))
 app.include_router(create_bible_router(DB_PATH))
 app.include_router(create_production_router(DB_PATH, lambda shot_id: compile_prompt_plan(DB_PATH, shot_id)))
 app.include_router(create_review_router(DB_PATH, COMFY_OUTPUT_ROOT))
+app.include_router(create_hd_router(DB_PATH, COMFY_OUTPUT_ROOT, run_hd_operation))
 app.include_router(create_delivery_router(DB_PATH, COMFY_OUTPUT_ROOT))
 app.include_router(create_archive_router(DB_PATH, BACKUP_ROOT, EXPORT_ROOT))
 
@@ -2434,12 +2715,25 @@ def get_workbench() -> dict[str, Any]:
         FROM export_runs JOIN projects ON projects.id = export_runs.project_id
         ORDER BY export_runs.updated_at DESC LIMIT 20"""
     )
+    archive_activity = rows(
+        """SELECT 'archive-' || project_archive_tasks.id AS id, 'archive' AS item_type,
+        project_archive_tasks.operation AS kind, project_archive_tasks.state,
+        COALESCE(project_archive_tasks.error, project_archive_tasks.stage) AS message,
+        project_archive_tasks.created_at, project_archive_tasks.updated_at,
+        NULL AS shot_id,
+        '项目归档 R' || project_archive_tasks.archive_revision AS title,
+        projects.id AS project_id, projects.title AS project_title
+        FROM project_archive_tasks JOIN projects ON projects.id = project_archive_tasks.project_id
+        WHERE project_archive_tasks.state IN ('running', 'failed')
+        ORDER BY project_archive_tasks.updated_at DESC LIMIT 20"""
+    )
     activities = sorted(
-        [*generation_activity, *export_activity], key=lambda item: item.get("updated_at") or item["created_at"], reverse=True
+        [*generation_activity, *export_activity, *archive_activity],
+        key=lambda item: item.get("updated_at") or item["created_at"], reverse=True,
     )[:30]
     queue_items = [
         item for item in activities
-        if item["state"] in {*ACTIVE_JOB_STATES, *EXPORT_ACTIVE_STATES}
+        if item["state"] in {*ACTIVE_JOB_STATES, *EXPORT_ACTIVE_STATES, "running"}
     ]
     pending_generation = row(
         "SELECT COUNT(*) AS count FROM shots WHERE status IN ('未生成', '可生成')"
@@ -2461,6 +2755,7 @@ def get_workbench() -> dict[str, Any]:
         "projects": projects,
         "activities": activities,
         "queue": queue_items,
+        "archive_reconciliations": list_archive_reconciliations(DB_PATH, include_resolved=False),
         "storage": storage_payload(),
     }
 
@@ -2886,6 +3181,8 @@ def _assembly_snapshot(assembly: dict[str, Any]) -> dict[str, Any]:
             "dialogue_mode": item.get("dialogue_mode") or "original",
             "section_id": item.get("section_id"), "candidate_id": item.get("candidate_id"),
             "master_version_id": item.get("master_version_id"),
+            "hd_artifact_id": item.get("hd_artifact_id"),
+            "hd_master_version_id": item.get("hd_master_version_id"),
             "source_snapshot": item.get("source_snapshot") or {},
         }
         for item in assembly["items"]
@@ -2950,17 +3247,26 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
         frozen_source = (assembly_item or {}).get("source_snapshot") or {}
         selected = None
         if assembly_item:
-            frozen_candidate_id = frozen_source.get("candidate_id")
-            selected = row(
-                """SELECT id, 'candidate' AS source_type, status, output_file, source AS source_detail
-                FROM candidates WHERE id = ? AND shot_id = ? AND archived = 0""",
-                (frozen_candidate_id, shot["id"]),
-            ) if frozen_candidate_id else None
+            frozen_hd_artifact_id = frozen_source.get("hd_artifact_id")
+            if frozen_hd_artifact_id:
+                selected = row(
+                    """SELECT id, 'hd_artifact' AS source_type, 'completed' AS status,
+                    output_path AS output_file, strategy_type AS source_detail
+                    FROM hd_artifacts WHERE id = ? AND shot_id = ? AND project_id = ?""",
+                    (frozen_hd_artifact_id, shot["id"], project["id"]),
+                )
+            else:
+                frozen_candidate_id = frozen_source.get("candidate_id")
+                selected = row(
+                    """SELECT id, 'candidate' AS source_type, status, output_file, source AS source_detail
+                    FROM candidates WHERE id = ? AND shot_id = ? AND archived = 0""",
+                    (frozen_candidate_id, shot["id"]),
+                ) if frozen_candidate_id else None
         issue = None
         if not assembly_item:
             issue = "缺少锁定装配的冻结来源凭证"
         elif frozen_source.get("source_status") != "ready" or not frozen_source.get("media", {}).get("checksum_sha256"):
-            issue = "锁定装配是旧版或缺少候选、审片、母版与媒体校验和凭证"
+            issue = "锁定装配是旧版或缺少候选、高清审片、母版与媒体校验和凭证"
         elif not selected:
             issue = "锁定装配中的候选已删除"
         elif selected.get("status") != "completed":
@@ -2997,6 +3303,13 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
                         "has_audio": bool(probe.get("has_audio")),
                         "checksum_sha256": frozen_media["checksum_sha256"],
                         "master_version_id": frozen_source.get("master_version_id"),
+                        "hd_artifact_id": frozen_source.get("hd_artifact_id"),
+                        "hd_master_version_id": frozen_source.get("hd_master_version_id"),
+                        "hd_strategy_type": frozen_source.get("hd_strategy_type"),
+                        "hd_strategy_kind": frozen_source.get("hd_strategy_kind"),
+                        "hd_plan_hash": frozen_source.get("hd_plan_hash"),
+                        "hd_model_id": frozen_source.get("hd_model_id"),
+                        "hd_workflow_id": frozen_source.get("hd_workflow_id"),
                         "review_id": frozen_source.get("review_id"),
                         "review_revision": frozen_source.get("review_revision"),
                         "section_id": frozen_source.get("section_id"),
@@ -3338,10 +3651,16 @@ def claim_next_export_run() -> dict[str, Any] | None:
     now = utc_now()
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
+        archive_filter = (
+            "AND NOT EXISTS (SELECT 1 FROM project_archive_leases leases WHERE leases.project_id = runs.project_id)"
+            if table_exists(db, "project_archive_leases") else ""
+        )
         pending = db.execute(
-            """SELECT * FROM export_runs
-            WHERE state IN ('排队中', '恢复排队') AND cancel_requested = 0
-            ORDER BY created_at, attempt LIMIT 1"""
+            f"""SELECT runs.* FROM export_runs runs
+            JOIN projects ON projects.id = runs.project_id AND projects.archived = 0
+            WHERE runs.state IN ('排队中', '恢复排队') AND runs.cancel_requested = 0
+              {archive_filter}
+            ORDER BY runs.created_at, runs.attempt LIMIT 1"""
         ).fetchone()
         if not pending:
             db.commit()
@@ -3841,6 +4160,11 @@ def create_export(payload: ExportRequest) -> dict[str, Any]:
     }
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
+        if table_exists(db, "project_archive_leases") and db.execute(
+            "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (preflight["project_id"],),
+        ).fetchone():
+            db.rollback()
+            raise HTTPException(409, "项目正在冻结归档，禁止创建导出任务")
         current_assembly = _locked_assembly_from_db(db, preflight["project_id"])
         if not current_assembly:
             db.rollback()
@@ -4073,6 +4397,8 @@ def current_export() -> dict[str, Any]:
         "has_audio": bool(probe.get("has_audio")),
         "shot_count": len(sources),
         "size_bytes": video_path.stat().st_size,
+        "sha256": file_sha256(video_path),
+        "export_run_id": export_run.get("id") if export_run else None,
         "updated_at": datetime.fromtimestamp(video_path.stat().st_mtime, timezone.utc).isoformat(),
         "quality_note": (
             "平台后台按已选版本合成；导出参数、输入来源、哈希和产物均写入生产清单。低清草稿仅做确定性放大。"
@@ -4206,13 +4532,27 @@ def production_acceptance_payload() -> dict[str, Any]:
         if latest_review and latest_review["decision"] == "pass":
             review_pass_count += 1
 
+    hd_selected_count = int((row(
+        """SELECT COUNT(*) AS count FROM hd_master_versions masters
+        JOIN (SELECT shot_id, MAX(revision) AS revision FROM hd_master_versions GROUP BY shot_id) latest
+          ON latest.shot_id = masters.shot_id AND latest.revision = masters.revision
+        WHERE masters.project_id = ?""",
+        (project_id,),
+    ) or {"count": 0})["count"])
     deliverable = current_export()
     export_pass = bool(
         deliverable.get("available") and deliverable.get("has_audio")
+        and int(deliverable.get("width") or 0) >= 1344 and int(deliverable.get("height") or 0) >= 768
         and int(deliverable.get("width") or 0) > int(deliverable.get("height") or 0)
         and int(deliverable.get("shot_count") or 0) == shot_count
     )
-    signoffs = latest_delivery_signoffs(project_id)
+    all_signoffs = latest_delivery_signoffs(project_id)
+    current_export_id = deliverable.get("export_run_id") or f"legacy:{deliverable.get('updated_at') or ''}"
+    current_export_sha = deliverable.get("sha256")
+    signoffs = {
+        category: record for category, record in all_signoffs.items()
+        if record.get("export_run_id") == current_export_id and record.get("export_sha256") == current_export_sha
+    }
     picture_pass = signoffs.get("picture_continuity", {}).get("decision") == "pass"
     sound_pass = signoffs.get("sound", {}).get("decision") == "pass"
 
@@ -4243,6 +4583,11 @@ def production_acceptance_payload() -> dict[str, Any]:
             "sources", "真实镜头来源", "pass" if selected_sources == shot_count and shot_count else "block",
             f"{selected_sources}/{shot_count} 个镜头有真实已选本地版本",
             "完成生成、结构化审片并选择母版" if selected_sources != shot_count else "",
+        ),
+        acceptance_stage(
+            "hd_masters", "逐镜高清定稿", "pass" if hd_selected_count == shot_count and shot_count else "block",
+            f"{hd_selected_count}/{shot_count} 个镜头有 append-only 高清定稿",
+            "为每个已锁定草稿母版完成高清策略、审片并选择高清版本" if hd_selected_count != shot_count else "",
         ),
         acceptance_stage(
             "assembly", "锁定交付装配", "pass" if assembly_locked else "block",
@@ -4304,8 +4649,20 @@ def create_delivery_signoff(payload: DeliverySignoffRequest) -> dict[str, Any]:
     project = active_project()
     if not project:
         raise HTTPException(404, "项目不存在")
-    if not current_export().get("available"):
+    current = current_export()
+    if not current.get("available"):
         raise HTTPException(409, "当前项目尚无完整成片，不能写入整片人工确认")
+    if int(current.get("width") or 0) < 1344 or int(current.get("height") or 0) < 768 or not current.get("has_audio"):
+        raise HTTPException(409, "当前成片未达到 1344×768 横屏或缺少音轨，不能签署")
+    export_run_id = current.get("export_run_id") or f"legacy:{current.get('updated_at') or ''}"
+    export_sha = current.get("sha256") or hashlib.sha256(
+        json.dumps(current, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    export_snapshot = {
+        "export_run_id": export_run_id, "sha256": export_sha, "width": current.get("width"),
+        "height": current.get("height"), "duration_seconds": current.get("duration_seconds"),
+        "shot_count": current.get("shot_count"), "has_audio": bool(current.get("has_audio")),
+    }
     with closing(connect()) as db:
         revision = int(db.execute(
             "SELECT COALESCE(MAX(revision), 0) + 1 FROM delivery_signoffs WHERE project_id = ? AND category = ?",
@@ -4314,9 +4671,14 @@ def create_delivery_signoff(payload: DeliverySignoffRequest) -> dict[str, Any]:
         record_id = f"delivery-signoff-{uuid.uuid4().hex[:12]}"
         db.execute(
             """INSERT INTO delivery_signoffs
-            (id, project_id, category, revision, decision, note, source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (record_id, project["id"], payload.category, revision, payload.decision, payload.note.strip(), payload.source.strip(), utc_now()),
+            (id, project_id, category, revision, decision, note, source, export_run_id,
+             export_sha256, export_snapshot, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record_id, project["id"], payload.category, revision, payload.decision,
+                payload.note.strip(), payload.source.strip(), export_run_id, export_sha,
+                json.dumps(export_snapshot, ensure_ascii=False, sort_keys=True), utc_now(),
+            ),
         )
         db.commit()
     return production_acceptance_payload()
@@ -4657,6 +5019,11 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
     )
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
+        project_row = db.execute("SELECT archived FROM projects WHERE id = ?", (shot["project_id"],)).fetchone()
+        if not project_row or project_row["archived"]:
+            raise HTTPException(409, "项目已归档，禁止提交 H3")
+        if db.execute("SELECT 1 FROM project_archive_leases WHERE project_id = ?", (shot["project_id"],)).fetchone():
+            raise HTTPException(409, "项目正在冻结归档，禁止提交 H3")
         current_marker = draft_attempt_marker(shot_id, db)
         if current_marker != request_attempt_marker:
             raise HTTPException(409, "该请求读取生成状态后已有新的 H3 attempt，请刷新后再操作")

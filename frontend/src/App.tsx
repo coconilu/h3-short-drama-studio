@@ -42,12 +42,13 @@ import {
   WandSparkles,
   X,
 } from 'lucide-react'
-import type { Asset, BatchGenerationResult, Candidate, CandidateReview, DeliveryPlanItem, DeliveryWorkspace, DryRunResult, ExportPreflight, ExportRun, Health, Job, ProductionAcceptance, ProductionBatch, ProductionConflictGroup, Project, ProjectArchive, Promotion, PromptPlan, ReviewWorkspace, RoughCut, Shot, ShotReference, Workbench, WorkspaceSettings } from './types'
+import type { ArchiveReconciliation, Asset, BatchGenerationResult, Candidate, CandidateReview, DeliveryPlanItem, DeliveryWorkspace, DryRunResult, ExportPreflight, ExportRun, Health, Job, ProductionAcceptance, ProductionBatch, ProductionConflictGroup, Project, ProjectArchive, Promotion, PromptPlan, ReviewWorkspace, RoughCut, Shot, ShotReference, Workbench, WorkspaceSettings } from './types'
 import { GlobalActivityPage, GlobalQueuePage, ProjectsWorkbench, SettingsPage } from './WorkbenchPages'
 import { ScriptStudio } from './ScriptStudio'
 import { CreativePlanning } from './CreativePlanning'
 import { ProductionBible } from './ProductionBible'
 import { PromptCompiler } from './PromptCompiler'
+import { HDWorkbench } from './HDWorkbench'
 
 const globalNavItems = [
   { id: 'projects', label: '所有项目', icon: FolderKanban },
@@ -65,6 +66,7 @@ const projectNavItems = [
   { id: 'assets', label: '素材库', icon: UserRound },
   { id: 'queue', label: '项目队列', icon: ListVideo },
   { id: 'review', label: '审片台', icon: Film },
+  { id: 'hd', label: '高清交付', icon: Sparkles },
   { id: 'timeline', label: '成片交付', icon: Library },
 ]
 
@@ -82,6 +84,10 @@ const api = async <T,>(path: string, options?: ApiOptions): Promise<T> => {
   const headers = new Headers(options?.headers)
   if (!(options?.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
   const controller = new AbortController()
+  const callerSignal = options?.signal
+  const cancelFromCaller = () => controller.abort()
+  if (callerSignal?.aborted) controller.abort()
+  else callerSignal?.addEventListener('abort', cancelFromCaller, { once: true })
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
   try {
     const response = await fetch(path, { ...fetchOptions, headers, signal: controller.signal })
@@ -101,11 +107,15 @@ const api = async <T,>(path: string, options?: ApiOptions): Promise<T> => {
     }
     return response.json()
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') throw new Error(`API 响应超时（${timeoutMs / 1000} 秒）`)
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      if (callerSignal?.aborted) throw error
+      throw new Error(`API 响应超时（${timeoutMs / 1000} 秒）`)
+    }
     if (error instanceof TypeError) throw new Error('无法连接镜场 API，正在自动重试')
     throw error
   } finally {
     window.clearTimeout(timeout)
+    callerSignal?.removeEventListener('abort', cancelFromCaller)
   }
 }
 
@@ -185,7 +195,7 @@ function App() {
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([])
   const [deliveryWorkspace, setDeliveryWorkspace] = useState<DeliveryWorkspace | null>(null)
   const [acceptance, setAcceptance] = useState<ProductionAcceptance | null>(null)
-  const [selectedShotId, setSelectedShotId] = useState('EP01-S01-03')
+  const [selectedShotId, setSelectedShotId] = useState('')
   const [candidates, setCandidates] = useState<Candidate[]>([])
   const [promotions, setPromotions] = useState<Promotion[]>([])
   const [reviewWorkspace, setReviewWorkspace] = useState<ReviewWorkspace | null>(null)
@@ -199,26 +209,30 @@ function App() {
   const [modal, setModal] = useState<'new' | 'project' | 'confirm' | null>(null)
   const initialPreferencesApplied = useRef(false)
   const apiOnlineRef = useRef(true)
+  const projectSwitchSequence = useRef(0)
+  const projectSwitchController = useRef<AbortController | null>(null)
 
   const selectedShot = useMemo(
     () => project?.shots.find((shot) => shot.id === selectedShotId) || project?.shots[0],
     [project, selectedShotId],
   )
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (signal?: AbortSignal) => {
+    const requestOptions = signal ? { signal } : undefined
     const [projectData, workbenchData, settingsData, healthData, assetData, jobData, roughCutData, preflightData, exportRunData, deliveryData, acceptanceData] = await Promise.all([
-      api<Project>('/api/project'),
-      api<Workbench>('/api/workbench'),
-      api<WorkspaceSettings>('/api/settings'),
-      api<Health>('/api/health'),
-      api<Asset[]>('/api/assets'),
-      api<Job[]>('/api/jobs'),
-      api<RoughCut>('/api/exports/current'),
-      api<ExportPreflight>('/api/exports/preflight'),
-      api<ExportRun[]>('/api/exports'),
-      api<DeliveryWorkspace>('/api/delivery-plan'),
-      api<ProductionAcceptance>('/api/acceptance'),
+      api<Project>('/api/project', requestOptions),
+      api<Workbench>('/api/workbench', requestOptions),
+      api<WorkspaceSettings>('/api/settings', requestOptions),
+      api<Health>('/api/health', requestOptions),
+      api<Asset[]>('/api/assets', requestOptions),
+      api<Job[]>('/api/jobs', requestOptions),
+      api<RoughCut>('/api/exports/current', requestOptions),
+      api<ExportPreflight>('/api/exports/preflight', requestOptions),
+      api<ExportRun[]>('/api/exports', requestOptions),
+      api<DeliveryWorkspace>('/api/delivery-plan', requestOptions),
+      api<ProductionAcceptance>('/api/acceptance', requestOptions),
     ])
+    if (signal?.aborted) return
     setProject(projectData)
     setWorkbench(workbenchData)
     setSettings(settingsData)
@@ -238,12 +252,12 @@ function App() {
     }
   }, [])
 
-  const refreshShotReview = useCallback(async (shotId: string) => {
+  const refreshShotReview = useCallback(async (shotId: string, signal?: AbortSignal) => {
     const [candidateData, promotionData, referenceData, reviewData] = await Promise.all([
-      api<Candidate[]>(`/api/shots/${shotId}/candidates`),
-      api<Promotion[]>(`/api/shots/${shotId}/promotions`),
-      api<ShotReference[]>(`/api/shots/${shotId}/references`),
-      api<ReviewWorkspace>(`/api/shots/${shotId}/review-workspace`),
+      api<Candidate[]>(`/api/shots/${shotId}/candidates`, { signal }),
+      api<Promotion[]>(`/api/shots/${shotId}/promotions`, { signal }),
+      api<ShotReference[]>(`/api/shots/${shotId}/references`, { signal }),
+      api<ReviewWorkspace>(`/api/shots/${shotId}/review-workspace`, { signal }),
     ])
     setCandidates(candidateData)
     setPromotions(promotionData)
@@ -306,14 +320,27 @@ function App() {
   }, [project, refresh])
 
   useEffect(() => {
-    if (!selectedShotId) return
-    refreshShotReview(selectedShotId).catch(() => {
+    const belongsToLoadedProject = Boolean(
+      project && selectedShotId && project.shots.some(shot => shot.id === selectedShotId),
+    )
+    if (!belongsToLoadedProject) {
       setCandidates([])
       setPromotions([])
       setReferences([])
       setReviewWorkspace(null)
+      return
+    }
+    const controller = new AbortController()
+    refreshShotReview(selectedShotId, controller.signal).catch((error) => {
+      if (controller.signal.aborted) return
+      setCandidates([])
+      setPromotions([])
+      setReferences([])
+      setReviewWorkspace(null)
+      setNotice(error instanceof Error ? error.message : '镜头子资源加载失败')
     })
-  }, [selectedShotId, jobs, refreshShotReview])
+    return () => controller.abort()
+  }, [project?.id, selectedShotId, jobs, refreshShotReview])
 
   const syncShot = useCallback(async (shotId: string, announce = true) => {
     try {
@@ -401,19 +428,31 @@ function App() {
   }
 
   const switchProject = async (projectId: string, destination?: 'overview' | 'planning' | 'script' | 'storyboard' | 'assets') => {
-    if (projectId === project?.id) {
+    const hadPendingSwitch = projectSwitchController.current !== null
+    const sequence = projectSwitchSequence.current + 1
+    projectSwitchSequence.current = sequence
+    projectSwitchController.current?.abort()
+    projectSwitchController.current = null
+    if (projectId === project?.id && !hadPendingSwitch) {
       if (destination) setActivePage(destination)
       return
     }
+    const controller = new AbortController()
+    projectSwitchController.current = controller
     setNotice('正在切换项目工作区…')
     try {
-      const activated = await api<Project>(`/api/projects/${projectId}/activate`, { method: 'POST' })
+      const activated = await api<Project>(`/api/projects/${projectId}/activate`, { method: 'POST', signal: controller.signal })
+      if (controller.signal.aborted || projectSwitchSequence.current !== sequence) return
       setSelectedShotId(activated.shots[0]?.id || '')
-      await refresh()
+      await refresh(controller.signal)
+      if (controller.signal.aborted || projectSwitchSequence.current !== sequence) return
       if (destination) setActivePage(destination)
       setNotice(`已切换到“${activated.title}”`)
     } catch (error) {
+      if (controller.signal.aborted || projectSwitchSequence.current !== sequence) return
       setNotice(error instanceof Error ? error.message : '项目切换失败')
+    } finally {
+      if (projectSwitchSequence.current === sequence) projectSwitchController.current = null
     }
   }
 
@@ -421,13 +460,15 @@ function App() {
     setNotice('正在冻结项目数据并校验归档包…')
     try {
       const archive = await api<ProjectArchive>(`/api/projects/${projectId}/archives`, { method: 'POST', timeoutMs: 120000 })
+      const verification = await api<{ ok: boolean; errors: string[]; archive: ProjectArchive }>(`/api/project-archives/${archive.id}/verify`, { method: 'POST', timeoutMs: 120000 })
+      if (!verification.ok) throw new Error(`归档校验失败：${verification.errors.join('；')}`)
       const link = document.createElement('a')
-      link.href = archive.download_url
+      link.href = verification.archive.download_url
       link.download = ''
       document.body.appendChild(link)
       link.click()
       link.remove()
-      setNotice(`归档 R${archive.revision} 已生成：${archive.media_count} 个媒体文件，SHA-256 ${archive.checksum_sha256.slice(0, 12)}`)
+      setNotice(`归档 R${archive.revision} 已校验并下载：${archive.media_count} 个媒体文件，SHA-256 ${archive.checksum_sha256.slice(0, 12)}`)
       await refresh()
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '项目归档包生成失败')
@@ -454,6 +495,26 @@ function App() {
       setNotice('项目已恢复；原归档包和历史版本保持不变')
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '项目恢复失败')
+    }
+  }
+
+  const resolveArchiveReconciliation = async (record: ArchiveReconciliation, note: string) => {
+    setNotice('正在核验并解除异常归档冻结…')
+    try {
+      await api(`/api/projects/${record.project_id}/archive-reconciliations/${record.id}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_revision: record.revision,
+          confirmed_by: '本机操作员',
+          note,
+          confirm_no_live_archive_process: true,
+        }),
+      })
+      await refresh()
+      setNotice(`“${record.project_title || record.project_id}”的异常归档冻结已审计解除`)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '异常归档冻结对账失败')
+      throw error
     }
   }
 
@@ -630,7 +691,7 @@ function App() {
 
         {notice && <button className="notice" onClick={() => setNotice('')}>{notice}<X size={15} /></button>}
 
-        {activePage === 'projects' && <ProjectsWorkbench workbench={workbench} health={health} search={projectSearch} onOpenProject={switchProject} onOpenSettings={() => setActivePage('settings')} onCreateArchive={createProjectArchive} onArchiveProject={archiveProject} onRestoreProject={restoreProject} />}
+        {activePage === 'projects' && <ProjectsWorkbench workbench={workbench} health={health} search={projectSearch} onOpenProject={switchProject} onOpenSettings={() => setActivePage('settings')} onCreateArchive={createProjectArchive} onArchiveProject={archiveProject} onRestoreProject={restoreProject} onResolveArchiveReconciliation={resolveArchiveReconciliation} />}
         {activePage === 'activity' && <GlobalActivityPage workbench={workbench} onOpenProject={switchProject} />}
         {activePage === 'global-queue' && <GlobalQueuePage workbench={workbench} onOpenProject={switchProject} />}
         {activePage === 'settings' && <SettingsPage settings={settings} health={health} onSave={saveSettings} onTest={testConnection} onRestartApi={restartApi} />}
@@ -663,6 +724,7 @@ function App() {
         {activePage === 'queue' && <QueuePage jobs={jobs} onSync={syncShot} onResolve={resolveReconciliation} />}
         {activePage === 'review' && selectedShot && <ReviewPage project={project} shot={selectedShot} candidates={candidates} promotions={promotions} reviewWorkspace={reviewWorkspace} onSelectShot={setSelectedShotId} onRefresh={async () => { await Promise.all([refresh(), refreshShotReview(selectedShot.id)]) }} setNotice={setNotice} />}
         {activePage === 'review' && !selectedShot && <main className="empty-project-stage"><Film size={28} /><h1>还没有可审片的镜头</h1><p>完成创作规划和剧本开发后，再同步分镜并生成候选。</p><button className="button primary" onClick={() => setActivePage('planning')}>返回创作规划</button></main>}
+        {activePage === 'hd' && <HDWorkbench key={project.id} projectId={project.id} setNotice={setNotice} onOpenTimeline={async () => { await refresh(); setActivePage('timeline') }} />}
         {activePage === 'timeline' && <TimelinePage shots={project.shots} roughCut={roughCut} preflight={exportPreflight} exportRuns={exportRuns} deliveryWorkspace={deliveryWorkspace} onExport={submitExport} onRunAction={mutateExport} onRefresh={refresh} setNotice={setNotice} />}
       </div>
 
@@ -1596,7 +1658,7 @@ function TimelinePage({ shots, roughCut, preflight, exportRuns, deliveryWorkspac
       </div>
       {preflight?.issues.length ? <div className="export-issues">{preflight.issues.map(issue => <span key={issue.shot_id}><strong>{displayShotId(issue.shot_id)}</strong>{issue.message}</span>)}</div> : null}
     </section>
-    {roughCut.available && roughCut.video && <section className="roughcut-delivery"><div><span className="eyebrow">当前可交付版本</span><h2>{roughCut.name}</h2><p>{roughCut.width}×{roughCut.height} · {(roughCut.duration_seconds || 0).toFixed(2)} 秒 · {roughCut.shot_count} 镜头 · 含音轨与可开关字幕</p><small>{roughCut.quality_note}</small><nav>{roughCut.subtitles && <a href={roughCut.subtitles}>下载 SRT 字幕</a>}{roughCut.sources && <a href={roughCut.sources}>查看来源清单</a>}{roughCut.manifest && <a href={roughCut.manifest}>查看生产清单</a>}</nav></div><video controls preload="metadata" src={roughCut.video}>{roughCut.captions && <track kind="subtitles" src={roughCut.captions} srcLang="zh" label="中文" default />}</video></section>}
+    {roughCut.available && roughCut.video && <section className="roughcut-delivery"><div><span className="eyebrow">当前可交付版本</span><h2>{roughCut.name}</h2><p>{roughCut.width}×{roughCut.height} · {(roughCut.duration_seconds || 0).toFixed(2)} 秒 · {roughCut.shot_count} 镜头 · 含音轨与可开关字幕</p>{roughCut.sha256 && <code title={roughCut.sha256}>视频 SHA-256 · {roughCut.sha256}</code>}<small>{roughCut.quality_note}</small><nav>{roughCut.subtitles && <a href={roughCut.subtitles}>下载 SRT 字幕</a>}{roughCut.sources && <a href={roughCut.sources}>查看来源清单</a>}{roughCut.manifest && <a href={roughCut.manifest}>查看生产清单</a>}</nav></div><video controls preload="metadata" src={roughCut.video}>{roughCut.captions && <track kind="subtitles" src={roughCut.captions} srcLang="zh" label="中文" default />}</video></section>}
     <section className="export-history">
       <div className="export-history-heading"><div><span className="eyebrow">任务与版本</span><h2>平台导出历史</h2></div><small>服务重启可恢复 · 失败可重试 · 已完成版本可回切</small></div>
       <div className="export-run-list">

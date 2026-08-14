@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import socket
+import shutil
 import sqlite3
+import sys
 import uuid
 import zipfile
 from contextlib import closing
@@ -12,10 +16,13 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 
-ARCHIVE_SCHEMA_VERSION = 1
+ARCHIVE_SCHEMA_VERSION = 2
 MEDIA_SUFFIXES = {".aac", ".flac", ".jpeg", ".jpg", ".json", ".m4a", ".mov", ".mp3", ".mp4", ".png", ".srt", ".vtt", ".wav", ".webm", ".webp"}
+ARCHIVE_OWNER_INSTANCE = f"archive-instance-{uuid.uuid4().hex}"
+ARCHIVE_OWNER_HOST = socket.gethostname().casefold()
 
 
 def utc_now() -> str:
@@ -53,8 +60,415 @@ def init_archive_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_project_archives_project
           ON project_archives(project_id, revision DESC);
+        CREATE TABLE IF NOT EXISTS project_archive_tasks (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          archive_id TEXT NOT NULL UNIQUE,
+          operation TEXT NOT NULL CHECK(operation IN ('snapshot','archive')),
+          state TEXT NOT NULL CHECK(state IN ('running','completed','failed')),
+          stage TEXT NOT NULL,
+          revision INTEGER NOT NULL DEFAULT 0,
+          archive_revision INTEGER NOT NULL,
+          owner_instance TEXT NOT NULL,
+          owner_host TEXT NOT NULL,
+          owner_pid INTEGER NOT NULL,
+          owner_process_identity TEXT NOT NULL,
+          heartbeat_at TEXT NOT NULL,
+          staging_path TEXT NOT NULL,
+          partial_path TEXT NOT NULL,
+          final_path TEXT NOT NULL,
+          error TEXT,
+          audit TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_archive_tasks_project
+          ON project_archive_tasks(project_id, created_at DESC);
+        CREATE TABLE IF NOT EXISTS project_archive_leases (
+          project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+          lease_id TEXT NOT NULL UNIQUE,
+          operation TEXT NOT NULL CHECK(operation IN ('snapshot','archive')),
+          created_at TEXT NOT NULL,
+          task_id TEXT REFERENCES project_archive_tasks(id),
+          owner_instance TEXT,
+          owner_host TEXT,
+          owner_pid INTEGER,
+          owner_process_identity TEXT,
+          heartbeat_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS project_archive_reconciliations (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          lease_id TEXT NOT NULL UNIQUE,
+          task_id TEXT,
+          reason TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('unresolved','resolving','cleanup_failed','resolved')) DEFAULT 'unresolved',
+          revision INTEGER NOT NULL DEFAULT 0,
+          evidence TEXT NOT NULL DEFAULT '{}',
+          confirmed_no_live_process INTEGER NOT NULL DEFAULT 0,
+          resolved_by TEXT,
+          resolution_note TEXT,
+          resolution_owner TEXT,
+          resolution_owner_instance TEXT,
+          resolution_owner_host TEXT,
+          resolution_owner_pid INTEGER,
+          resolution_owner_process_identity TEXT,
+          resolution_task_id TEXT,
+          resolution_task_revision INTEGER,
+          resolution_paths TEXT NOT NULL DEFAULT '{}',
+          resolution_started_at TEXT,
+          resolution_stage TEXT,
+          resolution_heartbeat_at TEXT,
+          cleanup_error TEXT,
+          cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_archive_reconciliations_open
+          ON project_archive_reconciliations(project_id, state, updated_at DESC);
         """
     )
+    lease_columns = {row[1] for row in db.execute("PRAGMA table_info(project_archive_leases)").fetchall()}
+    for name, definition in (
+        ("task_id", "TEXT REFERENCES project_archive_tasks(id)"),
+        ("owner_instance", "TEXT"),
+        ("owner_host", "TEXT"),
+        ("owner_pid", "INTEGER"),
+        ("owner_process_identity", "TEXT"),
+        ("heartbeat_at", "TEXT"),
+    ):
+        if name not in lease_columns:
+            db.execute(f"ALTER TABLE project_archive_leases ADD COLUMN {name} {definition}")
+    _ensure_archive_reconciliation_schema(db)
+    _audit_archive_lease_reconciliations(db)
+
+
+def _ensure_archive_reconciliation_schema(db: sqlite3.Connection) -> None:
+    """Upgrade the first reconciliation schema without losing audit history."""
+    table_sql = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'project_archive_reconciliations'"
+    ).fetchone()
+    if not table_sql:
+        return
+    needs_state_upgrade = "'resolving'" not in str(table_sql[0] or "")
+    if needs_state_upgrade:
+        legacy_table = "project_archive_reconciliations_legacy_v1"
+        db.execute("DROP INDEX IF EXISTS idx_project_archive_reconciliations_open")
+        db.execute(f"DROP TABLE IF EXISTS {legacy_table}")
+        db.execute(f"ALTER TABLE project_archive_reconciliations RENAME TO {legacy_table}")
+        db.executescript(
+            """
+            CREATE TABLE project_archive_reconciliations (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              lease_id TEXT NOT NULL UNIQUE,
+              task_id TEXT,
+              reason TEXT NOT NULL,
+              state TEXT NOT NULL CHECK(state IN ('unresolved','resolving','cleanup_failed','resolved')) DEFAULT 'unresolved',
+              revision INTEGER NOT NULL DEFAULT 0,
+              evidence TEXT NOT NULL DEFAULT '{}',
+              confirmed_no_live_process INTEGER NOT NULL DEFAULT 0,
+              resolved_by TEXT,
+              resolution_note TEXT,
+              resolution_owner TEXT,
+              resolution_owner_instance TEXT,
+              resolution_owner_host TEXT,
+              resolution_owner_pid INTEGER,
+              resolution_owner_process_identity TEXT,
+              resolution_task_id TEXT,
+              resolution_task_revision INTEGER,
+              resolution_paths TEXT NOT NULL DEFAULT '{}',
+              resolution_started_at TEXT,
+              resolution_stage TEXT,
+              resolution_heartbeat_at TEXT,
+              cleanup_error TEXT,
+              cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              resolved_at TEXT
+            );
+            """
+        )
+        legacy_columns = {
+            row[1] for row in db.execute(f"PRAGMA table_info({legacy_table})").fetchall()
+        }
+        preserved = [
+            name for name in (
+                "id", "project_id", "lease_id", "task_id", "reason", "state", "revision",
+                "evidence", "confirmed_no_live_process", "resolved_by", "resolution_note",
+                "created_at", "updated_at", "resolved_at",
+            ) if name in legacy_columns
+        ]
+        columns = ", ".join(preserved)
+        db.execute(
+            f"INSERT INTO project_archive_reconciliations ({columns}) SELECT {columns} FROM {legacy_table}"
+        )
+        db.execute(f"DROP TABLE {legacy_table}")
+    else:
+        columns = {
+            row[1] for row in db.execute("PRAGMA table_info(project_archive_reconciliations)").fetchall()
+        }
+        for name, definition in (
+            ("resolution_owner", "TEXT"),
+            ("resolution_owner_instance", "TEXT"),
+            ("resolution_owner_host", "TEXT"),
+            ("resolution_owner_pid", "INTEGER"),
+            ("resolution_owner_process_identity", "TEXT"),
+            ("resolution_task_id", "TEXT"),
+            ("resolution_task_revision", "INTEGER"),
+            ("resolution_paths", "TEXT NOT NULL DEFAULT '{}'"),
+            ("resolution_started_at", "TEXT"),
+            ("resolution_stage", "TEXT"),
+            ("resolution_heartbeat_at", "TEXT"),
+            ("cleanup_error", "TEXT"),
+            ("cleanup_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in columns:
+                db.execute(f"ALTER TABLE project_archive_reconciliations ADD COLUMN {name} {definition}")
+    db.execute(
+        """CREATE INDEX IF NOT EXISTS idx_project_archive_reconciliations_open
+        ON project_archive_reconciliations(project_id, state, updated_at DESC)"""
+    )
+
+
+def _process_identity(pid: int) -> tuple[bool | None, str | None]:
+    """Return whether a local process is alive and a stable start identity when available.
+
+    ``None`` means that the OS would not let us prove either outcome. Recovery
+    must retain the lease in that case; false negatives are safer than clearing
+    work owned by another live server instance.
+    """
+    if pid <= 0:
+        return False, None
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        )
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error in {87, 1168}:  # ERROR_INVALID_PARAMETER / ERROR_NOT_FOUND
+                return False, None
+            return None, None
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return None, None
+            if int(exit_code.value) != 259:  # STILL_ACTIVE
+                return False, None
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user),
+            ):
+                return None, None
+            ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+            return True, f"win-filetime:{ticks}"
+        finally:
+            kernel32.CloseHandle(handle)
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        # Field 22 is the process start time in clock ticks since boot. The
+        # command name can contain spaces, so split only after the final ')'.
+        payload = proc_stat.read_text(encoding="utf-8")
+        tail = payload[payload.rfind(")") + 2 :].split()
+        return True, f"proc-start:{tail[19]}"
+    except FileNotFoundError:
+        return False, None
+    except (OSError, IndexError):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False, None
+        except (PermissionError, OSError):
+            return None, None
+        return True, None
+
+
+def _current_owner() -> dict[str, Any]:
+    alive, identity = _process_identity(os.getpid())
+    if not alive or not identity:
+        # This value remains unique for the process lifetime. Recovery will
+        # never clear it unless the PID is proven dead.
+        identity = f"runtime:{os.getpid()}:{ARCHIVE_OWNER_INSTANCE}"
+    return {
+        "owner_instance": ARCHIVE_OWNER_INSTANCE,
+        "owner_host": ARCHIVE_OWNER_HOST,
+        "owner_pid": os.getpid(),
+        "owner_process_identity": identity,
+    }
+
+
+class ArchiveReconciliationResolve(BaseModel):
+    expected_revision: int = Field(ge=0)
+    confirmed_by: str = Field(min_length=2, max_length=80)
+    note: str = Field(min_length=8, max_length=1000)
+    confirm_no_live_archive_process: bool
+
+
+def _lease_anomaly(
+    lease: dict[str, Any], task: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]] | None:
+    lease_owner = {
+        key: lease.get(key)
+        for key in ("owner_instance", "owner_host", "owner_pid", "owner_process_identity")
+    }
+    evidence: dict[str, Any] = {
+        "lease": {
+            "project_id": lease.get("project_id"),
+            "lease_id": lease.get("lease_id"),
+            "task_id": lease.get("task_id"),
+            "operation": lease.get("operation"),
+            "created_at": lease.get("created_at"),
+            "heartbeat_at": lease.get("heartbeat_at"),
+            "owner": lease_owner,
+        }
+    }
+    if not lease.get("task_id") or task is None:
+        evidence["task"] = None
+        return "taskless_lease", evidence
+    task_owner = {
+        key: task.get(key)
+        for key in ("owner_instance", "owner_host", "owner_pid", "owner_process_identity")
+    }
+    evidence["task"] = {
+        "id": task.get("id"),
+        "project_id": task.get("project_id"),
+        "state": task.get("state"),
+        "stage": task.get("stage"),
+        "revision": task.get("revision"),
+        "operation": task.get("operation"),
+        "owner": task_owner,
+    }
+    if task.get("project_id") != lease.get("project_id"):
+        return "task_project_mismatch", evidence
+    if task.get("state") != "running":
+        return "terminal_task_lease", evidence
+    owner_mismatches = [key for key in task_owner if task_owner[key] != lease_owner[key]]
+    if owner_mismatches or task.get("operation") != lease.get("operation"):
+        evidence["mismatches"] = owner_mismatches + (
+            ["operation"] if task.get("operation") != lease.get("operation") else []
+        )
+        return "task_lease_owner_mismatch", evidence
+    return None
+
+
+def _audit_archive_lease_reconciliations(db: sqlite3.Connection) -> int:
+    """Persist abnormal leases without ever releasing their project freeze."""
+    if not _table_exists(db, "project_archive_leases") or not _table_exists(db, "project_archive_reconciliations"):
+        return 0
+    now = utc_now()
+    changed = 0
+    leases = [dict(row) for row in db.execute("SELECT * FROM project_archive_leases ORDER BY project_id").fetchall()]
+    for lease in leases:
+        task_row = None
+        if lease.get("task_id") and _table_exists(db, "project_archive_tasks"):
+            task_row = db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (lease["task_id"],)).fetchone()
+        anomaly = _lease_anomaly(lease, dict(task_row) if task_row else None)
+        if anomaly is None:
+            continue
+        reason, evidence = anomaly
+        serialized = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+        existing = db.execute(
+            "SELECT * FROM project_archive_reconciliations WHERE lease_id = ?", (lease["lease_id"],),
+        ).fetchone()
+        if existing is None:
+            db.execute(
+                """INSERT INTO project_archive_reconciliations
+                (id, project_id, lease_id, task_id, reason, state, revision, evidence, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'unresolved', 0, ?, ?, ?)""",
+                (
+                    f"archive-reconciliation-{uuid.uuid4().hex[:12]}", lease["project_id"], lease["lease_id"],
+                    lease.get("task_id"), reason, serialized, now, now,
+                ),
+            )
+            changed += 1
+            continue
+        if existing["state"] == "resolving":
+            # A resolver owns the exact lease/task/path snapshot. Startup or a
+            # concurrent poll must not steal or rewrite that ownership.
+            continue
+        same_identity = (
+            existing["project_id"] == lease["project_id"]
+            and existing["task_id"] == lease.get("task_id")
+            and existing["reason"] == reason
+        )
+        if existing["state"] == "cleanup_failed" and same_identity:
+            # Preserve the cleanup failure and its retry revision. A later
+            # explicit resolver may retry; passive auditing never erases it.
+            continue
+        if (
+            existing["state"] != "unresolved"
+            or not same_identity
+            or existing["evidence"] != serialized
+        ):
+            db.execute(
+                """UPDATE project_archive_reconciliations
+                SET project_id = ?, task_id = ?, reason = ?, state = 'unresolved', evidence = ?,
+                    confirmed_no_live_process = 0, resolved_by = NULL, resolution_note = NULL,
+                    resolution_owner = NULL, resolution_task_id = NULL,
+                    resolution_owner_instance = NULL, resolution_owner_host = NULL,
+                    resolution_owner_pid = NULL, resolution_owner_process_identity = NULL,
+                    resolution_task_revision = NULL, resolution_paths = '{}',
+                    resolution_started_at = NULL, resolution_stage = NULL,
+                    resolution_heartbeat_at = NULL, cleanup_error = NULL,
+                    resolved_at = NULL, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND revision = ?""",
+                (
+                    lease["project_id"], lease.get("task_id"), reason, serialized, now,
+                    existing["id"], int(existing["revision"]),
+                ),
+            )
+            changed += 1
+    return changed
+
+
+def _table_exists(db: sqlite3.Connection, name: str) -> bool:
+    return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone())
+
+
+def project_has_active_work(db: sqlite3.Connection, project_id: str) -> list[str]:
+    """Return durable blockers that make a project snapshot unsafe."""
+    blockers: list[str] = []
+    checks = (
+        ("hd_generation_jobs", "SELECT 1 FROM hd_generation_jobs WHERE project_id = ? AND state IN ('queued','running','submission_outcome_unknown') LIMIT 1", "高清任务"),
+        ("hd_validation_leases", "SELECT 1 FROM hd_validation_leases WHERE project_id = ? LIMIT 1", "高清 dry-run"),
+        ("production_batches", "SELECT 1 FROM production_batches WHERE project_id = ? AND state IN ('running','paused','cancelling') LIMIT 1", "生产批次"),
+        ("export_runs", "SELECT 1 FROM export_runs WHERE project_id = ? AND state IN ('排队中','恢复排队','导出中','取消中') LIMIT 1", "导出任务"),
+        ("jobs", """SELECT 1 FROM jobs JOIN shots ON shots.id = jobs.shot_id
+            WHERE shots.project_id = ? AND jobs.state IN ('提交中','已提交待对账','提交状态未知','已提交','排队中','运行中','待人工对账') LIMIT 1""", "H3 任务"),
+        ("production_shot_leases", """SELECT 1 FROM production_shot_leases leases
+            JOIN production_batches batches ON batches.id = leases.batch_id WHERE batches.project_id = ? LIMIT 1""", "生产镜头占用"),
+        ("hd_shot_leases", "SELECT 1 FROM hd_shot_leases WHERE project_id = ? LIMIT 1", "高清镜头占用"),
+        ("h3_generation_leases", """SELECT 1 FROM h3_generation_leases leases
+            JOIN shots ON shots.id = leases.shot_id WHERE shots.project_id = ? LIMIT 1""", "H3 提交占用"),
+        ("h3_validation_leases", """SELECT 1 FROM h3_validation_leases leases
+            JOIN shots ON shots.id = leases.shot_id WHERE shots.project_id = ? LIMIT 1""", "H3 校验占用"),
+    )
+    for table, sql, label in checks:
+        if _table_exists(db, table) and db.execute(sql, (project_id,)).fetchone():
+            blockers.append(label)
+    return blockers
 
 
 def _rows(db: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
@@ -100,6 +514,12 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
     export_ids = _ids(export_runs)
     delivery_signoffs = _rows(db, "SELECT * FROM delivery_signoffs WHERE project_id = ? ORDER BY category, revision", (project_id,))
     acceptance_runs = _rows(db, "SELECT * FROM production_acceptance_runs WHERE project_id = ? ORDER BY created_at", (project_id,))
+    hd_plans = _rows(db, "SELECT * FROM hd_strategy_versions WHERE project_id = ? ORDER BY shot_id, revision", (project_id,))
+    hd_validations = _rows(db, "SELECT * FROM hd_validations WHERE project_id = ? ORDER BY created_at", (project_id,))
+    hd_jobs = _rows(db, "SELECT * FROM hd_generation_jobs WHERE project_id = ? ORDER BY created_at", (project_id,))
+    hd_artifacts = _rows(db, "SELECT * FROM hd_artifacts WHERE project_id = ? ORDER BY shot_id, version", (project_id,))
+    hd_reviews = _rows(db, "SELECT * FROM hd_artifact_reviews WHERE project_id = ? ORDER BY artifact_id, revision", (project_id,))
+    hd_masters = _rows(db, "SELECT * FROM hd_master_versions WHERE project_id = ? ORDER BY shot_id, revision", (project_id,))
     creative_briefs = _rows(db, "SELECT * FROM creative_briefs WHERE project_id = ?", (project_id,))
     creative_proposals = _rows(db, "SELECT * FROM creative_proposals WHERE project_id = ? ORDER BY ordinal", (project_id,))
     creative_characters = _rows(db, "SELECT * FROM creative_characters WHERE project_id = ? ORDER BY ordinal", (project_id,))
@@ -152,6 +572,13 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
         "export_events": _by_ids(db, "export_events", "run_id", export_ids),
         "delivery_signoffs": delivery_signoffs,
         "production_acceptance_runs": acceptance_runs,
+        "hd_strategy_versions": hd_plans,
+        "hd_validations": hd_validations,
+        "hd_generation_jobs": hd_jobs,
+        "hd_shot_leases": _rows(db, "SELECT * FROM hd_shot_leases WHERE project_id = ? ORDER BY shot_id", (project_id,)),
+        "hd_artifacts": hd_artifacts,
+        "hd_artifact_reviews": hd_reviews,
+        "hd_master_versions": hd_masters,
         "creative_briefs": creative_briefs,
         "creative_proposals": creative_proposals,
         "creative_characters": creative_characters,
@@ -189,6 +616,9 @@ def _candidate_paths(snapshot: dict[str, list[dict[str, Any]]], export_root: Pat
     for promotion in snapshot["promotions"]:
         if promotion.get("selected") and promotion.get("output_file"):
             candidates.append(("selected-promotions", Path(promotion["output_file"])))
+    for artifact in snapshot.get("hd_artifacts", []):
+        if artifact.get("output_path"):
+            candidates.append(("hd-artifacts", Path(artifact["output_path"])))
     for run in snapshot["export_runs"]:
         if not run.get("is_current"):
             continue
@@ -207,6 +637,10 @@ def _collect_media(snapshot: dict[str, list[dict[str, Any]]], export_root: Path)
     included: list[dict[str, Any]] = []
     omitted: list[dict[str, str]] = []
     seen: set[Path] = set()
+    hd_checksums = {
+        str(Path(item["output_path"]).expanduser().resolve()): str(item.get("output_sha256") or "").lower()
+        for item in snapshot.get("hd_artifacts", []) if item.get("output_path")
+    }
     for category, raw_path in _candidate_paths(snapshot, export_root):
         try:
             path = raw_path.expanduser().resolve(strict=True)
@@ -220,6 +654,10 @@ def _collect_media(snapshot: dict[str, list[dict[str, Any]]], export_root: Path)
             omitted.append({"category": category, "path": str(path), "reason": "unsupported"})
             continue
         checksum = sha256_file(path)
+        expected_hd = hd_checksums.get(str(path))
+        if category == "hd-artifacts" and (len(expected_hd or "") != 64 or checksum.lower() != expected_hd):
+            omitted.append({"category": category, "path": str(path), "reason": "sha256-mismatch"})
+            continue
         included.append({
             "category": category,
             "source_path": str(path),
@@ -243,62 +681,1026 @@ def archive_public(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def create_project_archive(db_path: Path, backup_root: Path, project_id: str, export_root: Path | None = None) -> dict[str, Any]:
+def archive_task_public(record: dict[str, Any]) -> dict[str, Any]:
+    try:
+        audit = json.loads(record.get("audit") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        audit = {"parse_error": "stored audit is not valid JSON"}
+    return {
+        "id": record["id"],
+        "project_id": record["project_id"],
+        "archive_id": record["archive_id"],
+        "operation": record["operation"],
+        "state": record["state"],
+        "stage": record["stage"],
+        "revision": record["revision"],
+        "archive_revision": record["archive_revision"],
+        "owner_instance": record["owner_instance"],
+        "owner_pid": record["owner_pid"],
+        "heartbeat_at": record["heartbeat_at"],
+        "error": record.get("error"),
+        "audit": audit,
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+        "completed_at": record.get("completed_at"),
+    }
+
+
+def archive_reconciliation_public(record: dict[str, Any]) -> dict[str, Any]:
+    try:
+        evidence = json.loads(record.get("evidence") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        evidence = {"parse_error": "stored evidence is not valid JSON"}
+    return {
+        "id": record["id"],
+        "project_id": record["project_id"],
+        "project_title": record.get("project_title"),
+        "lease_id": record["lease_id"],
+        "task_id": record.get("task_id"),
+        "reason": record["reason"],
+        "state": record["state"],
+        "revision": int(record.get("revision") or 0),
+        "evidence": evidence,
+        "confirmed_no_live_process": bool(record.get("confirmed_no_live_process")),
+        "resolved_by": record.get("resolved_by"),
+        "resolution_note": record.get("resolution_note"),
+        "resolution_owner_instance": record.get("resolution_owner_instance"),
+        "resolution_owner_host": record.get("resolution_owner_host"),
+        "resolution_owner_pid": record.get("resolution_owner_pid"),
+        "resolution_owner_process_identity": record.get("resolution_owner_process_identity"),
+        "resolution_started_at": record.get("resolution_started_at"),
+        "resolution_stage": record.get("resolution_stage"),
+        "resolution_heartbeat_at": record.get("resolution_heartbeat_at"),
+        "cleanup_error": record.get("cleanup_error"),
+        "cleanup_attempts": int(record.get("cleanup_attempts") or 0),
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+        "resolved_at": record.get("resolved_at"),
+    }
+
+
+def list_archive_reconciliations(
+    db_path: Path, project_id: str | None = None, *, include_resolved: bool = True,
+) -> list[dict[str, Any]]:
     with closing(connect(db_path)) as db:
-        db.execute("BEGIN")
+        if project_id is not None and not db.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone():
+            raise HTTPException(404, "项目不存在")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append("reconciliations.project_id = ?")
+            params.append(project_id)
+        if not include_resolved:
+            clauses.append("reconciliations.state != 'resolved'")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        records = _rows(
+            db,
+            f"""SELECT reconciliations.*, projects.title AS project_title
+            FROM project_archive_reconciliations reconciliations
+            JOIN projects ON projects.id = reconciliations.project_id
+            {where} ORDER BY reconciliations.updated_at DESC, reconciliations.id""",
+            tuple(params),
+        )
+    return [archive_reconciliation_public(record) for record in records]
+
+
+def _owner_is_definitely_current(task: dict[str, Any]) -> bool:
+    if task.get("owner_instance") == ARCHIVE_OWNER_INSTANCE:
+        return True
+    if str(task.get("owner_host") or "").casefold() != ARCHIVE_OWNER_HOST:
+        return False
+    try:
+        pid = int(task.get("owner_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    alive, identity = _process_identity(pid)
+    if alive is not True:
+        return False
+    stored = str(task.get("owner_process_identity") or "")
+    current = str(identity or "")
+    stored_kind = stored.split(":", 1)[0] if ":" in stored else ""
+    current_kind = current.split(":", 1)[0] if ":" in current else ""
+    return stored_kind in {"win-filetime", "proc-start"} and current_kind == stored_kind and stored == current
+
+
+def _resolver_owner_crash_reason(record: dict[str, Any]) -> str | None:
+    """Return a proof-backed crash reason; uncertainty always keeps the freeze."""
+    if record.get("resolution_owner_instance") == ARCHIVE_OWNER_INSTANCE:
+        return None
+    if str(record.get("resolution_owner_host") or "").casefold() != ARCHIVE_OWNER_HOST:
+        return None
+    stored_identity = str(record.get("resolution_owner_process_identity") or "")
+    stored_kind = stored_identity.split(":", 1)[0] if ":" in stored_identity else ""
+    if stored_kind not in {"win-filetime", "proc-start"}:
+        # Runtime fallbacks are process-lifetime hints, not OS-verifiable proof.
+        return None
+    try:
+        pid = int(record.get("resolution_owner_pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    alive, current_identity_value = _process_identity(pid)
+    if alive is False:
+        return "resolver_process_dead"
+    if alive is not True:
+        return None
+    current_identity = str(current_identity_value or "")
+    current_kind = current_identity.split(":", 1)[0] if ":" in current_identity else ""
+    if current_kind != stored_kind or not current_identity:
+        return None
+    if current_identity != stored_identity:
+        return "resolver_pid_reused"
+    return None
+
+
+def _touch_reconciliation_stage(
+    db_path: Path,
+    project_id: str,
+    reconciliation_id: str,
+    resolution_owner: str,
+    expected_revision: int,
+    stage: str,
+) -> None:
+    now = utc_now()
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        cursor = db.execute(
+            """UPDATE project_archive_reconciliations
+            SET resolution_stage = ?, resolution_heartbeat_at = ?, updated_at = ?
+            WHERE id = ? AND project_id = ? AND state = 'resolving'
+              AND resolution_owner = ? AND revision = ?""",
+            (
+                stage, now, now, reconciliation_id, project_id,
+                resolution_owner, expected_revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "归档冻结对账清理所有权已变化")
+        db.commit()
+
+
+def recover_archive_reconciliations(db_path: Path) -> int:
+    """Make provably abandoned resolver attempts manually retryable.
+
+    This recovery never cleans files or releases a lease. It only transitions
+    the exact abandoned resolver attempt to ``cleanup_failed`` with crash
+    evidence, so a human can inspect and retry the idempotent cleanup.
+    """
+    with closing(connect(db_path)) as db:
+        candidates = [dict(row) for row in db.execute(
+            """SELECT * FROM project_archive_reconciliations
+            WHERE state = 'resolving' ORDER BY updated_at, id"""
+        ).fetchall()]
+    recovered = 0
+    for candidate in candidates:
+        crash_reason = _resolver_owner_crash_reason(candidate)
+        if crash_reason is None:
+            continue
+        now = utc_now()
+        with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                """SELECT * FROM project_archive_reconciliations
+                WHERE id = ? AND project_id = ?""",
+                (candidate["id"], candidate["project_id"]),
+            ).fetchone()
+            if (
+                not current
+                or current["state"] != "resolving"
+                or int(current["revision"]) != int(candidate["revision"])
+                or current["resolution_owner"] != candidate.get("resolution_owner")
+                or current["resolution_owner_instance"] != candidate.get("resolution_owner_instance")
+                or current["resolution_owner_host"] != candidate.get("resolution_owner_host")
+                or current["resolution_owner_pid"] != candidate.get("resolution_owner_pid")
+                or current["resolution_owner_process_identity"]
+                != candidate.get("resolution_owner_process_identity")
+            ):
+                db.rollback()
+                continue
+            lease = db.execute(
+                """SELECT 1 FROM project_archive_leases
+                WHERE project_id = ? AND lease_id = ?""",
+                (current["project_id"], current["lease_id"]),
+            ).fetchone()
+            if not lease:
+                # Without the exact freeze there is no safe recovery claim.
+                db.rollback()
+                continue
+            try:
+                evidence = json.loads(current["evidence"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                evidence = {}
+            crashes = evidence.setdefault("resolver_crash_recoveries", [])
+            crashes.append({
+                "reason": crash_reason,
+                "resolution_owner": current["resolution_owner"],
+                "owner_instance": current["resolution_owner_instance"],
+                "owner_host": current["resolution_owner_host"],
+                "owner_pid": current["resolution_owner_pid"],
+                "owner_process_identity": current["resolution_owner_process_identity"],
+                "stage": current["resolution_stage"],
+                "heartbeat_at": current["resolution_heartbeat_at"],
+                "detected_by": _current_owner(),
+                "detected_at": now,
+                "lease_preserved": True,
+            })
+            message = "归档对账进程异常退出，已保留冻结与清理快照，请人工核对后重试"
+            cursor = db.execute(
+                """UPDATE project_archive_reconciliations
+                SET state = 'cleanup_failed', evidence = ?, cleanup_error = ?,
+                    resolution_owner = NULL, resolution_stage = 'crash_recovered',
+                    resolution_heartbeat_at = ?, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND project_id = ? AND state = 'resolving'
+                  AND resolution_owner = ? AND revision = ?
+                  AND resolution_owner_instance = ? AND resolution_owner_host = ?
+                  AND resolution_owner_pid = ? AND resolution_owner_process_identity = ?""",
+                (
+                    json.dumps(evidence, ensure_ascii=False, sort_keys=True), message, now, now,
+                    current["id"], current["project_id"], current["resolution_owner"],
+                    int(current["revision"]), current["resolution_owner_instance"],
+                    current["resolution_owner_host"], current["resolution_owner_pid"],
+                    current["resolution_owner_process_identity"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                db.rollback()
+                continue
+            db.commit()
+            recovered += 1
+    return recovered
+
+
+def resolve_archive_reconciliation(
+    db_path: Path,
+    backup_root: Path,
+    project_id: str,
+    reconciliation_id: str,
+    payload: ArchiveReconciliationResolve,
+) -> dict[str, Any]:
+    if not payload.confirm_no_live_archive_process:
+        raise HTTPException(400, "必须明确确认没有存活的归档进程")
+    resolution_owner = f"archive-resolution-{uuid.uuid4().hex}"
+    resolver_owner = _current_owner()
+    cleanup_task: dict[str, Any] | None = None
+    same_project_task = False
+    frozen_snapshot: dict[str, Any] = {}
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        _audit_archive_lease_reconciliations(db)
+        record = db.execute(
+            """SELECT * FROM project_archive_reconciliations
+            WHERE id = ? AND project_id = ?""",
+            (reconciliation_id, project_id),
+        ).fetchone()
+        if not record:
+            db.rollback()
+            raise HTTPException(404, "归档冻结对账记录不存在")
+        if record["state"] not in {"unresolved", "cleanup_failed"} or int(record["revision"]) != payload.expected_revision:
+            db.rollback()
+            raise HTTPException(409, "归档冻结对账记录已变化，请刷新后重试")
+        lease_row = db.execute(
+            "SELECT * FROM project_archive_leases WHERE project_id = ? AND lease_id = ?",
+            (project_id, record["lease_id"]),
+        ).fetchone()
+        if not lease_row:
+            db.rollback()
+            raise HTTPException(409, "异常归档 lease 已变化，保持对账记录且未写入")
+        task_row = None
+        if lease_row["task_id"]:
+            task_row = db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (lease_row["task_id"],)).fetchone()
+        anomaly = _lease_anomaly(dict(lease_row), dict(task_row) if task_row else None)
+        if anomaly is None:
+            db.rollback()
+            raise HTTPException(409, "当前 lease 与任务已恢复一致，不能按旧证据解除")
+        task = dict(task_row) if task_row else None
+        same_project_task = bool(task and task["project_id"] == project_id)
+        if same_project_task and task and task["state"] == "running" and _owner_is_definitely_current(task):
+            db.rollback()
+            raise HTTPException(409, "检测到归档任务 owner 仍存活，不能解除冻结")
+        cleanup_task = task if same_project_task and task and task["state"] == "running" else None
+        lease_snapshot = {
+            key: lease_row[key]
+            for key in (
+                "project_id", "lease_id", "operation", "created_at", "task_id", "owner_instance",
+                "owner_host", "owner_pid", "owner_process_identity", "heartbeat_at",
+            )
+        }
+        frozen_snapshot = {
+            "lease": lease_snapshot,
+            "same_project_task": same_project_task,
+            "referenced_task_project_id": task.get("project_id") if task else None,
+            "paths": {
+                key: task[key] for key in ("staging_path", "partial_path", "final_path")
+            } if same_project_task and task else {},
+        }
+        now = utc_now()
+        acquired = db.execute(
+            """UPDATE project_archive_reconciliations
+            SET state = 'resolving', resolution_owner = ?, resolution_task_id = ?,
+                resolution_owner_instance = ?, resolution_owner_host = ?,
+                resolution_owner_pid = ?, resolution_owner_process_identity = ?,
+                resolution_task_revision = ?, resolution_paths = ?, resolution_started_at = ?,
+                resolution_stage = 'acquired', resolution_heartbeat_at = ?,
+                cleanup_error = NULL, cleanup_attempts = cleanup_attempts + 1,
+                updated_at = ?, revision = revision + 1
+            WHERE id = ? AND project_id = ? AND state IN ('unresolved','cleanup_failed') AND revision = ?""",
+            (
+                resolution_owner, lease_row["task_id"], resolver_owner["owner_instance"],
+                resolver_owner["owner_host"], resolver_owner["owner_pid"],
+                resolver_owner["owner_process_identity"],
+                int(task["revision"]) if same_project_task and task else None,
+                json.dumps(frozen_snapshot, ensure_ascii=False, sort_keys=True), now, now, now,
+                reconciliation_id, project_id, payload.expected_revision,
+            ),
+        )
+        if acquired.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "归档冻结对账已被其他请求取得清理所有权")
+        db.commit()
+    resolving_revision = payload.expected_revision + 1
+
+    cleanup_errors: list[str] = []
+    if cleanup_task:
+        _touch_reconciliation_stage(
+            db_path, project_id, reconciliation_id, resolution_owner, resolving_revision, "cleaning",
+        )
+        try:
+            cleanup_errors = _cleanup_archive_task_paths(db_path, backup_root, cleanup_task)
+        except Exception as exc:  # noqa: BLE001 - unexpected cleanup failures must remain auditable.
+            cleanup_errors = [f"cleanup-exception:{type(exc).__name__}:{exc}"]
+    if cleanup_errors:
+        _mark_reconciliation_cleanup_failed(
+            db_path, project_id, reconciliation_id, resolution_owner, resolving_revision, cleanup_errors,
+        )
+        raise HTTPException(409, "无法安全清理异常归档任务文件，冻结保持：" + "；".join(cleanup_errors))
+
+    _touch_reconciliation_stage(
+        db_path, project_id, reconciliation_id, resolution_owner, resolving_revision, "finalizing",
+    )
+    final_error: str | None = None
+    now = utc_now()
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        record = db.execute(
+            "SELECT * FROM project_archive_reconciliations WHERE id = ? AND project_id = ?",
+            (reconciliation_id, project_id),
+        ).fetchone()
+        if (
+            not record
+            or record["state"] != "resolving"
+            or record["resolution_owner"] != resolution_owner
+            or int(record["revision"]) != resolving_revision
+        ):
+            db.rollback()
+            raise HTTPException(409, "归档冻结对账记录已被其他请求处理")
+        lease_row = db.execute(
+            "SELECT * FROM project_archive_leases WHERE project_id = ? AND lease_id = ?",
+            (project_id, record["lease_id"]),
+        ).fetchone()
+        if not lease_row:
+            final_error = "异常归档 lease 在清理后消失"
+        else:
+            current_lease = {key: lease_row[key] for key in frozen_snapshot["lease"]}
+            if current_lease != frozen_snapshot["lease"]:
+                final_error = "异常归档 lease 在清理期间变化"
+        task_row = None
+        if final_error is None and same_project_task:
+            task_row = db.execute(
+                "SELECT * FROM project_archive_tasks WHERE id = ? AND project_id = ?",
+                (record["resolution_task_id"], project_id),
+            ).fetchone()
+            if not task_row or int(task_row["revision"]) != int(record["resolution_task_revision"]):
+                final_error = "同项目归档任务 revision 在清理期间变化"
+            elif {
+                key: task_row[key] for key in ("staging_path", "partial_path", "final_path")
+            } != frozen_snapshot["paths"]:
+                final_error = "同项目归档任务路径在清理期间变化"
+        if final_error is not None:
+            db.rollback()
+            _mark_reconciliation_cleanup_failed(
+                db_path, project_id, reconciliation_id, resolution_owner, resolving_revision, [final_error],
+            )
+            raise HTTPException(409, final_error + "；冻结保持并已记录对账失败")
+        try:
+            reconciliation_audit = json.loads(record["evidence"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            reconciliation_audit = {}
+        reconciliation_audit["resolution"] = {
+            "confirmed_no_live_archive_process": True,
+            "confirmed_by": payload.confirmed_by.strip(),
+            "note": payload.note.strip(),
+            "reason_at_resolution": record["reason"],
+            "ownership": {
+                "resolution_owner": resolution_owner,
+                "frozen_snapshot": frozen_snapshot,
+                "cross_project_task_untouched": bool(record["resolution_task_id"] and not same_project_task),
+            },
+            "resolved_at": now,
+        }
+        if same_project_task and task_row:
+            task = dict(task_row)
+            try:
+                task_audit = json.loads(task["audit"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                task_audit = {}
+            task_audit["manual_reconciliation"] = reconciliation_audit["resolution"]
+            if task["state"] == "running":
+                task_cursor = db.execute(
+                    """UPDATE project_archive_tasks
+                    SET state = 'failed', stage = 'reconciled_failed', error = ?, audit = ?,
+                        heartbeat_at = ?, updated_at = ?, completed_at = ?, revision = revision + 1
+                    WHERE id = ? AND project_id = ? AND state = 'running' AND revision = ?""",
+                    (
+                        "人工确认无存活归档进程并解除异常冻结",
+                        json.dumps(task_audit, ensure_ascii=False, sort_keys=True), now, now, now,
+                        task["id"], project_id, int(task["revision"]),
+                    ),
+                )
+            else:
+                task_cursor = db.execute(
+                    """UPDATE project_archive_tasks
+                    SET audit = ?, updated_at = ?, revision = revision + 1
+                    WHERE id = ? AND project_id = ? AND state = ? AND revision = ?""",
+                    (
+                        json.dumps(task_audit, ensure_ascii=False, sort_keys=True), now,
+                        task["id"], project_id, task["state"], int(task["revision"]),
+                    ),
+                )
+            if task_cursor.rowcount != 1:
+                db.rollback()
+                raise HTTPException(409, "归档任务在对账期间变化，零写入")
+        if lease_row["task_id"] is None:
+            lease_cursor = db.execute(
+                """DELETE FROM project_archive_leases
+                WHERE project_id = ? AND lease_id = ? AND task_id IS NULL""",
+                (project_id, record["lease_id"]),
+            )
+        else:
+            lease_cursor = db.execute(
+                """DELETE FROM project_archive_leases
+                WHERE project_id = ? AND lease_id = ? AND task_id = ?""",
+                (project_id, record["lease_id"], lease_row["task_id"]),
+            )
+        if lease_cursor.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "异常归档 lease 在对账期间变化，零写入")
+        cursor = db.execute(
+            """UPDATE project_archive_reconciliations
+            SET state = 'resolved', confirmed_no_live_process = 1, resolved_by = ?, resolution_note = ?,
+                evidence = ?, cleanup_error = NULL, resolution_owner = NULL,
+                resolution_stage = 'resolved', resolution_heartbeat_at = ?,
+                updated_at = ?, resolved_at = ?, revision = revision + 1
+            WHERE id = ? AND project_id = ? AND state = 'resolving'
+              AND resolution_owner = ? AND revision = ?""",
+            (
+                payload.confirmed_by.strip(), payload.note.strip(),
+                json.dumps(reconciliation_audit, ensure_ascii=False, sort_keys=True), now, now, now,
+                reconciliation_id, project_id, resolution_owner, resolving_revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "归档冻结对账完成 CAS 失败，零数据库写入")
+        db.commit()
+    return next(
+        item for item in list_archive_reconciliations(db_path, project_id) if item["id"] == reconciliation_id
+    )
+
+
+def _mark_reconciliation_cleanup_failed(
+    db_path: Path,
+    project_id: str,
+    reconciliation_id: str,
+    resolution_owner: str,
+    expected_revision: int,
+    errors: list[str],
+) -> None:
+    now = utc_now()
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        record = db.execute(
+            """SELECT * FROM project_archive_reconciliations
+            WHERE id = ? AND project_id = ? AND state = 'resolving'
+              AND resolution_owner = ? AND revision = ?""",
+            (reconciliation_id, project_id, resolution_owner, expected_revision),
+        ).fetchone()
+        if not record:
+            db.rollback()
+            raise HTTPException(409, "清理失败，但对账所有权已变化；冻结保持")
+        lease = db.execute(
+            "SELECT 1 FROM project_archive_leases WHERE project_id = ? AND lease_id = ?",
+            (project_id, record["lease_id"]),
+        ).fetchone()
+        if not lease:
+            db.rollback()
+            raise HTTPException(409, "清理失败且异常 lease 已变化；未写入已解决状态")
+        try:
+            evidence = json.loads(record["evidence"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            evidence = {}
+        evidence["cleanup_failure"] = {
+            "errors": errors,
+            "resolution_owner": resolution_owner,
+            "failed_at": now,
+        }
+        cursor = db.execute(
+            """UPDATE project_archive_reconciliations
+            SET state = 'cleanup_failed', evidence = ?, cleanup_error = ?,
+                resolution_owner = NULL, resolution_stage = 'cleanup_failed',
+                resolution_heartbeat_at = ?, updated_at = ?, revision = revision + 1
+            WHERE id = ? AND project_id = ? AND state = 'resolving'
+              AND resolution_owner = ? AND revision = ?""",
+            (
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True), "；".join(errors), now, now,
+                reconciliation_id, project_id, resolution_owner, expected_revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "清理失败审计 CAS 冲突；冻结保持")
+        db.commit()
+
+
+def _cleanup_tree(path: Path) -> None:
+    if not path.exists():
+        return
+
+    def writable_then_retry(function: Any, raw_path: str, _error: Any) -> None:
+        os.chmod(raw_path, 0o700)
+        function(raw_path)
+
+    shutil.rmtree(path, onerror=writable_then_retry)
+
+
+def _stage_archive_media(staging_root: Path, media: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    staged: list[dict[str, Any]] = []
+    media_root = staging_root / "media"
+    staging_root.mkdir(parents=True, exist_ok=False)
+    media_root.mkdir(exist_ok=False)
+    for index, item in enumerate(media, 1):
+        source = Path(item["path"]).resolve()
+        expected_sha = str(item["checksum_sha256"]).lower()
+        before_size = source.stat().st_size
+        before_sha = sha256_file(source).lower()
+        if before_sha != expected_sha or before_size != int(item["size_bytes"]):
+            raise HTTPException(409, f"归档媒体在冻结前已变化：{source.name}")
+        suffix = source.suffix.lower() if source.suffix.lower() in MEDIA_SUFFIXES else ".media"
+        staged_path = media_root / f"{index:04d}-{expected_sha}{suffix}"
+        temporary = media_root / f".{index:04d}-{uuid.uuid4().hex}.tmp"
+        try:
+            with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
+            after_size = source.stat().st_size
+            after_sha = sha256_file(source).lower()
+            staged_sha = sha256_file(temporary).lower()
+            if before_size != after_size or before_sha != after_sha or staged_sha != expected_sha:
+                raise HTTPException(409, f"归档媒体在 staging 复制期间发生变化：{source.name}")
+            temporary.replace(staged_path)
+            os.chmod(staged_path, 0o444)
+            staged.append({**item, "staged_path": staged_path})
+        finally:
+            temporary.unlink(missing_ok=True)
+    return staged
+
+
+def _verify_built_archive(path: Path, manifest_bytes: bytes, data_bytes: bytes, media: list[dict[str, Any]]) -> None:
+    expected_names = {"archive-manifest.json", "project-data.json", *[item["archive_path"] for item in media]}
+    try:
+        with zipfile.ZipFile(path) as package:
+            if package.testzip() is not None or set(package.namelist()) != expected_names:
+                raise HTTPException(500, "归档 ZIP 目录或 CRC 校验失败")
+            if package.read("archive-manifest.json") != manifest_bytes:
+                raise HTTPException(500, "归档 manifest 与冻结凭证不一致")
+            packaged_data = package.read("project-data.json")
+            if packaged_data != data_bytes:
+                raise HTTPException(500, "归档项目数据与冻结凭证不一致")
+            for item in media:
+                payload = package.read(item["archive_path"])
+                if len(payload) != int(item["size_bytes"]) or hashlib.sha256(payload).hexdigest() != item["checksum_sha256"]:
+                    raise HTTPException(500, f"归档媒体校验失败：{item['archive_path']}")
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+        raise HTTPException(500, f"归档 ZIP 完整验证失败：{exc}") from exc
+
+
+def _archive_task_paths(backup_root: Path, project_id: str, archive_id: str, archive_revision: int, task_id: str) -> dict[str, Path]:
+    root = backup_root.resolve()
+    staging_path = (root / ".staging" / task_id).resolve()
+    archive_dir = (root / project_id).resolve()
+    try:
+        staging_path.relative_to(root / ".staging")
+        archive_dir.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(400, "项目标识无法映射到归档目录") from exc
+    return {
+        "staging_path": staging_path,
+        "partial_path": archive_dir / f".{archive_id}.partial",
+        "final_path": archive_dir / f"{project_id}-R{archive_revision}-{archive_id}.jingchang.zip",
+    }
+
+
+def _acquire_archive_task(
+    db_path: Path,
+    backup_root: Path,
+    project_id: str,
+    *,
+    mark_archived: bool,
+    task_id: str,
+    lease_id: str,
+    archive_id: str,
+    created_at: str,
+) -> dict[str, Any]:
+    owner = _current_owner()
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        project = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if not project:
+            raise HTTPException(404, "项目不存在")
+        if project["archived"]:
+            raise HTTPException(409, "项目已经归档")
+        if db.execute("SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project_id,)).fetchone():
+            raise HTTPException(409, "项目已有归档冻结任务")
+        blockers = project_has_active_work(db, project_id)
+        if blockers:
+            raise HTTPException(409, "项目仍有活动任务，不能归档：" + "、".join(blockers))
+        if mark_archived:
+            active = db.execute("SELECT value FROM workspace_settings WHERE key = 'active_project_id'").fetchone()
+            if active and active["value"] == project_id:
+                raise HTTPException(409, "当前项目不能归档，请先切换到另一个项目")
+        previous = db.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM project_archives WHERE project_id = ?", (project_id,),
+        ).fetchone()[0]
+        archive_revision = int(previous) + 1
+        paths = _archive_task_paths(backup_root, project_id, archive_id, archive_revision, task_id)
         snapshot = project_snapshot(db, project_id)
-        previous = db.execute("SELECT COALESCE(MAX(revision), 0) FROM project_archives WHERE project_id = ?", (project_id,)).fetchone()[0]
-        revision = int(previous) + 1
-        project = snapshot["projects"][0]
+        db.execute(
+            """INSERT INTO project_archive_tasks
+            (id, project_id, archive_id, operation, state, stage, revision, archive_revision,
+             owner_instance, owner_host, owner_pid, owner_process_identity, heartbeat_at,
+             staging_path, partial_path, final_path, audit, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'running', 'snapshot_frozen', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)""",
+            (
+                task_id, project_id, archive_id, "archive" if mark_archived else "snapshot", archive_revision,
+                owner["owner_instance"], owner["owner_host"], owner["owner_pid"], owner["owner_process_identity"],
+                created_at, str(paths["staging_path"]), str(paths["partial_path"]), str(paths["final_path"]),
+                created_at, created_at,
+            ),
+        )
+        db.execute(
+            """INSERT INTO project_archive_leases
+            (project_id, lease_id, operation, created_at, task_id, owner_instance, owner_host,
+             owner_pid, owner_process_identity, heartbeat_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                project_id, lease_id, "archive" if mark_archived else "snapshot", created_at, task_id,
+                owner["owner_instance"], owner["owner_host"], owner["owner_pid"],
+                owner["owner_process_identity"], created_at,
+            ),
+        )
+        db.commit()
+    return {"snapshot": snapshot, "archive_revision": archive_revision, "task_revision": 0, **paths}
+
+
+def _advance_archive_task(db_path: Path, task_id: str, expected_revision: int, stage: str) -> int:
+    now = utc_now()
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        cursor = db.execute(
+            """UPDATE project_archive_tasks
+            SET stage = ?, heartbeat_at = ?, updated_at = ?, revision = revision + 1
+            WHERE id = ? AND state = 'running' AND revision = ?""",
+            (stage, now, now, task_id, expected_revision),
+        )
+        if cursor.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "归档任务所有权或阶段已变化，已停止发布")
+        db.execute("UPDATE project_archive_leases SET heartbeat_at = ? WHERE task_id = ?", (now, task_id))
+        db.commit()
+    return expected_revision + 1
+
+
+def _fail_archive_task(db_path: Path, task_id: str, error: str, cleanup_errors: list[str] | None = None) -> None:
+    now = utc_now()
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row or row["state"] != "running":
+            db.rollback()
+            return
+        try:
+            audit = json.loads(row["audit"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            audit = {}
+        audit["failure"] = {
+            "stage": row["stage"], "error": error, "cleanup_errors": cleanup_errors or [], "at": now,
+        }
+        if cleanup_errors:
+            db.execute(
+                """UPDATE project_archive_tasks
+                SET stage = 'failure_cleanup_failed', error = ?, audit = ?, heartbeat_at = ?,
+                    updated_at = ?, revision = revision + 1
+                WHERE id = ? AND state = 'running' AND revision = ?""",
+                (
+                    "归档失败且私有文件无法安全清理，冻结仍保留",
+                    json.dumps(audit, ensure_ascii=False), now, now, task_id, int(row["revision"]),
+                ),
+            )
+            db.commit()
+            return
+        db.execute(
+            """UPDATE project_archive_tasks
+            SET state = 'failed', stage = 'failed', error = ?, audit = ?, heartbeat_at = ?,
+                updated_at = ?, completed_at = ?, revision = revision + 1
+            WHERE id = ? AND state = 'running' AND revision = ?""",
+            (error, json.dumps(audit, ensure_ascii=False), now, now, now, task_id, int(row["revision"])),
+        )
+        db.execute("DELETE FROM project_archive_leases WHERE task_id = ?", (task_id,))
+        db.commit()
+
+
+def _cleanup_archive_task_paths(db_path: Path, backup_root: Path, task: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    root = backup_root.resolve()
+    expected = _archive_task_paths(
+        root, task["project_id"], task["archive_id"], int(task["archive_revision"]), task["id"],
+    )
+    for key, path in expected.items():
+        if str(path) != str(Path(task[key]).resolve()):
+            errors.append(f"unsafe-{key}")
+            continue
+        try:
+            if key == "staging_path":
+                _cleanup_tree(path)
+            elif key == "partial_path":
+                path.unlink(missing_ok=True)
+            else:
+                with closing(connect(db_path)) as db:
+                    registered = db.execute(
+                        "SELECT 1 FROM project_archives WHERE package_path = ?", (str(path),),
+                    ).fetchone()
+                if not registered:
+                    path.unlink(missing_ok=True)
+        except OSError as exc:
+            errors.append(f"{key}:{exc}")
+    return errors
+
+
+def _task_owner_is_dead(task: dict[str, Any]) -> bool:
+    if task.get("owner_instance") == ARCHIVE_OWNER_INSTANCE:
+        return False
+    if str(task.get("owner_host") or "").casefold() != ARCHIVE_OWNER_HOST:
+        return False
+    try:
+        pid = int(task.get("owner_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    alive, current_identity = _process_identity(pid)
+    if alive is False:
+        return True
+    stored_identity = str(task.get("owner_process_identity") or "")
+    current_identity = str(current_identity or "")
+    stored_kind = stored_identity.split(":", 1)[0] if ":" in stored_identity else ""
+    current_kind = current_identity.split(":", 1)[0] if ":" in current_identity else ""
+    verified_kinds = {"win-filetime", "proc-start"}
+    if (
+        alive is True
+        and stored_kind in verified_kinds
+        and current_kind == stored_kind
+        and stored_identity
+        and current_identity
+    ):
+        return current_identity != stored_identity
+    return False
+
+
+def recover_archive_tasks(db_path: Path, backup_root: Path) -> int:
+    """Fail and clean only tasks whose local owner process is proven dead."""
+    # Resolver recovery is deliberately database-only: it preserves the lease
+    # and frozen paths for an explicit, idempotent manual retry.
+    recover_archive_reconciliations(db_path)
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        _audit_archive_lease_reconciliations(db)
+        db.commit()
+        blocked_task_ids = {
+            row[0]
+            for row in db.execute(
+                """SELECT task_id FROM project_archive_reconciliations
+                WHERE state != 'resolved' AND task_id IS NOT NULL"""
+            ).fetchall()
+        }
+        tasks = [dict(row) for row in db.execute(
+            "SELECT * FROM project_archive_tasks WHERE state = 'running' ORDER BY created_at",
+        ).fetchall()]
+    recovered = 0
+    for task in tasks:
+        if task["id"] in blocked_task_ids:
+            continue
+        if not _task_owner_is_dead(task):
+            continue
+        cleanup_errors = _cleanup_archive_task_paths(db_path, backup_root, task)
+        if cleanup_errors:
+            now = utc_now()
+            with closing(connect(db_path)) as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute(
+                    "SELECT state, revision, audit FROM project_archive_tasks WHERE id = ?", (task["id"],),
+                ).fetchone()
+                if current and current["state"] == "running" and int(current["revision"]) == int(task["revision"]):
+                    try:
+                        audit = json.loads(current["audit"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        audit = {}
+                    audit["recovery_cleanup_failed"] = {"errors": cleanup_errors, "at": now}
+                    db.execute(
+                        """UPDATE project_archive_tasks SET stage = 'recovery_cleanup_failed', error = ?, audit = ?,
+                        heartbeat_at = ?, updated_at = ?, revision = revision + 1
+                        WHERE id = ? AND state = 'running' AND revision = ?""",
+                        (
+                            "无法安全清理崩溃归档任务，冻结仍保留", json.dumps(audit, ensure_ascii=False), now, now,
+                            task["id"], int(task["revision"]),
+                        ),
+                    )
+                    db.commit()
+                else:
+                    db.rollback()
+            continue
+        now = utc_now()
+        with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (task["id"],)).fetchone()
+            if not current or current["state"] != "running" or int(current["revision"]) != int(task["revision"]):
+                db.rollback()
+                continue
+            if db.execute("SELECT 1 FROM project_archives WHERE package_path = ?", (current["final_path"],)).fetchone():
+                db.rollback()
+                continue
+            try:
+                audit = json.loads(current["audit"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                audit = {}
+            audit["recovery"] = {
+                "reason": "owner_process_dead", "owner_instance": current["owner_instance"],
+                "owner_pid": current["owner_pid"], "owner_process_identity": current["owner_process_identity"],
+                "recovered_by": ARCHIVE_OWNER_INSTANCE, "at": now,
+            }
+            cursor = db.execute(
+                """UPDATE project_archive_tasks
+                SET state = 'failed', stage = 'recovered_failed', error = ?, audit = ?, heartbeat_at = ?,
+                    updated_at = ?, completed_at = ?, revision = revision + 1
+                WHERE id = ? AND state = 'running' AND revision = ?""",
+                (
+                    "检测到归档进程异常退出；未发布归档并已释放冻结",
+                    json.dumps(audit, ensure_ascii=False), now, now, now, task["id"], int(task["revision"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                db.rollback()
+                continue
+            db.execute("DELETE FROM project_archive_leases WHERE task_id = ?", (task["id"],))
+            db.commit()
+            recovered += 1
+    return recovered
+
+
+def create_project_archive(
+    db_path: Path, backup_root: Path, project_id: str, export_root: Path | None = None, *, mark_archived: bool = False,
+) -> dict[str, Any]:
+    task_id = f"archive-task-{uuid.uuid4().hex[:12]}"
+    lease_id = f"archive-lease-{uuid.uuid4().hex[:12]}"
+    archive_id = f"project-archive-{uuid.uuid4().hex[:12]}"
+    created_at = utc_now()
+    archive_revision = 0
+    task_revision = 0
+    lease_acquired = False
+    final_path: Path | None = None
+    partial_path: Path | None = None
+    staging_root: Path | None = None
+    failure_error = "归档任务异常终止"
+    try:
+        acquired = _acquire_archive_task(
+            db_path, backup_root, project_id, mark_archived=mark_archived, task_id=task_id,
+            lease_id=lease_id, archive_id=archive_id, created_at=created_at,
+        )
+        snapshot = acquired["snapshot"]
+        archive_revision = int(acquired["archive_revision"])
+        task_revision = int(acquired["task_revision"])
+        staging_root = Path(acquired["staging_path"])
+        partial_path = Path(acquired["partial_path"])
+        final_path = Path(acquired["final_path"])
+        lease_acquired = True
+
         media, omitted = _collect_media(snapshot, (export_root or backup_root.parent / "exports").resolve())
-        archive_id = f"project-archive-{uuid.uuid4().hex[:12]}"
-        created_at = utc_now()
+        if omitted:
+            details = "；".join(f"{item['reason']}:{item['path']}" for item in omitted[:5])
+            raise HTTPException(409, f"归档包含 {len(omitted)} 个缺失或不可信媒体，未发布：{details}")
+        task_revision = _advance_archive_task(db_path, task_id, task_revision, "sources_verified")
+        staged_media = _stage_archive_media(staging_root, media)
+        task_revision = _advance_archive_task(db_path, task_id, task_revision, "media_staged")
+        project = snapshot["projects"][0]
         manifest = {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
             "archive_id": archive_id,
             "project_id": project_id,
             "project_title": project["title"],
-            "revision": revision,
+            "revision": archive_revision,
             "created_at": created_at,
             "row_counts": {table: len(records) for table, records in snapshot.items()},
-            "media": [{key: value for key, value in item.items() if key != "path"} for item in media],
-            "omitted_media": omitted,
+            "media": [{key: value for key, value in item.items() if key not in {"path", "staged_path"}} for item in staged_media],
+            "omitted_media": [],
             "model_weights_included": False,
         }
-        data_bytes = json.dumps({"schema_version": ARCHIVE_SCHEMA_VERSION, "tables": snapshot}, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+        data_bytes = json.dumps(
+            {"schema_version": ARCHIVE_SCHEMA_VERSION, "tables": snapshot},
+            ensure_ascii=False, sort_keys=True, indent=2,
+        ).encode("utf-8")
         manifest["data_sha256"] = hashlib.sha256(data_bytes).hexdigest()
         manifest_bytes = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
 
-    archive_dir = (backup_root / project_id).resolve()
-    backup_root = backup_root.resolve()
-    try:
-        archive_dir.relative_to(backup_root)
-    except ValueError as exc:
-        raise HTTPException(400, "项目标识无法映射到归档目录") from exc
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    final_path = archive_dir / f"{project_id}-R{revision}.jingchang.zip"
-    partial_path = archive_dir / f".{archive_id}.partial"
-    try:
+        archive_dir = final_path.parent
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        task_revision = _advance_archive_task(db_path, task_id, task_revision, "package_building")
         with zipfile.ZipFile(partial_path, "w", allowZip64=True) as package:
             package.writestr("archive-manifest.json", manifest_bytes, compress_type=zipfile.ZIP_DEFLATED)
             package.writestr("project-data.json", data_bytes, compress_type=zipfile.ZIP_DEFLATED)
-            for item in media:
-                package.write(item["path"], item["archive_path"], compress_type=zipfile.ZIP_STORED)
+            for item in staged_media:
+                package.write(item["staged_path"], item["archive_path"], compress_type=zipfile.ZIP_STORED)
+        _verify_built_archive(partial_path, manifest_bytes, data_bytes, staged_media)
+        task_revision = _advance_archive_task(db_path, task_id, task_revision, "package_verified")
         partial_path.replace(final_path)
+        _verify_built_archive(final_path, manifest_bytes, data_bytes, staged_media)
+        checksum = sha256_file(final_path)
+        size_bytes = final_path.stat().st_size
+        task_revision = _advance_archive_task(db_path, task_id, task_revision, "final_verified")
+
+        with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            lease = db.execute(
+                "SELECT * FROM project_archive_leases WHERE project_id = ? AND lease_id = ? AND task_id = ?",
+                (project_id, lease_id, task_id),
+            ).fetchone()
+            task = db.execute(
+                "SELECT * FROM project_archive_tasks WHERE id = ? AND state = 'running' AND revision = ?",
+                (task_id, task_revision),
+            ).fetchone()
+            project = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if not lease or not task or not project or project["archived"] or project_has_active_work(db, project_id):
+                raise HTTPException(409, "归档冻结期间项目状态或任务发生变化，未发布")
+            current_snapshot = project_snapshot(db, project_id)
+            current_data = json.dumps(
+                {"schema_version": ARCHIVE_SCHEMA_VERSION, "tables": current_snapshot},
+                ensure_ascii=False, sort_keys=True, indent=2,
+            ).encode("utf-8")
+            if hashlib.sha256(current_data).hexdigest() != manifest["data_sha256"]:
+                raise HTTPException(409, "归档冻结期间项目数据发生变化，未发布")
+            if mark_archived:
+                active = db.execute("SELECT value FROM workspace_settings WHERE key = 'active_project_id'").fetchone()
+                if active and active["value"] == project_id:
+                    raise HTTPException(409, "项目在归档期间被重新激活，未发布")
+            verified_at = utc_now()
+            db.execute(
+                """INSERT INTO project_archives
+                (id, project_id, revision, state, package_path, size_bytes, checksum_sha256, manifest, created_at, verified_at)
+                VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)""",
+                (archive_id, project_id, archive_revision, str(final_path), size_bytes, checksum, json.dumps(manifest, ensure_ascii=False), created_at, verified_at),
+            )
+            if mark_archived:
+                db.execute("UPDATE projects SET archived = 1, archived_at = ? WHERE id = ? AND archived = 0", (verified_at, project_id))
+            cursor = db.execute(
+                """UPDATE project_archive_tasks
+                SET state = 'completed', stage = 'completed', error = NULL, heartbeat_at = ?, updated_at = ?,
+                    completed_at = ?, revision = revision + 1
+                WHERE id = ? AND state = 'running' AND revision = ?""",
+                (verified_at, verified_at, verified_at, task_id, task_revision),
+            )
+            if cursor.rowcount != 1:
+                db.rollback()
+                raise HTTPException(409, "归档任务状态已变化，未发布")
+            db.execute(
+                "DELETE FROM project_archive_leases WHERE project_id = ? AND lease_id = ? AND task_id = ?",
+                (project_id, lease_id, task_id),
+            )
+            record = dict(db.execute("SELECT * FROM project_archives WHERE id = ?", (archive_id,)).fetchone())
+            db.commit()
+            lease_acquired = False
+        return archive_public(record)
+    except Exception as exc:
+        failure_error = str(getattr(exc, "detail", exc))
+        raise
     finally:
-        partial_path.unlink(missing_ok=True)
-    checksum = sha256_file(final_path)
-    size_bytes = final_path.stat().st_size
-    with closing(connect(db_path)) as db:
-        db.execute(
-            """INSERT INTO project_archives
-            (id, project_id, revision, state, package_path, size_bytes, checksum_sha256, manifest, created_at, verified_at)
-            VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)""",
-            (archive_id, project_id, revision, str(final_path), size_bytes, checksum, json.dumps(manifest, ensure_ascii=False), created_at, created_at),
-        )
-        db.commit()
-        record = dict(db.execute("SELECT * FROM project_archives WHERE id = ?", (archive_id,)).fetchone())
-    return archive_public(record)
+        if lease_acquired:
+            with closing(connect(db_path)) as db:
+                task_row = db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (task_id,)).fetchone()
+            cleanup_errors = _cleanup_archive_task_paths(db_path, backup_root, dict(task_row)) if task_row else ["task-missing"]
+            _fail_archive_task(db_path, task_id, failure_error, cleanup_errors)
+        else:
+            if partial_path is not None:
+                partial_path.unlink(missing_ok=True)
+            if staging_root is not None:
+                _cleanup_tree(staging_root)
 
 
 def verify_project_archive(db_path: Path, archive_id: str) -> dict[str, Any]:
@@ -347,6 +1749,32 @@ def create_archive_router(db_path: Path, backup_root: Path, export_root: Path | 
     def create_archive(project_id: str) -> dict[str, Any]:
         return create_project_archive(db_path, backup_root, project_id, export_root)
 
+    @router.get("/api/projects/{project_id}/archive-tasks")
+    def list_archive_tasks(project_id: str) -> list[dict[str, Any]]:
+        with closing(connect(db_path)) as db:
+            if not db.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone():
+                raise HTTPException(404, "项目不存在")
+            records = _rows(
+                db,
+                "SELECT * FROM project_archive_tasks WHERE project_id = ? ORDER BY created_at DESC",
+                (project_id,),
+            )
+        return [archive_task_public(record) for record in records]
+
+    @router.get("/api/projects/{project_id}/archive-reconciliations")
+    def api_list_archive_reconciliations(
+        project_id: str, include_resolved: bool = True,
+    ) -> list[dict[str, Any]]:
+        return list_archive_reconciliations(db_path, project_id, include_resolved=include_resolved)
+
+    @router.post("/api/projects/{project_id}/archive-reconciliations/{reconciliation_id}/resolve")
+    def api_resolve_archive_reconciliation(
+        project_id: str, reconciliation_id: str, payload: ArchiveReconciliationResolve,
+    ) -> dict[str, Any]:
+        return resolve_archive_reconciliation(
+            db_path, backup_root, project_id, reconciliation_id, payload,
+        )
+
     @router.post("/api/project-archives/{archive_id}/verify")
     def verify_archive(archive_id: str) -> dict[str, Any]:
         return verify_project_archive(db_path, archive_id)
@@ -368,10 +1796,7 @@ def create_archive_router(db_path: Path, backup_root: Path, export_root: Path | 
                 raise HTTPException(404, "项目不存在")
             if active and active["value"] == project_id:
                 raise HTTPException(409, "当前项目不能归档，请先切换到另一个项目")
-        archive = create_project_archive(db_path, backup_root, project_id, export_root)
-        with closing(connect(db_path)) as db:
-            db.execute("UPDATE projects SET archived = 1, archived_at = ? WHERE id = ?", (utc_now(), project_id))
-            db.commit()
+        archive = create_project_archive(db_path, backup_root, project_id, export_root, mark_archived=True)
         return {"project_id": project_id, "archived": True, "archive": archive}
 
     @router.post("/api/projects/{project_id}/restore")

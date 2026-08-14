@@ -222,7 +222,7 @@ foreach ($line in $srt) {
 $sourceManifest = Join-Path $ExportRoot "$OutputName.sources.json"
 [IO.File]::WriteAllText(
     $sourceManifest,
-    ($sources | ConvertTo-Json -Depth 6),
+    (ConvertTo-Json -InputObject @($sources) -Depth 6),
     [Text.UTF8Encoding]::new($false)
 )
 

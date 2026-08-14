@@ -486,6 +486,14 @@ def begin_validation_lease(db_path: Path, plan: dict[str, Any]) -> str:
     project_id = str(plan["source_snapshot"]["shot"]["project_id"])
     with closing(connect(db_path)) as db:
         db.execute("BEGIN IMMEDIATE")
+        project_columns = {row[1] for row in db.execute("PRAGMA table_info(projects)").fetchall()}
+        if "archived" in project_columns:
+            project = db.execute("SELECT archived FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if not project or project["archived"]:
+                raise HTTPException(409, "项目已归档，不能开始 H3 dry-run")
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_archive_leases'").fetchone():
+            if db.execute("SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project_id,)).fetchone():
+                raise HTTPException(409, "项目正在冻结归档，不能开始 H3 dry-run")
         snapshot = _current_source_snapshot(db, shot_id, project_id)
         if snapshot is None:
             raise HTTPException(409, "镜头已删除，不能开始 H3 dry-run")

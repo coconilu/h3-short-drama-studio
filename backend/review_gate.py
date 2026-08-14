@@ -477,7 +477,10 @@ def review_workspace(db_path: Path, shot_id: str, output_root: Path) -> dict[str
         comparison: list[dict[str, Any]] = []
         for candidate in candidates:
             history = _review_history(db, candidate, output_root)
-            latest = history[0] if history else _review_public(None, candidate, output_root)
+            # Keep the latest public review independent from the history list.
+            # Reusing history[0] here makes latest["history"] point back to the
+            # list that already contains latest, which FastAPI cannot serialize.
+            latest = dict(history[0]) if history else _review_public(None, candidate, output_root)
             latest["history"] = history
             reviews.append(latest)
             comparison.append({
