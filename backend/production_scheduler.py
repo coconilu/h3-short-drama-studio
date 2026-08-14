@@ -547,7 +547,7 @@ def _fail_poll_reconciliation(
     db.execute(
         """UPDATE production_item_attempts SET state = ?,
         error = 'draft_job_reconciliation_conflict', updated_at = ?, completed_at = ?
-        WHERE item_id = ? AND attempt = ? AND state = 'running'""",
+        WHERE item_id = ? AND attempt = ? AND state IN ('running', 'submission_unknown')""",
         ("failed" if retry_safe else "submission_unknown", now, now, item["id"], int(item.get("attempts") or 0)),
     )
     if retry_safe:
@@ -752,37 +752,60 @@ def _zero_submit_proof(
             (item["id"],),
         ).fetchall()
     ]
-    if conflict["original_state"] == "queued" and int(item.get("attempts") or 0) == 0 and not attempts and not item.get("draft_job_id"):
+    claimed_count = int(item.get("attempts") or 0)
+    if conflict["original_state"] == "queued" and claimed_count == 0 and not attempts and not item.get("draft_job_id"):
         return {"verified": True, "basis": "queued_never_claimed", "job_id": None}
-    if any(_decode_json(attempt.get("candidate_ids"), []) or _decode_json(attempt.get("media_evidence"), []) for attempt in attempts):
-        return {"verified": False, "reason": "历史尝试已记录候选或媒体证据，不能证明零提交"}
-    attempt_job_ids = {int(attempt["draft_job_id"]) for attempt in attempts if attempt.get("draft_job_id")}
-    if len(attempt_job_ids) > 1 or (attempt_job_ids and int(item.get("draft_job_id") or 0) not in attempt_job_ids):
-        return {"verified": False, "reason": "历史尝试绑定了不同 draft job，不能证明整条 attempt 链零提交"}
-    job = _draft_job(db, item.get("draft_job_id"))
-    if not job or job.get("shot_id") != item["shot_id"]:
-        return {"verified": False, "reason": "缺少该冲突条目精确绑定的 draft job"}
-    if job.get("state") != "提交失败" or not bool(job.get("retry_safe")) or _decode_json(job.get("candidate_ids"), []):
-        return {"verified": False, "reason": "draft job 尚未被可信地确认成零提交"}
-    evidence = _decode_json(job.get("reconciliation_snapshot"), {})
-    manual = any(
-        isinstance(value, dict) and value.get("action") == "confirm_not_submitted"
-        for value in evidence.get("manual_resolutions") or []
-    )
-    frozen_pre_spawn = bool(
-        evidence.get("adapter_returned_success") is False
-        and isinstance(evidence.get("frozen_command"), dict)
-        and len(str(evidence.get("input_hash") or "")) == 64
-        and isinstance(evidence.get("manifest_before"), dict)
-        and evidence["manifest_before"].get("trusted") is True
-    )
-    if not manual and not frozen_pre_spawn:
-        return {"verified": False, "reason": "retry_safe 缺少人工确认或受信任的进程未启动冻结证据"}
+    expected_numbers = list(range(1, claimed_count + 1))
+    actual_numbers = [int(attempt.get("attempt") or 0) for attempt in attempts]
+    if claimed_count <= 0 or actual_numbers != expected_numbers:
+        return {
+            "verified": False,
+            "reason": f"历史 attempt 行不完整：期望 {expected_numbers}，实际 {actual_numbers}",
+        }
+    owned_job_ids = [int(attempt.get("draft_job_id") or 0) for attempt in attempts]
+    if any(job_id <= 0 for job_id in owned_job_ids):
+        return {"verified": False, "reason": "每个已领取 attempt 都必须独立绑定精确 draft job"}
+    if len(set(owned_job_ids)) != claimed_count:
+        return {"verified": False, "reason": "多个历史 attempt 复用了同一 draft job，不能独立证明零提交"}
+    if int(item.get("draft_job_id") or 0) != owned_job_ids[-1]:
+        return {"verified": False, "reason": "条目当前 draft job 与最后一次实际 attempt 不一致"}
+    attempt_proofs: list[dict[str, Any]] = []
+    for attempt, job_id in zip(attempts, owned_job_ids, strict=True):
+        attempt_number = int(attempt["attempt"])
+        if _decode_json(attempt.get("candidate_ids"), []) or _decode_json(attempt.get("media_evidence"), []):
+            return {"verified": False, "reason": f"attempt {attempt_number} 已记录候选或媒体证据，不能证明零提交"}
+        job = _draft_job(db, job_id)
+        if not job or job.get("shot_id") != item["shot_id"]:
+            return {"verified": False, "reason": f"attempt {attempt_number} 的精确 draft job 缺失或镜头不匹配"}
+        if job.get("state") != "提交失败" or not bool(job.get("retry_safe")) or _decode_json(job.get("candidate_ids"), []):
+            return {"verified": False, "reason": f"attempt {attempt_number} 尚未被可信地确认成零提交"}
+        evidence = _decode_json(job.get("reconciliation_snapshot"), {})
+        manual = any(
+            isinstance(value, dict) and value.get("action") == "confirm_not_submitted"
+            for value in evidence.get("manual_resolutions") or []
+        )
+        frozen_pre_spawn = bool(
+            evidence.get("adapter_returned_success") is False
+            and isinstance(evidence.get("frozen_command"), dict)
+            and len(str(evidence.get("input_hash") or "")) == 64
+            and isinstance(evidence.get("manifest_before"), dict)
+            and evidence["manifest_before"].get("trusted") is True
+        )
+        if not manual and not frozen_pre_spawn:
+            return {
+                "verified": False,
+                "reason": f"attempt {attempt_number} 缺少独立的人工确认或受信任进程未启动证据",
+            }
+        attempt_proofs.append({
+            "attempt": attempt_number,
+            "basis": "manual_confirm_not_submitted" if manual else "audited_pre_spawn_failure",
+            "job_id": int(job["id"]),
+            "job_revision": int(job.get("reconciliation_revision") or 0),
+        })
     return {
         "verified": True,
-        "basis": "manual_confirm_not_submitted" if manual else "audited_pre_spawn_failure",
-        "job_id": int(job["id"]),
-        "job_revision": int(job.get("reconciliation_revision") or 0),
+        "basis": "all_claimed_attempts_zero_submit",
+        "attempts": attempt_proofs,
     }
 
 
@@ -1356,7 +1379,37 @@ def poll_running_items(db_path: Path, syncer: Syncer) -> int:
                     ),
                 )
                 if advanced.rowcount != 1 or attempt_advanced.rowcount != 1:
-                    db.rollback()
+                    authority_item = db.execute(
+                        "SELECT * FROM production_batch_items WHERE id = ?", (item["id"],),
+                    ).fetchone()
+                    authority_attempt = db.execute(
+                        """SELECT * FROM production_item_attempts
+                        WHERE item_id = ? AND attempt = ? AND draft_job_id = ?""",
+                        (item["id"], int(current_item.get("attempts") or 0), int(job["id"])),
+                    ).fetchone()
+                    already_consumed = bool(
+                        authority_item
+                        and authority_attempt
+                        and authority_item["state"] != "running"
+                        and int(authority_item["draft_job_revision"] or 0) >= job_revision
+                        and int(authority_attempt["draft_job_revision"] or 0) >= job_revision
+                        and authority_attempt["state"] in ITEM_TERMINAL_STATES + ("submission_unknown",)
+                    )
+                    if already_consumed:
+                        db.commit()
+                        continue
+                    failure_result = {
+                        **result,
+                        "message": "draft job revision CAS 未能同时推进条目与 attempt；已失败关闭并保留审计证据",
+                    }
+                    _fail_poll_reconciliation(
+                        db,
+                        dict(authority_item or current_item),
+                        failure_result,
+                        now=now,
+                    )
+                    db.commit()
+                    changed += 1
                     continue
                 current_item["draft_job_revision"] = job_revision
                 result = {**result, "base_job_revision": job_revision, "job_revision": job_revision}

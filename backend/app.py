@@ -3366,9 +3366,8 @@ def run_export_job(run_id: str) -> None:
             "size_bytes": video_path.stat().st_size,
         }
         completed_at = utc_now()
-        # Keep expensive file hashing outside the final database write lock.
-        # The following short transaction protects the mutable assembly rows;
-        # the source set itself is immutable by frozen path+SHA contract.
+        # Reject obvious source drift before taking the publication lock.  The
+        # authoritative hash is repeated inside the final transaction below.
         _verify_frozen_export_sources(snapshot, sources)
         with closing(connect()) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -3384,10 +3383,10 @@ def run_export_job(run_id: str) -> None:
                 or current_run.get("config") != export_run.get("config")
             ):
                 raise RuntimeError("导出任务冻结凭证在发布前发生变化")
-            # This final validation and the current-version CAS share one short
-            # write transaction, so a delivery row/status/revision edit cannot
-            # slip between validation and publication.
-            _validate_export_run_snapshot(current_run, db=db, verify_sources=False)
+            # Final assembly and path/SHA validation share the publication
+            # transaction with the run CAS.  It contains no FFmpeg work, and a
+            # delivery edit or source replacement cannot slip into publication.
+            _validate_export_run_snapshot(current_run, db=db, verify_sources=True)
             production_manifest_temp.replace(production_manifest_path)
             db.execute("UPDATE export_runs SET is_current = 0 WHERE project_id = ?", (export_run["project_id"],))
             published = db.execute(

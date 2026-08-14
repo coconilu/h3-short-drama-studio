@@ -252,6 +252,56 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         self.assertEqual(json.loads(failed[2]), {})
         self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
 
+    def test_source_replaced_after_last_external_check_fails_inside_publication_transaction(self) -> None:
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
+        self.assertEqual(studio.claim_next_export_run()["id"], queued["id"])
+        run = studio.row("SELECT * FROM export_runs WHERE id = ?", (queued["id"],))
+        snapshot = json.loads(run["source_snapshot"])
+        stem = run["output_name"]
+
+        class SuccessfulRender:
+            pid = 4244
+            returncode = 0
+
+            def __init__(self) -> None:
+                self.finished = False
+
+            def poll(self) -> int:
+                if not self.finished:
+                    studio.EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+                    for suffix in (".mp4", ".srt", ".vtt"):
+                        (studio.EXPORT_ROOT / f"{stem}{suffix}").write_bytes(b"controlled-output")
+                    (studio.EXPORT_ROOT / f"{stem}.sources.json").write_text(
+                        json.dumps(snapshot["sources"], ensure_ascii=False), encoding="utf-8",
+                    )
+                    self.finished = True
+                return 0
+
+        original_verify = studio._verify_frozen_export_sources
+        verify_calls = 0
+
+        def replace_after_fourth_verify(current_snapshot: dict, rendered_sources=None) -> None:
+            nonlocal verify_calls
+            verify_calls += 1
+            original_verify(current_snapshot, rendered_sources)
+            if verify_calls == 4:
+                self.video.write_bytes(b"replacement-after-last-external-source-check")
+
+        with patch("backend.app.subprocess.Popen", return_value=SuccessfulRender()), patch(
+            "backend.app._verify_frozen_export_sources", side_effect=replace_after_fourth_verify,
+        ), patch("backend.app.probe_media", side_effect=self.probe):
+            studio.run_export_job(queued["id"])
+        self.assertEqual(verify_calls, 5, "最终发布事务必须执行第五次权威 path/SHA 复核")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            failed = db.execute(
+                "SELECT state, is_current, outputs FROM export_runs WHERE id = ?", (queued["id"],),
+            ).fetchone()
+        self.assertEqual(failed[0], "失败")
+        self.assertEqual(failed[1], 0)
+        self.assertEqual(json.loads(failed[2]), {})
+        self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
+
     def _assert_delivery_mutation_during_render_fails(self, sql: str) -> None:
         with patch("backend.app.probe_media", side_effect=self.probe):
             queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))

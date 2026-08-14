@@ -160,6 +160,42 @@ class ProductionSchedulerTests(unittest.TestCase):
             db.commit()
         return batch["id"], item_ids
 
+    def attach_zero_submit_job(
+        self, item_id: str, attempt_number: int, *, manual: bool = False, set_current: bool = True,
+    ) -> int:
+        evidence = (
+            {"manual_resolutions": [{"action": "confirm_not_submitted", "resolved_by": "test"}]}
+            if manual
+            else {
+                "adapter_returned_success": False,
+                "frozen_command": {"arguments": ["draft"]},
+                "input_hash": "f" * 64,
+                "manifest_before": {"trusted": True},
+            }
+        )
+        with closing(sqlite3.connect(self.db_path)) as db:
+            cursor = db.execute(
+                """INSERT INTO jobs
+                (shot_id, kind, state, message, candidate_ids, source_snapshot, plan_hash, retry_safe,
+                 reconciliation_snapshot, reconciliation_revision)
+                VALUES ('s1', 'draft', '提交失败', '已确认零提交', '[]', '{}', ?, 1, ?, 1)""",
+                ("v" * 64, json.dumps(evidence)),
+            )
+            job_id = int(cursor.lastrowid)
+            db.execute(
+                """UPDATE production_item_attempts SET state = 'submission_unknown', draft_job_id = ?,
+                draft_job_revision = 1, candidate_ids = '[]', media_evidence = '[]'
+                WHERE item_id = ? AND attempt = ?""",
+                (job_id, item_id, attempt_number),
+            )
+            if set_current:
+                db.execute(
+                    "UPDATE production_batch_items SET draft_job_id = ?, draft_job_revision = 1 WHERE id = ?",
+                    (job_id, item_id),
+                )
+            db.commit()
+        return job_id
+
     def create_draft_job(self, shot_id: str, state: str = "运行中") -> dict:
         prompt_ids = [f"prompt-{shot_id}"]
         candidate_ids = [f"draft-{shot_id}-1", f"draft-{shot_id}-2"]
@@ -594,6 +630,94 @@ class ProductionSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(resolved["state"], "resolved")
 
+    def test_later_safe_current_job_cannot_substitute_for_older_unknown_attempt(self) -> None:
+        _, item_ids = self.make_ownership_conflict(uncertain=True)
+        first_item = item_ids[0]
+        with closing(sqlite3.connect(self.db_path)) as db:
+            item = db.execute("SELECT * FROM production_batch_items WHERE id = ?", (first_item,)).fetchone()
+            db.execute("UPDATE production_batch_items SET attempts = 2 WHERE id = ?", (first_item,))
+            db.execute(
+                """INSERT INTO production_item_attempts
+                (id, item_id, batch_id, shot_id, attempt, state, plan_hash, plan_snapshot,
+                 candidate_ids, media_evidence, created_at, updated_at)
+                VALUES ('late-safe-attempt', ?, ?, 's1', 2, 'submission_unknown', ?, ?, '[]', '[]', 'later', 'later')""",
+                (first_item, item[1], item[6], item[7]),
+            )
+            db.commit()
+        self.attach_zero_submit_job(first_item, 2, set_current=True)
+        self.attach_zero_submit_job(item_ids[1], 1, set_current=True)
+        group = list_ownership_conflicts(self.db_path)[0]
+        self.assertFalse(group["can_resolve"])
+        proof = next(item["proof"] for item in group["items"] if item["item_id"] == first_item)
+        self.assertIn("attempt", proof["reason"])
+        with self.assertRaises(Exception):
+            resolve_ownership_conflicts(
+                self.db_path, "s1", expected_revisions=group["expected_revisions"],
+                resolved_by="测试审片员", note="后来的安全 job 不能替代旧 attempt",
+            )
+
+    def test_attempt_count_gap_and_duplicate_job_mapping_remain_blocked(self) -> None:
+        _, item_ids = self.make_ownership_conflict(uncertain=True)
+        first_item = item_ids[0]
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("UPDATE production_batch_items SET attempts = 2 WHERE id = ?", (first_item,))
+            db.commit()
+        self.attach_zero_submit_job(first_item, 1, set_current=True)
+        self.attach_zero_submit_job(item_ids[1], 1, set_current=True)
+        gap_group = list_ownership_conflicts(self.db_path)[0]
+        self.assertFalse(gap_group["can_resolve"])
+        self.assertIn("不完整", next(item["proof"]["reason"] for item in gap_group["items"] if item["item_id"] == first_item))
+
+        with closing(sqlite3.connect(self.db_path)) as db:
+            same_job = db.execute(
+                "SELECT draft_job_id FROM production_batch_items WHERE id = ?", (first_item,),
+            ).fetchone()[0]
+            db.execute(
+                """INSERT INTO production_item_attempts
+                (id, item_id, batch_id, shot_id, attempt, state, plan_hash, plan_snapshot,
+                 candidate_ids, media_evidence, draft_job_id, draft_job_revision, created_at, updated_at)
+                SELECT 'duplicate-job-attempt', id, batch_id, shot_id, 2, 'submission_unknown',
+                plan_hash, plan_snapshot, '[]', '[]', ?, 1, 'later', 'later'
+                FROM production_batch_items WHERE id = ?""",
+                (same_job, first_item),
+            )
+            db.commit()
+        duplicate_group = list_ownership_conflicts(self.db_path)[0]
+        self.assertFalse(duplicate_group["can_resolve"])
+        self.assertIn("复用", next(item["proof"]["reason"] for item in duplicate_group["items"] if item["item_id"] == first_item))
+
+    def test_mixed_manual_and_pre_spawn_proofs_resolve_only_when_every_attempt_is_covered(self) -> None:
+        _, item_ids = self.make_ownership_conflict(uncertain=True)
+        first_item = item_ids[0]
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            item = db.execute("SELECT * FROM production_batch_items WHERE id = ?", (first_item,)).fetchone()
+            db.execute("UPDATE production_batch_items SET attempts = 2 WHERE id = ?", (first_item,))
+            db.execute(
+                """INSERT INTO production_item_attempts
+                (id, item_id, batch_id, shot_id, attempt, state, plan_hash, plan_snapshot,
+                 candidate_ids, media_evidence, created_at, updated_at)
+                VALUES ('mixed-attempt-2', ?, ?, 's1', 2, 'submission_unknown', ?, ?, '[]', '[]', 'later', 'later')""",
+                (first_item, item["batch_id"], item["plan_hash"], item["plan_snapshot"]),
+            )
+            db.commit()
+        self.attach_zero_submit_job(first_item, 1, manual=True, set_current=False)
+        self.attach_zero_submit_job(first_item, 2, manual=False, set_current=True)
+        self.attach_zero_submit_job(item_ids[1], 1, manual=True, set_current=True)
+        group = list_ownership_conflicts(self.db_path)[0]
+        self.assertTrue(group["can_resolve"])
+        first_proof = next(item["proof"] for item in group["items"] if item["item_id"] == first_item)
+        self.assertEqual([proof["attempt"] for proof in first_proof["attempts"]], [1, 2])
+        self.assertEqual(
+            {proof["basis"] for proof in first_proof["attempts"]},
+            {"manual_confirm_not_submitted", "audited_pre_spawn_failure"},
+        )
+        resolved = resolve_ownership_conflicts(
+            self.db_path, "s1", expected_revisions=group["expected_revisions"],
+            resolved_by="测试审片员", note="所有实际 attempt 已逐条独立证明零提交",
+        )
+        self.assertEqual(resolved["state"], "resolved")
+
     def test_conflict_resolution_is_concurrent_once_and_project_isolated(self) -> None:
         self.make_ownership_conflict()
         group = list_ownership_conflicts(self.db_path)[0]
@@ -708,6 +832,89 @@ class ProductionSchedulerTests(unittest.TestCase):
         self.assertEqual(failed["state"], "failed")
         self.assertEqual(failed["error"], "draft_job_reconciliation_conflict")
         self.assertEqual(failed["attempt_history"][0]["candidate_ids"], draft["candidate_ids"])
+
+    def test_attempt_cas_failure_fails_closed_instead_of_leaving_item_running(self) -> None:
+        batch = self.make_batch()
+        claimed = claim_next_item(self.db_path)
+        draft = self.create_draft_job("s1")
+        submit_claimed_item(self.db_path, claimed, self.plan, lambda _: draft)
+        running = get_batch(self.db_path, batch["id"])["items"][0]
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute(
+                "UPDATE jobs SET state = '完成', message = '完成', reconciliation_revision = 1 WHERE id = ?",
+                (draft["job_id"],),
+            )
+            db.execute(
+                """UPDATE production_item_attempts SET state = 'submission_unknown'
+                WHERE item_id = ? AND attempt = 1""",
+                (running["id"],),
+            )
+            db.commit()
+        result = {
+            "authoritative": True,
+            "job_id": draft["job_id"],
+            "base_job_revision": 0,
+            "job_revision": 1,
+            "state": "完成",
+            "message": "完成",
+            "prompt_ids": draft["prompt_ids"],
+            "candidate_ids": draft["candidate_ids"],
+        }
+        self.assertEqual(poll_running_items(self.db_path, lambda _: result), 1)
+        failed = get_batch(self.db_path, batch["id"])["items"][0]
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["error"], "draft_job_reconciliation_conflict")
+        self.assertEqual(failed["attempt_history"][0]["state"], "submission_unknown")
+        self.assertEqual(failed["attempt_history"][0]["error"], "draft_job_reconciliation_conflict")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(
+                db.execute("SELECT state FROM production_shot_leases WHERE shot_id = 's1'").fetchone()[0],
+                "unknown",
+            )
+
+    def test_concurrent_poll_consumes_one_revision_idempotently(self) -> None:
+        batch = self.make_batch()
+        claimed = claim_next_item(self.db_path)
+        draft = self.create_draft_job("s1")
+        submit_claimed_item(self.db_path, claimed, self.plan, lambda _: draft)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute(
+                "UPDATE jobs SET state = '完成', message = '完成', reconciliation_revision = 1 WHERE id = ?",
+                (draft["job_id"],),
+            )
+            db.commit()
+        barrier = threading.Barrier(3)
+        outcomes: list[int] = []
+
+        def sync_exact(_: dict) -> dict:
+            barrier.wait()
+            return {
+                "authoritative": True,
+                "job_id": draft["job_id"],
+                "base_job_revision": 0,
+                "job_revision": 1,
+                "state": "完成",
+                "message": "完成",
+                "prompt_ids": draft["prompt_ids"],
+                "candidate_ids": draft["candidate_ids"],
+            }
+
+        workers = [threading.Thread(target=lambda: outcomes.append(poll_running_items(self.db_path, sync_exact))) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=10)
+        self.assertEqual(sorted(outcomes), [0, 1])
+        completed = get_batch(self.db_path, batch["id"])["items"][0]
+        self.assertEqual(completed["state"], "completed")
+        self.assertEqual(completed["draft_job_revision"], 1)
+        self.assertEqual(completed["attempt_history"][0]["draft_job_revision"], 1)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM production_batch_events WHERE item_id = ? AND event = 'completed'",
+                (completed["id"],),
+            ).fetchone()[0], 1)
 
 
 if __name__ == "__main__":
