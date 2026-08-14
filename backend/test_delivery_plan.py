@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -24,6 +26,10 @@ class DeliveryPlanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "studio.db"
+        self.video1 = Path(self.temp_dir.name) / "c1.mp4"
+        self.video2 = Path(self.temp_dir.name) / "c2.mp4"
+        self.video1.write_bytes(b"candidate-one")
+        self.video2.write_bytes(b"candidate-two")
         with closing(sqlite3.connect(self.db_path)) as db:
             db.executescript(
                 """
@@ -40,7 +46,8 @@ class DeliveryPlanTests(unittest.TestCase):
                 );
                 CREATE TABLE candidates (
                   id TEXT PRIMARY KEY, shot_id TEXT NOT NULL, selected INTEGER NOT NULL DEFAULT 0,
-                  archived INTEGER NOT NULL DEFAULT 0, external_id TEXT, prompt_id TEXT
+                  archived INTEGER NOT NULL DEFAULT 0, external_id TEXT, prompt_id TEXT,
+                  status TEXT NOT NULL DEFAULT 'completed', output_file TEXT
                 );
                 CREATE TABLE candidate_master_versions (
                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, shot_id TEXT NOT NULL,
@@ -56,10 +63,12 @@ class DeliveryPlanTests(unittest.TestCase):
             db.execute("INSERT INTO workspace_settings VALUES ('active_project_id', 'p1', 'now')")
             db.execute("INSERT INTO shots VALUES ('s1', 'p1', 1, 'S01', '开场', '', 5.0, '草稿已选', 0, NULL)")
             db.execute("INSERT INTO shots VALUES ('s2', 'p1', 2, 'S02', '反转', '别出来', 6.0, '草稿已选', 1, 2.0)")
-            db.execute("INSERT INTO candidates VALUES ('c1', 's1', 1, 0, 'draft-1', 'prompt-1')")
-            db.execute("INSERT INTO candidates VALUES ('c2', 's2', 1, 0, 'draft-2', 'prompt-2')")
-            db.execute("INSERT INTO candidate_master_versions VALUES ('m1', 'p1', 's1', 'c1', 1, 'r1', 1, '{}', 'now')")
-            db.execute("INSERT INTO candidate_master_versions VALUES ('m2', 'p1', 's2', 'c2', 1, 'r2', 1, '{}', 'now')")
+            db.execute("INSERT INTO candidates VALUES ('c1', 's1', 1, 0, 'draft-1', 'prompt-1', 'completed', ?)", (str(self.video1),))
+            db.execute("INSERT INTO candidates VALUES ('c2', 's2', 1, 0, 'draft-2', 'prompt-2', 'completed', ?)", (str(self.video2),))
+            snapshot1 = json.dumps({"output_file": str(self.video1.resolve()), "size_bytes": self.video1.stat().st_size, "checksum_sha256": hashlib.sha256(self.video1.read_bytes()).hexdigest()})
+            snapshot2 = json.dumps({"output_file": str(self.video2.resolve()), "size_bytes": self.video2.stat().st_size, "checksum_sha256": hashlib.sha256(self.video2.read_bytes()).hexdigest()})
+            db.execute("INSERT INTO candidate_master_versions VALUES ('m1', 'p1', 's1', 'c1', 1, 'r1', 1, ?, 'now')", (snapshot1,))
+            db.execute("INSERT INTO candidate_master_versions VALUES ('m2', 'p1', 's2', 'c2', 1, 'r2', 1, ?, 'now')", (snapshot2,))
             db.execute("INSERT INTO creative_storyboard_links VALUES ('s1', 'section-1', 3)")
             db.execute("INSERT INTO creative_storyboard_links VALUES ('s2', 'section-2', 4)")
             init_delivery_schema(db)
@@ -154,7 +163,7 @@ class DeliveryPlanTests(unittest.TestCase):
         saved = save_delivery_plan(self.db_path, DeliveryPlanPatch(base_revision=0, items=self.items()))
         with closing(sqlite3.connect(self.db_path)) as db:
             db.execute("UPDATE candidates SET selected = 0 WHERE shot_id = 's2'")
-            db.execute("INSERT INTO candidates VALUES ('c2b', 's2', 1, 0, 'draft-2b', 'prompt-2b')")
+            db.execute("INSERT INTO candidates VALUES ('c2b', 's2', 1, 0, 'draft-2b', 'prompt-2b', 'completed', ?)", (str(self.video2),))
             db.execute("INSERT INTO candidate_master_versions VALUES ('m2b', 'p1', 's2', 'c2b', 2, 'r2b', 1, '{}', 'later')")
             db.commit()
         with self.assertRaises(HTTPException) as changed:
@@ -163,6 +172,18 @@ class DeliveryPlanTests(unittest.TestCase):
         current = delivery_workspace(self.db_path)
         self.assertEqual(current["plan"]["status"], "draft")
         self.assertEqual(current["plan"]["revision"], 1)
+
+    def test_media_replacement_after_save_blocks_lock_without_partial_write(self) -> None:
+        saved = save_delivery_plan(self.db_path, DeliveryPlanPatch(base_revision=0, items=self.items()))
+        self.video2.write_bytes(b"candidate-two-replaced")
+        with self.assertRaises(HTTPException) as changed:
+            lock_delivery_plan(self.db_path, saved["plan"]["revision"])
+        self.assertEqual(changed.exception.status_code, 409)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            plan = db.execute("SELECT status, revision FROM delivery_plans").fetchone()
+            versions = db.execute("SELECT COUNT(*) FROM delivery_plan_versions").fetchone()[0]
+        self.assertEqual(plan, ("draft", 1))
+        self.assertEqual(versions, 1)
 
 
 if __name__ == "__main__":

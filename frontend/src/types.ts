@@ -608,6 +608,8 @@ export type BatchGenerationResult = {
   submitted_count?: number
   failed_count: number
   gpu_submitted?: boolean
+  preflight_hash?: string
+  frozen_items?: Array<Record<string, unknown>>
   results: Array<{
     shot_id: string
     title: string
@@ -617,7 +619,11 @@ export type BatchGenerationResult = {
     resolution?: string
     candidate_count?: number
     prompt_ids?: string[]
-    message: string
+    message?: string
+    reasons?: string[]
+    plan_hash?: string
+    validation_job_id?: number
+    validation_hash?: string
   }>
 }
 
@@ -681,6 +687,7 @@ export type DeliveryPlanItem = {
   master_version_id?: string
   source_snapshot: {
     section_id?: string
+    section_revision?: number
     storyboard_revision?: number
     shot_id: string
     candidate_id?: string
@@ -690,6 +697,16 @@ export type DeliveryPlanItem = {
     master_revision?: number
     review_id?: string
     review_revision?: number
+    shot_snapshot?: Record<string, unknown>
+    master_snapshot?: Record<string, unknown>
+    media?: {
+      status: 'verified' | 'missing' | 'invalid'
+      output_file?: string
+      size_bytes?: number
+      modified_ns?: number
+      checksum_sha256?: string
+      reason?: string
+    }
     source_status: 'ready' | 'historical_debt' | 'missing' | 'unavailable'
     source_reason?: string
   }

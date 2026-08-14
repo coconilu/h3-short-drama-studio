@@ -2083,7 +2083,7 @@ class FrameExtractRequest(BaseModel):
 class ReviewRequest(BaseModel):
     candidate_id: str
     note: str = ""
-    base_revision: int | None = Field(None, ge=0)
+    base_revision: int = Field(ge=0)
 
 
 class FinalizePromotionRequest(BaseModel):
@@ -2133,8 +2133,15 @@ async def lifespan(_: FastAPI):
     configure_production_scheduler(
         DB_PATH,
         lambda shot_id: compile_prompt_plan(DB_PATH, shot_id),
-        lambda shot_id: generate(shot_id, GenerateRequest(confirm=True, dry_run=False)),
-        lambda shot_id: refresh_h3_project(shot_id, h3_project_for_shot(shot_id)),
+        lambda item: generate(
+            item["shot_id"],
+            GenerateRequest(confirm=True, dry_run=False, expected_validation_hash=item["validation_hash"]),
+        ),
+        lambda item: {
+            **refresh_h3_project(item["shot_id"], item.get("h3_project") or h3_project_for_shot(item["shot_id"])),
+            "job_id": item.get("draft_job_id"),
+        },
+        output_root=COMFY_OUTPUT_ROOT,
     )
     start_production_worker()
     try:
@@ -2159,7 +2166,7 @@ app.include_router(create_script_router(DB_PATH, ROOT))
 app.include_router(create_bible_router(DB_PATH))
 app.include_router(create_production_router(DB_PATH, lambda shot_id: compile_prompt_plan(DB_PATH, shot_id)))
 app.include_router(create_review_router(DB_PATH, COMFY_OUTPUT_ROOT))
-app.include_router(create_delivery_router(DB_PATH))
+app.include_router(create_delivery_router(DB_PATH, COMFY_OUTPUT_ROOT))
 app.include_router(create_archive_router(DB_PATH, BACKUP_ROOT, EXPORT_ROOT))
 
 
@@ -2796,26 +2803,28 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
                 "ordinal": item["ordinal"],
                 "subtitle_enabled": item["subtitle_enabled"],
                 "subtitle_start_seconds": item["subtitle_start_seconds"],
+                "_assembly_item": item,
             })
     sources: list[dict[str, Any]] = []
     total_seconds = 0.0
     for shot in shots:
-        selected = row(
-            """SELECT id, 'promotion' AS source_type, status, output_file, strategy AS source_detail
-            FROM promotions WHERE shot_id = ? AND selected = 1
-            ORDER BY selected_at DESC LIMIT 1""",
-            (shot["id"],),
-        )
-        if not selected:
+        assembly_item = shot.get("_assembly_item")
+        frozen_source = (assembly_item or {}).get("source_snapshot") or {}
+        selected = None
+        if assembly_item:
+            frozen_candidate_id = frozen_source.get("candidate_id")
             selected = row(
                 """SELECT id, 'candidate' AS source_type, status, output_file, source AS source_detail
-                FROM candidates WHERE shot_id = ? AND selected = 1 AND archived = 0
-                ORDER BY created_at DESC LIMIT 1""",
-                (shot["id"],),
-            )
+                FROM candidates WHERE id = ? AND shot_id = ? AND archived = 0""",
+                (frozen_candidate_id, shot["id"]),
+            ) if frozen_candidate_id else None
         issue = None
-        if not selected:
-            issue = "尚未选择草稿母版或最终成片"
+        if not assembly_item:
+            issue = "缺少锁定装配的冻结来源凭证"
+        elif frozen_source.get("source_status") != "ready" or not frozen_source.get("media", {}).get("checksum_sha256"):
+            issue = "锁定装配是旧版或缺少候选、审片、母版与媒体校验和凭证"
+        elif not selected:
+            issue = "锁定装配中的候选已删除"
         elif selected.get("status") != "completed":
             issue = f"所选版本状态为 {selected.get('status')}"
         elif selected.get("source_type") == "candidate" and selected.get("source_detail") != "h3":
@@ -2823,11 +2832,19 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
         else:
             try:
                 source_path = allowed_output_file(selected.get("output_file"))
+                frozen_media = frozen_source["media"]
+                if str(source_path) != frozen_media.get("output_file") or file_sha256(source_path) != frozen_media.get("checksum_sha256"):
+                    raise HTTPException(409, "冻结候选的路径或 SHA256 已变化")
                 probe = probe_media(source_path)
                 if not probe.get("has_audio"):
                     issue = "所选视频没有音轨"
                 else:
-                    duration = float(probe.get("duration_seconds") or 0)
+                    media_duration = float(probe.get("duration_seconds") or 0)
+                    in_point = float(assembly_item.get("in_point_seconds") or 0)
+                    out_point = float(assembly_item.get("out_point_seconds") or media_duration)
+                    if in_point >= out_point or out_point > media_duration + 0.001:
+                        raise HTTPException(409, "冻结入出点已超出当前媒体时长")
+                    duration = out_point - in_point
                     total_seconds += duration
                     source = {
                         "shot_id": shot["id"],
@@ -2840,14 +2857,23 @@ def export_preflight_payload(include_private: bool = False) -> dict[str, Any]:
                         "width": probe.get("width"),
                         "height": probe.get("height"),
                         "has_audio": bool(probe.get("has_audio")),
+                        "checksum_sha256": frozen_media["checksum_sha256"],
+                        "master_version_id": frozen_source.get("master_version_id"),
+                        "review_id": frozen_source.get("review_id"),
+                        "review_revision": frozen_source.get("review_revision"),
+                        "section_id": frozen_source.get("section_id"),
+                        "section_revision": frozen_source.get("section_revision"),
+                        "in_point_seconds": in_point,
+                        "out_point_seconds": out_point,
+                        "dialogue_mode": assembly_item.get("dialogue_mode") or "original",
                     }
                     if include_private:
                         source.update(
                             {
                                 "path": str(source_path),
-                                "dialogue": shot.get("dialogue") or "",
-                                "subtitle_enabled": bool(shot.get("subtitle_enabled", 1)),
-                                "subtitle_start_seconds": shot.get("subtitle_start_seconds"),
+                                "dialogue": frozen_source.get("shot_snapshot", {}).get("dialogue") or "",
+                                "subtitle_enabled": bool(assembly_item.get("subtitle_enabled")),
+                                "subtitle_start_seconds": assembly_item.get("subtitle_start_seconds"),
                             }
                         )
                     sources.append(source)
@@ -4343,6 +4369,9 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
         "message": reconciled["message"],
         "h3_project": project,
         "prompt_ids": prompt_ids,
+        "candidate_ids": string_list(reconciled.get("candidate_ids")),
+        "job_id": int(reconciled["id"]),
+        "job_revision": int(reconciled.get("reconciliation_revision") or 0),
         "mode": plan["mode"],
         "references": plan["references"],
     }
@@ -4563,9 +4592,6 @@ def select_candidate(shot_id: str, request: ReviewRequest) -> dict[str, Any]:
         raise HTTPException(404, "候选版本不存在")
     if candidate.get("status") != "completed":
         raise HTTPException(409, "候选尚未生成完成")
-    if candidate.get("selected"):
-        return {"ok": True, "selected": request.candidate_id, "unchanged": True}
-    require_passed_review(DB_PATH, request.candidate_id, COMFY_OUTPUT_ROOT)
     master_version = record_master_selection(
         DB_PATH,
         COMFY_OUTPUT_ROOT,

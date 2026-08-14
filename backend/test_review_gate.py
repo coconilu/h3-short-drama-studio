@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
@@ -48,7 +51,17 @@ class ReviewGateTests(unittest.TestCase):
                   status TEXT NOT NULL, output_file TEXT, external_id TEXT, prompt_id TEXT,
                   scores TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '', archived INTEGER NOT NULL DEFAULT 0,
                   label TEXT NOT NULL DEFAULT 'A', created_at TEXT NOT NULL DEFAULT 'now',
-                  selected INTEGER NOT NULL DEFAULT 0
+                  selected INTEGER NOT NULL DEFAULT 0, seed INTEGER, metadata TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE jobs (
+                  id INTEGER PRIMARY KEY, shot_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+                  h3_project TEXT, prompt_ids TEXT NOT NULL, candidate_ids TEXT NOT NULL,
+                  source_snapshot TEXT NOT NULL, plan_hash TEXT
+                );
+                CREATE TABLE production_item_attempts (
+                  id TEXT PRIMARY KEY, shot_id TEXT NOT NULL, state TEXT NOT NULL, draft_job_id INTEGER,
+                  candidate_ids TEXT NOT NULL, prompt_ids TEXT NOT NULL, media_evidence TEXT NOT NULL,
+                  plan_hash TEXT, validation_hash TEXT
                 );
                 """
             )
@@ -58,8 +71,20 @@ class ReviewGateTests(unittest.TestCase):
                 "INSERT INTO shots (id, project_id, ordinal, title, status, dialogue) VALUES ('s1', 'p1', 1, '镜头一', '待审片', '')"
             )
             db.execute(
-                "INSERT INTO candidates VALUES ('c1', 's1', 'h3', 'completed', ?, 'draft-1', 'prompt-1', '{}', '', 0, 'A', 'now', 0)",
-                (str(self.video_path),),
+                "INSERT INTO candidates VALUES ('c1', 's1', 'h3', 'completed', ?, 'draft-1', 'prompt-1', '{}', '', 0, 'A', 'now', 0, 42, ?)",
+                (str(self.video_path), '{"width":608,"height":352,"actual_seconds":5.0,"prompt":"scene one"}'),
+            )
+            db.execute(
+                "INSERT INTO jobs VALUES (1, 's1', 'draft', '完成', 'h3-s1', '[\"prompt-1\"]', '[\"draft-1\"]', ?, ?)",
+                ('{"arguments":["generate","--prompt","scene one","--width","608","--height","352","--seconds","5"]}', "v" * 64),
+            )
+            evidence1 = json.dumps([{
+                "candidate_id": "draft-1", "output_file": str(self.video_path.resolve()), "seed": 42,
+                "checksum_sha256": hashlib.sha256(self.video_path.read_bytes()).hexdigest(),
+            }])
+            db.execute(
+                "INSERT INTO production_item_attempts VALUES ('attempt-1', 's1', 'completed', 1, '[\"draft-1\"]', '[\"prompt-1\"]', ?, ?, ?)",
+                (evidence1, "p" * 64, "v" * 64),
             )
             init_review_schema(db)
             db.commit()
@@ -167,8 +192,20 @@ class ReviewGateTests(unittest.TestCase):
         path.write_bytes(b"test-video-v2")
         with closing(sqlite3.connect(self.db_path)) as db:
             db.execute(
-                "INSERT INTO candidates VALUES ('c2', 's1', 'h3', 'completed', ?, 'draft-2', 'prompt-2', '{}', '', 0, 'B', 'now', 0)",
-                (str(path),),
+                "INSERT INTO candidates VALUES ('c2', 's1', 'h3', 'completed', ?, 'draft-2', 'prompt-2', '{}', '', 0, 'B', 'now', 0, 43, ?)",
+                (str(path), '{"width":608,"height":352,"actual_seconds":5.0,"prompt":"scene two"}'),
+            )
+            db.execute(
+                "INSERT INTO jobs VALUES (2, 's1', 'draft', '完成', 'h3-s1', '[\"prompt-2\"]', '[\"draft-2\"]', ?, ?)",
+                ('{"arguments":["generate","--prompt","scene two","--width","608","--height","352","--seconds","5"]}', "w" * 64),
+            )
+            evidence2 = json.dumps([{
+                "candidate_id": "draft-2", "output_file": str(path.resolve()), "seed": 43,
+                "checksum_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }])
+            db.execute(
+                "INSERT INTO production_item_attempts VALUES ('attempt-2', 's1', 'completed', 2, '[\"draft-2\"]', '[\"prompt-2\"]', ?, ?, ?)",
+                (evidence2, "q" * 64, "w" * 64),
             )
             db.commit()
         return path
@@ -201,18 +238,44 @@ class ReviewGateTests(unittest.TestCase):
 
     def test_selection_requires_two_real_candidates_and_debt_remains_visible(self) -> None:
         save_candidate_review(self.db_path, self.root, "s1", self.request(), self.probe)
+        self.add_second_candidate()
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("DELETE FROM production_item_attempts WHERE id = 'attempt-2'")
+            db.commit()
         with self.assertRaises(HTTPException) as insufficient:
             record_master_selection(self.db_path, self.root, "s1", "c1", note="不能只有一个", base_revision=0)
         self.assertEqual(insufficient.exception.status_code, 409)
         with closing(sqlite3.connect(self.db_path)) as db:
             db.execute(
-                "INSERT INTO candidates VALUES ('legacy', 's1', 'mock', 'completed', NULL, NULL, NULL, '{}', '', 0, '旧', 'now', 0)"
+                "INSERT INTO candidates VALUES ('legacy', 's1', 'mock', 'completed', NULL, NULL, NULL, '{}', '', 0, '旧', 'now', 0, NULL, '{}')"
             )
             db.commit()
         workspace = review_workspace(self.db_path, "s1", self.root)
         debt = next(item for item in workspace["comparison"] if item["candidate_id"] == "legacy")
         self.assertEqual(debt["trace"]["evidence_status"], "historical_debt")
-        self.assertEqual(workspace["summary"]["evidence_debt_count"], 1)
+        self.assertEqual(workspace["summary"]["evidence_debt_count"], 2)
+
+    def test_media_replacement_during_master_selection_is_atomic(self) -> None:
+        self.add_second_candidate()
+        save_candidate_review(self.db_path, self.root, "s1", self.request(), self.probe)
+        original = __import__("backend.review_gate", fromlist=["_candidate_snapshot"])._candidate_snapshot
+        selected_calls = 0
+
+        def replacing(candidate: dict, path: Path) -> dict:
+            nonlocal selected_calls
+            if candidate["id"] == "c1":
+                selected_calls += 1
+                if selected_calls == 4:
+                    path.write_bytes(b"replaced-between-validation-and-write")
+            return original(candidate, path)
+
+        with patch("backend.review_gate._candidate_snapshot", side_effect=replacing):
+            with self.assertRaises(HTTPException) as changed:
+                record_master_selection(self.db_path, self.root, "s1", "c1", note="race", base_revision=0)
+        self.assertEqual(changed.exception.status_code, 409)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM candidate_master_versions").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM candidates WHERE selected = 1").fetchone()[0], 0)
 
     def test_review_history_and_media_checksum_are_persisted(self) -> None:
         first = save_candidate_review(self.db_path, self.root, "s1", self.request(), self.probe)

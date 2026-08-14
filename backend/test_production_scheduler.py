@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from contextlib import closing
 from pathlib import Path
 
 from backend.production_scheduler import (
+    batch_preflight,
     claim_next_item,
     create_batch,
     get_batch,
@@ -43,7 +45,9 @@ class ProductionSchedulerTests(unittest.TestCase):
                 CREATE TABLE jobs (
                   id INTEGER PRIMARY KEY AUTOINCREMENT, shot_id TEXT NOT NULL, kind TEXT NOT NULL,
                   state TEXT NOT NULL, h3_project TEXT, prompt_ids TEXT NOT NULL DEFAULT '[]',
-                  candidate_ids TEXT NOT NULL DEFAULT '[]', source_snapshot TEXT NOT NULL DEFAULT '{}'
+                  candidate_ids TEXT NOT NULL DEFAULT '[]', source_snapshot TEXT NOT NULL DEFAULT '{}',
+                  plan_hash TEXT, retry_safe INTEGER NOT NULL DEFAULT 0,
+                  reconciliation_revision INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE candidates (
                   id TEXT PRIMARY KEY, shot_id TEXT NOT NULL, external_id TEXT, prompt_id TEXT, seed INTEGER,
@@ -56,6 +60,16 @@ class ProductionSchedulerTests(unittest.TestCase):
             db.execute("INSERT INTO workspace_settings VALUES ('active_project_id', 'p1', 'now')")
             db.execute("INSERT INTO shots VALUES ('s1', 'p1', 1, '开场', '可生成')")
             db.execute("INSERT INTO shots VALUES ('s2', 'p1', 2, '反转', '可生成')")
+            db.execute("INSERT INTO h3_prompt_plans VALUES ('plan-s1', 's1', 'p1', ?, 'approved')", ("a" * 64,))
+            db.execute("INSERT INTO h3_prompt_plans VALUES ('plan-s2', 's2', 'p1', ?, 'approved')", ("b" * 64,))
+            db.execute(
+                "INSERT INTO jobs (shot_id, kind, state, source_snapshot, plan_hash) VALUES ('s1', 'validation', '校验通过', ?, ?)",
+                (json.dumps({"arguments": ["draft", "--prompt", "prompt s1", "--count", "2", "--width", "608", "--height", "352", "--seconds", "5.0", "--steps", "20", "--mode", "fl2va"]}), "v" * 64),
+            )
+            db.execute(
+                "INSERT INTO jobs (shot_id, kind, state, source_snapshot, plan_hash) VALUES ('s2', 'validation', '校验通过', ?, ?)",
+                (json.dumps({"arguments": ["draft", "--prompt", "prompt s2", "--count", "2", "--width", "608", "--height", "352", "--seconds", "5.0", "--steps", "20", "--mode", "fl2va"]}), "w" * 64),
+            )
             init_production_schema(db)
             db.commit()
         self.hashes = {"s1": "a" * 64, "s2": "b" * 64}
@@ -72,15 +86,20 @@ class ProductionSchedulerTests(unittest.TestCase):
             "status": "approved",
             "ready": True,
             "mode": "FL2VA",
+            "compiled_prompt": f"prompt {shot_id}",
             "spec": {
                 "candidate_count": self.candidate_counts[shot_id],
                 "resolution": self.resolutions[shot_id],
+                "adapter_seconds": 5.0,
+                "steps": 20,
             },
         }
 
     def make_batch(self) -> dict:
+        preflight = batch_preflight(self.db_path, self.plan, ["s2", "s1"])
         return create_batch(
             self.db_path, self.plan, ["s2", "s1"], name="EP01 夜间生产", max_attempts=3,
+            preflight_hash=preflight["preflight_hash"], idempotency_key="test-batch-0001",
         )
 
     def test_items_run_in_shot_order_and_only_one_is_active(self) -> None:
@@ -93,16 +112,16 @@ class ProductionSchedulerTests(unittest.TestCase):
             self.db_path,
             first,
             self.plan,
-            lambda shot_id: {
-                "state": "排队中", "message": "等待 ComfyUI", "h3_project": f"h3-{shot_id}",
-                "prompt_ids": [f"prompt-{shot_id}"],
+            lambda item: {
+                "state": "排队中", "message": "等待 ComfyUI", "h3_project": f"h3-{item['shot_id']}",
+                "prompt_ids": [f"prompt-{item['shot_id']}"],
             },
         )
         self.assertIsNone(claim_next_item(self.db_path), "前一镜头未完成时不得提交下一镜头")
 
         poll_running_items(
             self.db_path,
-            lambda shot_id: {"state": "完成", "message": "2/2 条候选已完成", "prompt_ids": [f"prompt-{shot_id}"]},
+            lambda item: {"state": "完成", "message": "2/2 条候选已完成", "prompt_ids": [f"prompt-{item['shot_id']}"]},
         )
         second = claim_next_item(self.db_path)
         self.assertEqual(second["shot_id"], "s2")
@@ -111,9 +130,9 @@ class ProductionSchedulerTests(unittest.TestCase):
             self.db_path,
             second,
             self.plan,
-            lambda shot_id: {
-                "state": "完成", "message": "已有候选已完成", "h3_project": f"h3-{shot_id}",
-                "prompt_ids": [f"prompt-{shot_id}"],
+            lambda item: {
+                "state": "完成", "message": "已有候选已完成", "h3_project": f"h3-{item['shot_id']}",
+                "prompt_ids": [f"prompt-{item['shot_id']}"],
             },
         )
         finished = get_batch(self.db_path, batch["id"])
@@ -175,6 +194,56 @@ class ProductionSchedulerTests(unittest.TestCase):
         self.candidate_counts["s1"] = 1
         with self.assertRaises(Exception):
             self.make_batch()
+
+    def test_preflight_is_side_effect_free_and_create_is_idempotent(self) -> None:
+        with closing(sqlite3.connect(self.db_path)) as db:
+            before = (
+                db.execute("SELECT COUNT(*) FROM production_batches").fetchone()[0],
+                db.execute("SELECT COUNT(*) FROM production_shot_leases").fetchone()[0],
+                db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            )
+        preflight = batch_preflight(self.db_path, self.plan, ["s1"])
+        self.assertTrue(preflight["ok"])
+        self.assertFalse(preflight["gpu_submitted"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            after = (
+                db.execute("SELECT COUNT(*) FROM production_batches").fetchone()[0],
+                db.execute("SELECT COUNT(*) FROM production_shot_leases").fetchone()[0],
+                db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            )
+        self.assertEqual(before, after)
+        first = create_batch(
+            self.db_path, self.plan, ["s1"], name="idem", max_attempts=3,
+            preflight_hash=preflight["preflight_hash"], idempotency_key="idem-request-001",
+        )
+        replay = create_batch(
+            self.db_path, self.plan, ["s1"], name="idem", max_attempts=3,
+            preflight_hash=preflight["preflight_hash"], idempotency_key="idem-request-001",
+        )
+        self.assertEqual(first["id"], replay["id"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM production_batches").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM production_shot_leases").fetchone()[0], 1)
+
+    def test_same_shot_cannot_be_active_in_two_batches(self) -> None:
+        self.make_batch()
+        blocked = batch_preflight(self.db_path, self.plan, ["s1"])
+        self.assertFalse(blocked["ok"])
+        self.assertIn("另一个活动生产批次", " ".join(blocked["results"][0]["reasons"]))
+
+    def test_unknown_submission_cannot_retry_or_submit_again(self) -> None:
+        batch = self.make_batch()
+        item = claim_next_item(self.db_path)
+        self.assertEqual(recover_batches(self.db_path), 1)
+        failed = get_batch(self.db_path, batch["id"])["items"][0]
+        with self.assertRaises(Exception):
+            retry_item(self.db_path, failed["id"], self.plan)
+        submitted: list[str] = []
+        self.assertIsNone(claim_next_item(self.db_path))
+        self.assertEqual(submitted, [])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            lease = db.execute("SELECT state FROM production_shot_leases WHERE item_id = ?", (item["id"],)).fetchone()
+            self.assertEqual(lease[0], "unknown")
         self.candidate_counts["s1"] = 2
         self.resolutions["s1"] = "1344×768"
         with self.assertRaises(Exception):
@@ -186,10 +255,13 @@ class ProductionSchedulerTests(unittest.TestCase):
         batch = self.make_batch()
         item = claim_next_item(self.db_path)
         with closing(sqlite3.connect(self.db_path)) as db:
-            db.execute(
-                "INSERT INTO jobs (shot_id, kind, state, h3_project, prompt_ids, candidate_ids, source_snapshot) VALUES (?, 'draft', '完成', ?, ?, ?, ?)",
-                ("s1", "h3-s1", '["prompt-s1"]', '["draft-1"]', '{"prompt":"frozen prompt","seed":42}'),
+            cursor = db.execute(
+                """INSERT INTO jobs
+                (shot_id, kind, state, h3_project, prompt_ids, candidate_ids, source_snapshot, plan_hash)
+                VALUES (?, 'draft', '完成', ?, ?, ?, ?, ?)""",
+                ("s1", "h3-s1", '["prompt-s1"]', '["draft-1"]', '{"prompt":"frozen prompt","seed":42}', "v" * 64),
             )
+            draft_job_id = int(cursor.lastrowid)
             db.execute(
                 "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, 'completed', ?, 12.5, ?, 0, 'now')",
                 ("s1-draft-1", "s1", "draft-1", "prompt-s1", 42, str(video), '{"width":608,"height":352}'),
@@ -199,7 +271,10 @@ class ProductionSchedulerTests(unittest.TestCase):
             self.db_path,
             item,
             self.plan,
-            lambda _: {"state": "完成", "message": "完成", "h3_project": "h3-s1", "prompt_ids": ["prompt-s1"]},
+            lambda _: {
+                "state": "完成", "message": "完成", "h3_project": "h3-s1",
+                "prompt_ids": ["prompt-s1"], "candidate_ids": ["draft-1"], "job_id": draft_job_id,
+            },
         )
         attempt = get_batch(self.db_path, batch["id"])["items"][0]["attempt_history"][0]
         self.assertEqual(attempt["prompt_ids"], ["prompt-s1"])

@@ -589,12 +589,13 @@ append-only 草稿母版版本（可回滚，不覆盖候选）
 
 | 生产环节 | 门禁与可追溯行为 |
 |---|---|
-| 批次选择 | 只接受当前 `approved` 且无阻断项的生成计划；每镜至少 2 条候选，最长边不得超过 768。批量应用规格会让旧计划过期，必须重新 dry-run 与批准 |
-| 调度恢复 | 暂停只阻止后续镜头，取消不冒充外部 GPU 已停止；每次提交尝试保存在 `production_item_attempts`，重启前未知提交结果会失败关闭 |
+| 批次选择 | 后端无副作用 preflight 逐镜冻结批准计划、H3 adapter 输入哈希和对应 validation job；每镜至少 2 条候选，最长边不得超过 768。创建请求必须携带 preflight hash 与幂等键，事务内复核后才排队 |
+| 调度恢复 | `production_shot_leases` 保证同一镜头不能跨批次并行提交；attempt 绑定精确 draft job/revision/candidate set。提交结果未知只能人工对账，只有经审计确认进程未启动的零提交结果才允许安全重试 |
 | 候选证据 | 保存 H3 项目、prompt/candidate ID、实际 prompt、seed、规格、plan hash、输出路径、文件大小和媒体状态；旧候选缺失真实文件或任务证据会显示为“历史证据债务” |
-| 结构化审片 | 每个候选保留全部评分/决定/备注修订；新母版至少需要 2 条可比较真实候选，且目标候选的最新结论为通过、媒体 SHA-256 未变化 |
-| 草稿母版 | `candidate_master_versions` 只追加选择/回滚修订；回滚会新增版本，不删除、不覆盖任何候选 |
-| 装配草案 | 每项冻结 `section → shot → candidate → master revision`，以及顺序、入点、出点、字幕和对白策略；锁定前再次核对当前母版和小节映射 |
+| 结构化审片 | `verified` 必须同时匹配唯一 production attempt、精确 draft job、plan/input hash、prompt、candidate ID、seed、规格和受管媒体 SHA-256；缺任一项都显示为历史债务且不计入“至少 2 条” |
+| 草稿母版 | `base_revision` 必填；同一写事务复核最新审片原始快照及媒体 path/size/mtime/SHA 后只追加选择/回滚修订，回滚不会删除或覆盖候选 |
+| 装配草案 | 每项规范化冻结 section revision、镜头正文/对白/字幕、candidate、master/review revision 和媒体路径/SHA，以及顺序、入点、出点和原声/静音策略；锁定事务逐项复核，旧计划缺凭证时失败关闭 |
+| 可复现导出 | 导出只使用锁定装配里的候选与校验和，不跟随后来变化的“当前选择”；FFmpeg 真正应用 `trim/atrim`、静音和冻结字幕，执行前再次校验 SHA-256 |
 | 项目归档 | 归档包包含生产批次、逐次 attempt、审片修订、母版历史和全部装配版本，原始候选媒体继续按既有受管媒体规则校验 |
 
 本阶段不执行高分辨率精修，也不会把普通放大称为高清重生成。自动化测试通过受控 fake 适配器验证提交、恢复和证据合同，不调用真实 GPU 或本地 Agent 额度。

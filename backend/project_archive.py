@@ -136,6 +136,7 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
         "production_batches": batches,
         "production_batch_items": batch_items,
         "production_item_attempts": _by_ids(db, "production_item_attempts", "item_id", batch_item_ids),
+        "production_shot_leases": _by_ids(db, "production_shot_leases", "batch_id", batch_ids),
         "production_batch_events": _by_ids(db, "production_batch_events", "batch_id", batch_ids),
         "script_documents": documents,
         "script_sections": _by_ids(db, "script_sections", "document_id", document_ids),
