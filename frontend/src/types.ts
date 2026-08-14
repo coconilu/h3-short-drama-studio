@@ -376,7 +376,7 @@ export type WorkbenchProject = ProjectSummary & {
 
 export type WorkbenchActivity = {
   id: string
-  item_type: 'generation' | 'export'
+  item_type: 'generation' | 'export' | 'archive'
   kind: string
   state: string
   message: string

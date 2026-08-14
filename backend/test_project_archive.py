@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -27,7 +29,14 @@ from backend.hd_delivery import (
     submit_hd_job,
     validate_hd_plan,
 )
-from backend.project_archive import create_archive_router, create_project_archive, verify_project_archive
+from backend.project_archive import (
+    _acquire_archive_task,
+    _fail_archive_task,
+    create_archive_router,
+    create_project_archive,
+    recover_archive_tasks,
+    verify_project_archive,
+)
 
 
 class ProjectArchiveTests(unittest.TestCase):
@@ -177,6 +186,118 @@ class ProjectArchiveTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archives").fetchone()[0], 0)
         self.assertEqual(list(self.backup_root.rglob("*.jingchang.zip")), [])
         self.assertFalse((self.backup_root / ".staging").exists() and any((self.backup_root / ".staging").iterdir()))
+
+    def test_hard_crash_recovery_cleans_private_files_and_releases_freeze_idempotently(self) -> None:
+        task_id = "archive-task-hard-crash"
+        lease_id = "archive-lease-hard-crash"
+        archive_id = "project-archive-hard-crash"
+        child_code = "\n".join(
+            (
+                "import os, sys",
+                "from pathlib import Path",
+                "from backend.project_archive import _acquire_archive_task, utc_now",
+                "result = _acquire_archive_task(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], "
+                "mark_archived=False, task_id=sys.argv[4], lease_id=sys.argv[5], archive_id=sys.argv[6], created_at=utc_now())",
+                "staging = Path(result['staging_path'])",
+                "staging.mkdir(parents=True, exist_ok=False)",
+                "(staging / 'orphan.media').write_bytes(b'orphan-staging')",
+                "partial = Path(result['partial_path'])",
+                "partial.parent.mkdir(parents=True, exist_ok=True)",
+                "partial.write_bytes(b'partial-archive')",
+                "Path(result['final_path']).write_bytes(b'unregistered-final')",
+                "os._exit(23)",
+            )
+        )
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                str(studio.DB_PATH),
+                str(self.backup_root),
+                self.project["id"],
+                task_id,
+                lease_id,
+                archive_id,
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            check=False,
+        )
+        self.assertEqual(process.returncode, 23)
+        with closing(studio.connect()) as db:
+            crashed = dict(db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (task_id,)).fetchone())
+            self.assertEqual(crashed["state"], "running")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archive_leases").fetchone()[0], 1)
+        crash_paths = [Path(crashed[key]) for key in ("staging_path", "partial_path", "final_path")]
+        self.assertTrue(all(path.exists() for path in crash_paths))
+
+        # This is the same ordering used by app.lifespan: idempotent schema
+        # initialization first, then archive recovery before any worker starts.
+        studio.init_db()
+        self.assertEqual(recover_archive_tasks(studio.DB_PATH, self.backup_root), 1)
+        with closing(studio.connect()) as db:
+            recovered = dict(db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (task_id,)).fetchone())
+            project = dict(db.execute("SELECT * FROM projects WHERE id = ?", (self.project["id"],)).fetchone())
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archive_leases").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archives").fetchone()[0], 0)
+        self.assertEqual(recovered["state"], "failed")
+        self.assertEqual(recovered["stage"], "recovered_failed")
+        self.assertIn("owner_process_dead", recovered["audit"])
+        self.assertFalse(project["archived"])
+        self.assertTrue(all(not path.exists() for path in crash_paths))
+        self.assertEqual(recover_archive_tasks(studio.DB_PATH, self.backup_root), 0)
+        tasks = self.endpoint("/api/projects/{project_id}/archive-tasks", "GET")(self.project["id"])
+        self.assertEqual(tasks[0]["id"], task_id)
+        self.assertEqual(tasks[0]["state"], "failed")
+        self.assertIn("recovery", tasks[0]["audit"])
+        self.assertNotIn("staging_path", tasks[0])
+        activity = next(item for item in studio.get_workbench()["activities"] if item["id"] == f"archive-{task_id}")
+        self.assertEqual(activity["state"], "failed")
+        self.assertIn("异常退出", activity["message"])
+
+        # Releasing only the dead owner restores every downstream archive-lease
+        # gate; a fresh snapshot can complete normally without deleting history.
+        archive = create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
+        self.assertEqual(archive["revision"], 1)
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archive_leases").fetchone()[0], 0)
+            self.assertEqual(
+                db.execute("SELECT state FROM project_archive_tasks WHERE id = ?", (task_id,)).fetchone()[0],
+                "failed",
+            )
+
+    def test_recovery_never_clears_live_owner_even_with_stale_heartbeat(self) -> None:
+        task_id = "archive-task-live-owner"
+        acquired = _acquire_archive_task(
+            studio.DB_PATH,
+            self.backup_root,
+            self.project["id"],
+            mark_archived=False,
+            task_id=task_id,
+            lease_id="archive-lease-live-owner",
+            archive_id="project-archive-live-owner",
+            created_at=studio.utc_now(),
+        )
+        with closing(studio.connect()) as db:
+            db.execute(
+                "UPDATE project_archive_tasks SET heartbeat_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                (task_id,),
+            )
+            db.execute(
+                "UPDATE project_archive_leases SET heartbeat_at = '2000-01-01T00:00:00+00:00' WHERE task_id = ?",
+                (task_id,),
+            )
+            db.commit()
+        with patch.object(archive_module, "ARCHIVE_OWNER_INSTANCE", "another-live-server-instance"):
+            self.assertEqual(recover_archive_tasks(studio.DB_PATH, self.backup_root), 0)
+        with closing(studio.connect()) as db:
+            task = dict(db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (task_id,)).fetchone())
+            self.assertEqual(task["state"], "running")
+            self.assertEqual(task["revision"], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archive_leases").fetchone()[0], 1)
+        _fail_archive_task(studio.DB_PATH, task_id, "test cleanup")
+        for key in ("staging_path", "partial_path", "final_path"):
+            self.assertFalse(Path(acquired[key]).exists())
 
     def test_archive_contains_candidate_master_and_generation_attempt_history(self) -> None:
         shot_id = self.project["shots"][0]["id"]

@@ -39,7 +39,7 @@ try:
     )
     from .local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from .delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
-    from .project_archive import create_archive_router, init_archive_schema
+    from .project_archive import create_archive_router, init_archive_schema, recover_archive_tasks
     from .production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from .prompt_compiler import (
         approve_plan,
@@ -77,7 +77,7 @@ except ImportError:  # Support `uvicorn app:app` when backend is the working dir
     )
     from local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
-    from project_archive import create_archive_router, init_archive_schema
+    from project_archive import create_archive_router, init_archive_schema, recover_archive_tasks
     from production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from prompt_compiler import (
         approve_plan,
@@ -2475,6 +2475,7 @@ async def lifespan(_: FastAPI):
     EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
     EXPORT_JOB_ROOT.mkdir(parents=True, exist_ok=True)
     init_db()
+    recover_archive_tasks(DB_PATH, BACKUP_ROOT)
     recover_local_agent_runs(DB_PATH)
     configure_hd_delivery(DB_PATH, COMFY_OUTPUT_ROOT, run_hd_operation, probe_media)
     recover_hd_jobs(DB_PATH)
@@ -2709,12 +2710,25 @@ def get_workbench() -> dict[str, Any]:
         FROM export_runs JOIN projects ON projects.id = export_runs.project_id
         ORDER BY export_runs.updated_at DESC LIMIT 20"""
     )
+    archive_activity = rows(
+        """SELECT 'archive-' || project_archive_tasks.id AS id, 'archive' AS item_type,
+        project_archive_tasks.operation AS kind, project_archive_tasks.state,
+        COALESCE(project_archive_tasks.error, project_archive_tasks.stage) AS message,
+        project_archive_tasks.created_at, project_archive_tasks.updated_at,
+        NULL AS shot_id,
+        '项目归档 R' || project_archive_tasks.archive_revision AS title,
+        projects.id AS project_id, projects.title AS project_title
+        FROM project_archive_tasks JOIN projects ON projects.id = project_archive_tasks.project_id
+        WHERE project_archive_tasks.state IN ('running', 'failed')
+        ORDER BY project_archive_tasks.updated_at DESC LIMIT 20"""
+    )
     activities = sorted(
-        [*generation_activity, *export_activity], key=lambda item: item.get("updated_at") or item["created_at"], reverse=True
+        [*generation_activity, *export_activity, *archive_activity],
+        key=lambda item: item.get("updated_at") or item["created_at"], reverse=True,
     )[:30]
     queue_items = [
         item for item in activities
-        if item["state"] in {*ACTIVE_JOB_STATES, *EXPORT_ACTIVE_STATES}
+        if item["state"] in {*ACTIVE_JOB_STATES, *EXPORT_ACTIVE_STATES, "running"}
     ]
     pending_generation = row(
         "SELECT COUNT(*) AS count FROM shots WHERE status IN ('未生成', '可生成')"

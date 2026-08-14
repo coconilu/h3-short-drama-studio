@@ -629,6 +629,8 @@ append-only 草稿母版版本（可回滚，不覆盖候选）
 
 交付装配只引用锁定时的高清 artifact、高清母版修订和媒体 SHA。导出仍使用每次 run 私有的内容寻址 staging；单镜头和多镜头的 `.sources.json` 都固定为 JSON 数组。当前成片必须至少为 1344×768 横屏、可解码、镜头覆盖完整且包含音轨，画面连续性与声音签署必须绑定精确 `export_run_id + video SHA-256`；切换或重新导出后旧签署不会授权新成片。项目归档包含全部高清计划、验证、任务、产物、审片、定稿历史和经 SHA 校验的高清媒体；归档媒体也先进入私有 staging，并对 ZIP 目录、项目数据和每个媒体的大小/SHA 做完整复验。任何媒体缺失、被替换或复制期间变化都会让本次归档失败关闭，既不发布不完整 ZIP，也不把项目标记为已归档。
 
+归档冻结由持久 `project_archive_tasks` 与项目级 lease 共同管理：任务记录进程 owner、阶段、heartbeat、私有 staging/partial/final 路径和 CAS revision。服务启动时只接管本机且已能证明 owner 进程死亡或 PID 身份变化的任务；活进程即使 heartbeat 陈旧也不会被其他实例清理。崩溃恢复会删除私有 staging、partial 和未登记 final，把任务保留为可审计失败记录并释放 lease，但绝不创建 `ready` 归档或修改项目归档状态；失败记录会出现在“所有项目”的最近活动中，也可通过 `/api/projects/{project_id}/archive-tasks` 查看。无法确认 owner 死亡或无法安全清理文件时继续保持冻结，等待人工排查。
+
 ### 本地配置与能力边界
 
 | 依赖 | 配置/用途 | 边界 |

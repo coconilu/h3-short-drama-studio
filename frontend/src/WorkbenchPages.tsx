@@ -58,6 +58,7 @@ function ProjectArtwork({ project }: { project: WorkbenchProject }) {
 
 function ActivityIcon({ item }: { item: WorkbenchActivity }) {
   if (item.item_type === 'export') return <Film size={15} />
+  if (item.item_type === 'archive') return <Archive size={15} />
   if (item.kind === 'delivery') return <Check size={15} />
   if (item.kind === 'validation') return <CircleGauge size={15} />
   return <WandSparkles size={15} />
