@@ -10,6 +10,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from threading import Event, Lock
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -169,6 +170,40 @@ class ProjectArchiveTests(unittest.TestCase):
         self.assertEqual(claim_next_item(studio.DB_PATH)["id"], "post-reconcile-item")
         self.assertEqual(_claim_job(studio.DB_PATH)["id"], "post-reconcile-hd")
         self.assertEqual(studio.claim_next_export_run()["id"], "post-reconcile-export")
+
+    def create_same_project_owner_mismatch(self, project: dict, suffix: str) -> tuple[dict, dict]:
+        acquired = _acquire_archive_task(
+            studio.DB_PATH, self.backup_root, project["id"], mark_archived=False,
+            task_id=f"archive-task-{suffix}", lease_id=f"archive-lease-{suffix}",
+            archive_id=f"project-archive-{suffix}", created_at=studio.utc_now(),
+        )
+        staging = Path(acquired["staging_path"])
+        partial = Path(acquired["partial_path"])
+        final = Path(acquired["final_path"])
+        staging.mkdir(parents=True, exist_ok=False)
+        (staging / "owned.txt").write_bytes(b"owned-staging")
+        partial.parent.mkdir(parents=True, exist_ok=True)
+        partial.write_bytes(b"owned-partial")
+        final.parent.mkdir(parents=True, exist_ok=True)
+        final.write_bytes(b"owned-final")
+        with closing(studio.connect()) as db:
+            db.execute(
+                """UPDATE project_archive_tasks
+                SET owner_instance = ?, owner_pid = 2147483000,
+                    owner_process_identity = 'win-filetime:111'
+                WHERE id = ?""",
+                (f"foreign-owner-{suffix}", f"archive-task-{suffix}"),
+            )
+            db.execute(
+                "UPDATE project_archive_leases SET owner_instance = ? WHERE lease_id = ?",
+                (f"different-lease-owner-{suffix}", f"archive-lease-{suffix}"),
+            )
+            db.commit()
+        self.assertEqual(recover_archive_tasks(studio.DB_PATH, self.backup_root), 0)
+        reconciliation = list_archive_reconciliations(
+            studio.DB_PATH, project["id"], include_resolved=False,
+        )[0]
+        return acquired, reconciliation
 
     def test_archive_package_contains_scoped_data_and_verifies(self) -> None:
         video = studio.EXPORT_ROOT / "delivery.mp4"
@@ -506,13 +541,63 @@ class ProjectArchiveTests(unittest.TestCase):
             resolved = dict(db.execute("SELECT * FROM project_archive_reconciliations").fetchone())
             self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archive_leases").fetchone()[0], 0)
         self.assertEqual(resolved["state"], "resolved")
-        self.assertEqual(resolved["revision"], 1)
+        self.assertEqual(resolved["revision"], 2)
         self.assertTrue(resolved["confirmed_no_live_process"])
         self.assertEqual(resolved["resolved_by"], "本机操作员")
 
         archive = create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
         self.assertEqual(archive["revision"], 1)
         self.assert_downstream_claims_resume()
+
+    def test_v1_reconciliation_table_upgrades_in_place_and_keeps_audit_record(self) -> None:
+        now = studio.utc_now()
+        with closing(studio.connect()) as db:
+            db.execute("DROP TABLE project_archive_reconciliations")
+            db.execute(
+                """CREATE TABLE project_archive_reconciliations (
+                  id TEXT PRIMARY KEY,
+                  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                  lease_id TEXT NOT NULL UNIQUE,
+                  task_id TEXT,
+                  reason TEXT NOT NULL,
+                  state TEXT NOT NULL CHECK(state IN ('unresolved','resolved')) DEFAULT 'unresolved',
+                  revision INTEGER NOT NULL DEFAULT 0,
+                  evidence TEXT NOT NULL DEFAULT '{}',
+                  confirmed_no_live_process INTEGER NOT NULL DEFAULT 0,
+                  resolved_by TEXT,
+                  resolution_note TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  resolved_at TEXT
+                )"""
+            )
+            db.execute(
+                """INSERT INTO project_archive_leases
+                (project_id, lease_id, operation, created_at)
+                VALUES (?, 'v1-taskless-lease', 'snapshot', ?)""",
+                (self.project["id"], now),
+            )
+            db.execute(
+                """INSERT INTO project_archive_reconciliations
+                (id, project_id, lease_id, reason, state, evidence, created_at, updated_at)
+                VALUES ('v1-reconciliation', ?, 'v1-taskless-lease', 'taskless_lease',
+                        'unresolved', '{}', ?, ?)""",
+                (self.project["id"], now, now),
+            )
+            db.commit()
+        studio.init_db()
+        studio.init_db()
+        with closing(studio.connect()) as db:
+            table_sql = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'project_archive_reconciliations'"
+            ).fetchone()[0]
+            columns = {row[1] for row in db.execute("PRAGMA table_info(project_archive_reconciliations)")}
+            rows = [dict(row) for row in db.execute("SELECT * FROM project_archive_reconciliations")]
+        self.assertIn("'resolving'", table_sql)
+        self.assertTrue({"resolution_owner", "resolution_paths", "cleanup_error", "cleanup_attempts"} <= columns)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "v1-reconciliation")
+        self.assertEqual(rows[0]["state"], "unresolved")
 
     def test_terminal_and_owner_mismatch_leases_remain_frozen_until_exact_manual_resolution(self) -> None:
         terminal = _acquire_archive_task(
@@ -595,6 +680,194 @@ class ProjectArchiveTests(unittest.TestCase):
             self.assertEqual(task["state"], "failed")
             self.assertEqual(task["stage"], "reconciled_failed")
             self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archive_leases WHERE project_id = ?", (mismatch_project["id"],)).fetchone()[0], 0)
+
+    def test_cross_project_task_mismatch_never_touches_foreign_task_lease_or_files(self) -> None:
+        foreign_project = studio.create_project(
+            studio.ProjectCreate(
+                title="异项目归档任务", episode="EP20", logline="必须完全隔离", target_duration=5,
+                shots=[studio.ShotCreate(title="异项目镜头", description="隔离", prompt="isolated")],
+            )
+        )
+        acquired = _acquire_archive_task(
+            studio.DB_PATH, self.backup_root, foreign_project["id"], mark_archived=False,
+            task_id="archive-task-foreign", lease_id="archive-lease-foreign",
+            archive_id="project-archive-foreign", created_at=studio.utc_now(),
+        )
+        paths = [Path(acquired[key]) for key in ("staging_path", "partial_path", "final_path")]
+        paths[0].mkdir(parents=True, exist_ok=False)
+        (paths[0] / "foreign.txt").write_bytes(b"foreign-staging")
+        paths[1].parent.mkdir(parents=True, exist_ok=True)
+        paths[1].write_bytes(b"foreign-partial")
+        paths[2].parent.mkdir(parents=True, exist_ok=True)
+        paths[2].write_bytes(b"foreign-final")
+        with closing(studio.connect()) as db:
+            task = dict(db.execute(
+                "SELECT * FROM project_archive_tasks WHERE id = 'archive-task-foreign'"
+            ).fetchone())
+            db.execute(
+                """INSERT INTO project_archive_leases
+                (project_id, lease_id, operation, created_at, task_id, owner_instance, owner_host,
+                 owner_pid, owner_process_identity, heartbeat_at)
+                VALUES (?, 'archive-lease-cross-project', 'snapshot', ?, 'archive-task-foreign',
+                        'malformed-owner', ?, 999999, 'runtime:legacy', ?)""",
+                (self.project["id"], studio.utc_now(), archive_module.ARCHIVE_OWNER_HOST, studio.utc_now()),
+            )
+            db.commit()
+        studio.init_db()
+        conflict = list_archive_reconciliations(
+            studio.DB_PATH, self.project["id"], include_resolved=False,
+        )[0]
+        self.assertEqual(conflict["reason"], "task_project_mismatch")
+        with closing(studio.connect()) as db:
+            before_task = dict(db.execute(
+                "SELECT * FROM project_archive_tasks WHERE id = 'archive-task-foreign'"
+            ).fetchone())
+            before_lease = dict(db.execute(
+                "SELECT * FROM project_archive_leases WHERE lease_id = 'archive-lease-foreign'"
+            ).fetchone())
+        before_files = {
+            str(paths[0] / "foreign.txt"): (paths[0] / "foreign.txt").read_bytes(),
+            str(paths[1]): paths[1].read_bytes(),
+            str(paths[2]): paths[2].read_bytes(),
+        }
+        with patch.object(archive_module, "_cleanup_archive_task_paths", side_effect=AssertionError("foreign cleanup")) as cleanup:
+            resolved = self.endpoint(
+                "/api/projects/{project_id}/archive-reconciliations/{reconciliation_id}/resolve", "POST",
+            )(
+                self.project["id"], conflict["id"],
+                ArchiveReconciliationResolve(
+                    expected_revision=conflict["revision"], confirmed_by="本机操作员",
+                    note="确认当前项目没有归档进程，只解除当前项目异常冻结",
+                    confirm_no_live_archive_process=True,
+                ),
+            )
+        self.assertEqual(cleanup.call_count, 0)
+        self.assertEqual(resolved["state"], "resolved")
+        with closing(studio.connect()) as db:
+            after_task = dict(db.execute(
+                "SELECT * FROM project_archive_tasks WHERE id = 'archive-task-foreign'"
+            ).fetchone())
+            after_lease = dict(db.execute(
+                "SELECT * FROM project_archive_leases WHERE lease_id = 'archive-lease-foreign'"
+            ).fetchone())
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM project_archive_leases WHERE lease_id = 'archive-lease-cross-project'"
+            ).fetchone())
+        self.assertEqual(after_task, before_task)
+        self.assertEqual(after_lease, before_lease)
+        self.assertEqual(task["project_id"], foreign_project["id"])
+        for path, contents in before_files.items():
+            self.assertEqual(Path(path).read_bytes(), contents)
+
+    def test_wrong_revision_has_zero_cleanup_or_file_side_effects(self) -> None:
+        acquired, conflict = self.create_same_project_owner_mismatch(self.project, "wrong-revision")
+        paths = [Path(acquired[key]) for key in ("staging_path", "partial_path", "final_path")]
+        before = {
+            str(paths[0] / "owned.txt"): (paths[0] / "owned.txt").read_bytes(),
+            str(paths[1]): paths[1].read_bytes(),
+            str(paths[2]): paths[2].read_bytes(),
+        }
+        with patch.object(archive_module, "_cleanup_archive_task_paths", wraps=archive_module._cleanup_archive_task_paths) as cleanup:
+            with self.assertRaises(HTTPException) as stale:
+                self.endpoint(
+                    "/api/projects/{project_id}/archive-reconciliations/{reconciliation_id}/resolve", "POST",
+                )(
+                    self.project["id"], conflict["id"],
+                    ArchiveReconciliationResolve(
+                        expected_revision=conflict["revision"] + 1, confirmed_by="本机操作员",
+                        note="使用错误 revision 不得产生任何文件副作用",
+                        confirm_no_live_archive_process=True,
+                    ),
+                )
+        self.assertEqual(stale.exception.status_code, 409)
+        self.assertEqual(cleanup.call_count, 0)
+        for path, contents in before.items():
+            self.assertEqual(Path(path).read_bytes(), contents)
+        current = list_archive_reconciliations(studio.DB_PATH, self.project["id"], include_resolved=False)[0]
+        self.assertEqual(current["state"], "unresolved")
+        self.assertEqual(current["revision"], conflict["revision"])
+
+    def test_concurrent_resolve_has_one_cleanup_owner_and_same_project_cleanup_completes(self) -> None:
+        acquired, conflict = self.create_same_project_owner_mismatch(self.project, "concurrent-cleanup")
+        entered = Event()
+        release = Event()
+        count_lock = Lock()
+        cleanup_calls = 0
+        original_cleanup = archive_module._cleanup_archive_task_paths
+
+        def blocking_cleanup(db_path: Path, backup_root: Path, task: dict) -> list[str]:
+            nonlocal cleanup_calls
+            with count_lock:
+                cleanup_calls += 1
+            entered.set()
+            self.assertTrue(release.wait(5), "timed out waiting to release cleanup")
+            return original_cleanup(db_path, backup_root, task)
+
+        payload = ArchiveReconciliationResolve(
+            expected_revision=conflict["revision"], confirmed_by="本机操作员",
+            note="并发请求只能有一个取得清理所有权并完成",
+            confirm_no_live_archive_process=True,
+        )
+        resolve_endpoint = self.endpoint(
+            "/api/projects/{project_id}/archive-reconciliations/{reconciliation_id}/resolve", "POST",
+        )
+        with patch.object(archive_module, "_cleanup_archive_task_paths", side_effect=blocking_cleanup):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(resolve_endpoint, self.project["id"], conflict["id"], payload)
+                self.assertTrue(entered.wait(5), "first resolver did not acquire cleanup ownership")
+                second = pool.submit(resolve_endpoint, self.project["id"], conflict["id"], payload)
+                with self.assertRaises(HTTPException) as concurrent:
+                    second.result(timeout=5)
+                release.set()
+                resolved = first.result(timeout=5)
+        self.assertEqual(concurrent.exception.status_code, 409)
+        self.assertEqual(cleanup_calls, 1)
+        self.assertEqual(resolved["state"], "resolved")
+        self.assertEqual(resolved["revision"], conflict["revision"] + 2)
+        for key in ("staging_path", "partial_path", "final_path"):
+            self.assertFalse(Path(acquired[key]).exists())
+        with closing(studio.connect()) as db:
+            task = dict(db.execute(
+                "SELECT * FROM project_archive_tasks WHERE id = 'archive-task-concurrent-cleanup'"
+            ).fetchone())
+            self.assertEqual(task["state"], "failed")
+            self.assertEqual(task["stage"], "reconciled_failed")
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (self.project["id"],)
+            ).fetchone())
+
+    def test_cleanup_failure_is_audited_and_retryable_without_releasing_freeze(self) -> None:
+        acquired, conflict = self.create_same_project_owner_mismatch(self.project, "cleanup-retry")
+        payload = ArchiveReconciliationResolve(
+            expected_revision=conflict["revision"], confirmed_by="本机操作员",
+            note="模拟文件占用，失败必须保留冻结并允许审计重试",
+            confirm_no_live_archive_process=True,
+        )
+        endpoint = self.endpoint(
+            "/api/projects/{project_id}/archive-reconciliations/{reconciliation_id}/resolve", "POST",
+        )
+        with patch.object(archive_module, "_cleanup_archive_task_paths", return_value=["staging_path:file-locked"]):
+            with self.assertRaises(HTTPException) as failed:
+                endpoint(self.project["id"], conflict["id"], payload)
+        self.assertEqual(failed.exception.status_code, 409)
+        failed_record = list_archive_reconciliations(
+            studio.DB_PATH, self.project["id"], include_resolved=False,
+        )[0]
+        self.assertEqual(failed_record["state"], "cleanup_failed")
+        self.assertEqual(failed_record["revision"], conflict["revision"] + 2)
+        self.assertIn("file-locked", failed_record["cleanup_error"])
+        with closing(studio.connect()) as db:
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (self.project["id"],)
+            ).fetchone())
+        retried = endpoint(
+            self.project["id"], conflict["id"],
+            payload.model_copy(update={"expected_revision": failed_record["revision"]}),
+        )
+        self.assertEqual(retried["state"], "resolved")
+        self.assertEqual(retried["revision"], conflict["revision"] + 4)
+        for key in ("staging_path", "partial_path", "final_path"):
+            self.assertFalse(Path(acquired[key]).exists())
 
     def test_owner_identity_requires_same_verified_os_identity_kind_before_pid_reuse_recovery(self) -> None:
         cases = (

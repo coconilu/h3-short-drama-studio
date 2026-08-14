@@ -204,12 +204,14 @@ export function ProjectsWorkbench({ workbench, health, search, onOpenProject, on
           <div className="rail-heading"><h2>归档冻结对账</h2><ArchiveRestore size={15} /></div>
           <p className="archive-reconciliation-warning">检测到旧版或不一致的归档冻结。系统不会自动解除；请先确认本机没有存活归档进程。</p>
           {workbench.archive_reconciliations.map((record) => <article key={record.id} className="archive-reconciliation-card">
-            <header><strong>{record.project_title || record.project_id}</strong><em>R{record.revision}</em></header>
+            <header><strong>{record.project_title || record.project_id}</strong><em>{record.state === 'resolving' ? '清理中' : record.state === 'cleanup_failed' ? '清理失败' : `R${record.revision}`}</em></header>
             <p>{reconciliationReason[record.reason] || record.reason}</p>
+            {record.cleanup_error && <p className="archive-reconciliation-error">上次清理未完成：{record.cleanup_error}</p>}
             <small>lease {record.lease_id}{record.task_id ? ` · task ${record.task_id}` : ' · 无 task'}</small>
             <textarea
               aria-label={`${record.project_title || record.project_id}归档对账说明`}
               placeholder="记录检查过的进程、日志和判断依据（至少 8 个字符）"
+              disabled={record.state === 'resolving'}
               value={reconciliationNotes[record.id] || ''}
               onChange={(event) => setReconciliationNotes((items) => ({ ...items, [record.id]: event.target.value }))}
             />
@@ -217,16 +219,17 @@ export function ProjectsWorkbench({ workbench, health, search, onOpenProject, on
               <input
                 type="checkbox"
                 checked={!!reconciliationConfirmations[record.id]}
+                disabled={record.state === 'resolving'}
                 onChange={(event) => setReconciliationConfirmations((items) => ({ ...items, [record.id]: event.target.checked }))}
               />
               我已确认没有存活归档进程
             </label>
             <button
               onClick={() => resolveReconciliation(record)}
-              disabled={busyReconciliation === record.id || !reconciliationConfirmations[record.id] || (reconciliationNotes[record.id]?.trim().length || 0) < 8}
+              disabled={record.state === 'resolving' || busyReconciliation === record.id || !reconciliationConfirmations[record.id] || (reconciliationNotes[record.id]?.trim().length || 0) < 8}
             >
-              {busyReconciliation === record.id ? <LoaderCircle className="spin" size={13} /> : <ArchiveRestore size={13} />}
-              确认并解除异常冻结
+              {record.state === 'resolving' || busyReconciliation === record.id ? <LoaderCircle className="spin" size={13} /> : <ArchiveRestore size={13} />}
+              {record.state === 'resolving' ? '正在清理受管路径' : record.state === 'cleanup_failed' ? '重试清理并解除冻结' : '确认并解除异常冻结'}
             </button>
           </article>)}
         </section>}

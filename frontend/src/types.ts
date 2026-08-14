@@ -404,12 +404,15 @@ export type ArchiveReconciliation = {
   lease_id: string
   task_id?: string
   reason: 'taskless_lease' | 'terminal_task_lease' | 'task_project_mismatch' | 'task_lease_owner_mismatch'
-  state: 'unresolved' | 'resolved'
+  state: 'unresolved' | 'resolving' | 'cleanup_failed' | 'resolved'
   revision: number
   evidence: Record<string, unknown>
   confirmed_no_live_process: boolean
   resolved_by?: string
   resolution_note?: string
+  resolution_started_at?: string
+  cleanup_error?: string
+  cleanup_attempts: number
   created_at: string
   updated_at: string
   resolved_at?: string

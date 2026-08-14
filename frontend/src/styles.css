@@ -875,6 +875,7 @@ textarea { line-height: 1.55; }
 .archive-reconciliation-card header strong { color: #e1d7c8; font-size: 11px; }
 .archive-reconciliation-card header em { color: var(--gold); font-size: 9px; font-style: normal; }
 .archive-reconciliation-card p { margin: 0; color: #c5aa81; font-size: 10px; line-height: 1.5; }
+.archive-reconciliation-card .archive-reconciliation-error { color: #d78978; }
 .archive-reconciliation-card small { color: #80786d; font-size: 8px; overflow-wrap: anywhere; }
 .archive-reconciliation-card textarea { box-sizing: border-box; width: 100%; min-height: 68px; resize: vertical; border: 1px solid #4c4033; background: #12110f; color: #d8d1c8; padding: 8px; font: inherit; font-size: 9px; line-height: 1.5; }
 .archive-reconciliation-card textarea:focus { outline: 1px solid #9b7133; border-color: #9b7133; }
