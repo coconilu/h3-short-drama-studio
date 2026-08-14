@@ -151,6 +151,13 @@ class ReviewGateTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             require_passed_review(self.db_path, "c1", self.root)
 
+        workspace = review_workspace(self.db_path, "s1", self.root)
+        # The API response must remain JSON serializable after review history
+        # exists; the latest record must not recursively contain itself.
+        encoded = json.dumps(workspace)
+        self.assertIn('"history"', encoded)
+        self.assertEqual(len(workspace["reviews"][0]["history"]), 2)
+
     def test_file_change_makes_review_stale(self) -> None:
         save_candidate_review(self.db_path, self.root, "s1", self.request(), self.probe)
         self.video_path.write_bytes(b"test-video-v2-with-different-size")

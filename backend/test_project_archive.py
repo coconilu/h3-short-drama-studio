@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 import zipfile
@@ -10,6 +11,20 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from backend import app as studio
+from backend.hd_delivery import (
+    HDPlanCreate,
+    HDReviewRequest,
+    HDScores,
+    HDSelectRequest,
+    HDSubmitRequest,
+    HDValidationRequest,
+    create_hd_plan,
+    process_next_hd_job,
+    save_hd_review,
+    select_hd_artifact,
+    submit_hd_job,
+    validate_hd_plan,
+)
 from backend.project_archive import create_archive_router, create_project_archive, verify_project_archive
 
 
@@ -17,12 +32,15 @@ class ProjectArchiveTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
+        self.root = root
         studio.DB_PATH = root / "studio.db"
+        studio.COMFY_OUTPUT_ROOT = root / "comfy-output"
         studio.EXPORT_ROOT = root / "exports"
         studio.EXPORT_JOB_ROOT = root / "jobs"
         self.backup_root = root / "backups"
         studio.EXPORT_ROOT.mkdir()
         studio.EXPORT_JOB_ROOT.mkdir()
+        studio.COMFY_OUTPUT_ROOT.mkdir()
         studio.init_db()
         self.project = studio.create_project(
             studio.ProjectCreate(
@@ -153,6 +171,157 @@ class ProjectArchiveTests(unittest.TestCase):
         archive = create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
         self.assertEqual(archive["row_counts"]["candidate_master_versions"], 1)
         self.assertEqual(archive["row_counts"]["production_item_attempts"], 1)
+
+    def test_archive_contains_hd_versions_and_checksum_verified_media(self) -> None:
+        shot_id = self.project["shots"][0]["id"]
+        source = studio.COMFY_OUTPUT_ROOT / "trusted-draft.mp4"
+        source.write_bytes(b"trusted-low-resolution-master")
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        now = studio.utc_now()
+        metadata = json.dumps(
+            {
+                "prompt": "a continuous locked shot",
+                "mode": "fl2va",
+                "width": 608,
+                "height": 352,
+                "actual_seconds": 5.167,
+            }
+        )
+        snapshot = json.dumps(
+            {
+                "output_file": str(source.resolve()),
+                "size_bytes": source.stat().st_size,
+                "checksum_sha256": source_sha,
+                "trace": {"plan_hash": "a" * 64, "plan_snapshot": {"mode": "fl2va"}},
+            }
+        )
+        with closing(studio.connect()) as db:
+            db.execute(
+                """INSERT INTO candidates
+                (id, shot_id, label, seed, created_at, thumbnail, selected, scores, note, status,
+                 source, external_id, prompt_id, output_file, archived, metadata)
+                VALUES ('archive-low-master', ?, 'A', 42, ?, '', 1, '{}', '', 'completed',
+                        'controlled-fake', 'draft-archive', 'prompt-archive', ?, 0, ?)""",
+                (shot_id, now, str(source), metadata),
+            )
+            db.execute(
+                """INSERT INTO candidate_reviews
+                (id, candidate_id, shot_id, project_id, revision, decision, scores, issues, note,
+                 watched_seconds, audio_checks, candidate_snapshot, media_probe, created_at)
+                VALUES ('archive-low-review', 'archive-low-master', ?, ?, 1, 'pass', '{}', '[]',
+                        'controlled fixture review', 5.167, '{}', ?, '{}', ?)""",
+                (shot_id, self.project["id"], snapshot, now),
+            )
+            db.execute(
+                """INSERT INTO candidate_master_versions
+                (id, project_id, shot_id, revision, candidate_id, action, review_id, review_revision,
+                 note, candidate_snapshot, created_at)
+                VALUES ('archive-low-version', ?, ?, 1, 'archive-low-master', 'select',
+                        'archive-low-review', 1, 'locked fixture', ?, ?)""",
+                (self.project["id"], shot_id, snapshot, now),
+            )
+            db.commit()
+
+        def runner(request: dict, dry_run: bool) -> dict:
+            if dry_run:
+                return {
+                    "gpu_submitted": False,
+                    "adapter": "controlled-fake-h3",
+                    "model_id": "fake-ref2va",
+                    "workflow_id": "fixture-workflow-v1",
+                    "command": request,
+                }
+            output = studio.COMFY_OUTPUT_ROOT / f"{request['expected_artifact_id']}.mp4"
+            output.write_bytes(b"controlled-fake-hd-archive-media")
+            return {
+                "gpu_submitted": True,
+                "output_file": str(output),
+                "model_id": "fake-ref2va",
+                "workflow_id": "fixture-workflow-v1",
+                "prompt_id": "fixture-hd-prompt",
+                "comfy_task_id": "fixture-comfy-task",
+            }
+
+        def probe(path: Path) -> dict:
+            return {
+                "ok": path.is_file(),
+                "issues": [],
+                "duration_seconds": 5.167,
+                "video": {"codec": "h264", "width": 1344, "height": 768},
+                "audio": {"present": True, "codec": "aac", "channels": 2, "sample_rate": 48000},
+            }
+
+        plan = create_hd_plan(
+            studio.DB_PATH,
+            studio.COMFY_OUTPUT_ROOT,
+            shot_id,
+            HDPlanCreate(strategy_type="ref2va_regenerate"),
+        )
+        validation = validate_hd_plan(
+            studio.DB_PATH,
+            studio.COMFY_OUTPUT_ROOT,
+            HDValidationRequest(plan_id=plan["id"], expected_plan_hash=plan["plan_hash"]),
+            runner,
+        )
+        submit_hd_job(
+            studio.DB_PATH,
+            studio.COMFY_OUTPUT_ROOT,
+            shot_id,
+            HDSubmitRequest(
+                validation_id=validation["id"],
+                expected_validation_hash=validation["validation_hash"],
+                idempotency_key="archive-hd-fixture-0001",
+                confirm=True,
+            ),
+        )
+        self.assertTrue(process_next_hd_job(studio.DB_PATH, studio.COMFY_OUTPUT_ROOT, runner, probe))
+        with closing(studio.connect()) as db:
+            artifact = dict(db.execute("SELECT * FROM hd_artifacts WHERE shot_id = ?", (shot_id,)).fetchone())
+        save_hd_review(
+            studio.DB_PATH,
+            studio.COMFY_OUTPUT_ROOT,
+            shot_id,
+            HDReviewRequest(
+                artifact_id=artifact["id"],
+                decision="pass",
+                scores=HDScores(
+                    story_match=4,
+                    identity_continuity=4,
+                    temporal_stability=4,
+                    visual_detail=4,
+                    audio_quality=4,
+                ),
+                drift_confirmed=True,
+                watched_seconds=5.167,
+                note="controlled fake was reviewed against the low-resolution master",
+            ),
+            probe,
+        )
+        select_hd_artifact(
+            studio.DB_PATH,
+            studio.COMFY_OUTPUT_ROOT,
+            shot_id,
+            HDSelectRequest(artifact_id=artifact["id"], base_revision=0, note="fixture HD master"),
+        )
+
+        archive = create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
+        for table in (
+            "hd_strategy_versions",
+            "hd_validations",
+            "hd_generation_jobs",
+            "hd_artifacts",
+            "hd_artifact_reviews",
+            "hd_master_versions",
+        ):
+            self.assertEqual(archive["row_counts"][table], 1, table)
+        self.assertEqual(archive["media_count"], 2)
+        self.assertEqual(archive["omitted_count"], 0)
+        self.assertTrue(verify_project_archive(studio.DB_PATH, archive["id"])["ok"])
+
+        Path(artifact["output_path"]).write_bytes(b"tampered-after-record")
+        corrupted = create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
+        self.assertEqual(corrupted["omitted_count"], 1)
+        self.assertEqual(corrupted["media_count"], 1)
 
 
 if __name__ == "__main__":

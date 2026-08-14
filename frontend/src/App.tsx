@@ -48,6 +48,7 @@ import { ScriptStudio } from './ScriptStudio'
 import { CreativePlanning } from './CreativePlanning'
 import { ProductionBible } from './ProductionBible'
 import { PromptCompiler } from './PromptCompiler'
+import { HDWorkbench } from './HDWorkbench'
 
 const globalNavItems = [
   { id: 'projects', label: '所有项目', icon: FolderKanban },
@@ -65,6 +66,7 @@ const projectNavItems = [
   { id: 'assets', label: '素材库', icon: UserRound },
   { id: 'queue', label: '项目队列', icon: ListVideo },
   { id: 'review', label: '审片台', icon: Film },
+  { id: 'hd', label: '高清交付', icon: Sparkles },
   { id: 'timeline', label: '成片交付', icon: Library },
 ]
 
@@ -421,13 +423,15 @@ function App() {
     setNotice('正在冻结项目数据并校验归档包…')
     try {
       const archive = await api<ProjectArchive>(`/api/projects/${projectId}/archives`, { method: 'POST', timeoutMs: 120000 })
+      const verification = await api<{ ok: boolean; errors: string[]; archive: ProjectArchive }>(`/api/project-archives/${archive.id}/verify`, { method: 'POST', timeoutMs: 120000 })
+      if (!verification.ok) throw new Error(`归档校验失败：${verification.errors.join('；')}`)
       const link = document.createElement('a')
-      link.href = archive.download_url
+      link.href = verification.archive.download_url
       link.download = ''
       document.body.appendChild(link)
       link.click()
       link.remove()
-      setNotice(`归档 R${archive.revision} 已生成：${archive.media_count} 个媒体文件，SHA-256 ${archive.checksum_sha256.slice(0, 12)}`)
+      setNotice(`归档 R${archive.revision} 已校验并下载：${archive.media_count} 个媒体文件，SHA-256 ${archive.checksum_sha256.slice(0, 12)}`)
       await refresh()
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '项目归档包生成失败')
@@ -663,6 +667,7 @@ function App() {
         {activePage === 'queue' && <QueuePage jobs={jobs} onSync={syncShot} onResolve={resolveReconciliation} />}
         {activePage === 'review' && selectedShot && <ReviewPage project={project} shot={selectedShot} candidates={candidates} promotions={promotions} reviewWorkspace={reviewWorkspace} onSelectShot={setSelectedShotId} onRefresh={async () => { await Promise.all([refresh(), refreshShotReview(selectedShot.id)]) }} setNotice={setNotice} />}
         {activePage === 'review' && !selectedShot && <main className="empty-project-stage"><Film size={28} /><h1>还没有可审片的镜头</h1><p>完成创作规划和剧本开发后，再同步分镜并生成候选。</p><button className="button primary" onClick={() => setActivePage('planning')}>返回创作规划</button></main>}
+        {activePage === 'hd' && <HDWorkbench key={project.id} projectId={project.id} setNotice={setNotice} onOpenTimeline={async () => { await refresh(); setActivePage('timeline') }} />}
         {activePage === 'timeline' && <TimelinePage shots={project.shots} roughCut={roughCut} preflight={exportPreflight} exportRuns={exportRuns} deliveryWorkspace={deliveryWorkspace} onExport={submitExport} onRunAction={mutateExport} onRefresh={refresh} setNotice={setNotice} />}
       </div>
 
@@ -1596,7 +1601,7 @@ function TimelinePage({ shots, roughCut, preflight, exportRuns, deliveryWorkspac
       </div>
       {preflight?.issues.length ? <div className="export-issues">{preflight.issues.map(issue => <span key={issue.shot_id}><strong>{displayShotId(issue.shot_id)}</strong>{issue.message}</span>)}</div> : null}
     </section>
-    {roughCut.available && roughCut.video && <section className="roughcut-delivery"><div><span className="eyebrow">当前可交付版本</span><h2>{roughCut.name}</h2><p>{roughCut.width}×{roughCut.height} · {(roughCut.duration_seconds || 0).toFixed(2)} 秒 · {roughCut.shot_count} 镜头 · 含音轨与可开关字幕</p><small>{roughCut.quality_note}</small><nav>{roughCut.subtitles && <a href={roughCut.subtitles}>下载 SRT 字幕</a>}{roughCut.sources && <a href={roughCut.sources}>查看来源清单</a>}{roughCut.manifest && <a href={roughCut.manifest}>查看生产清单</a>}</nav></div><video controls preload="metadata" src={roughCut.video}>{roughCut.captions && <track kind="subtitles" src={roughCut.captions} srcLang="zh" label="中文" default />}</video></section>}
+    {roughCut.available && roughCut.video && <section className="roughcut-delivery"><div><span className="eyebrow">当前可交付版本</span><h2>{roughCut.name}</h2><p>{roughCut.width}×{roughCut.height} · {(roughCut.duration_seconds || 0).toFixed(2)} 秒 · {roughCut.shot_count} 镜头 · 含音轨与可开关字幕</p>{roughCut.sha256 && <code title={roughCut.sha256}>视频 SHA-256 · {roughCut.sha256}</code>}<small>{roughCut.quality_note}</small><nav>{roughCut.subtitles && <a href={roughCut.subtitles}>下载 SRT 字幕</a>}{roughCut.sources && <a href={roughCut.sources}>查看来源清单</a>}{roughCut.manifest && <a href={roughCut.manifest}>查看生产清单</a>}</nav></div><video controls preload="metadata" src={roughCut.video}>{roughCut.captions && <track kind="subtitles" src={roughCut.captions} srcLang="zh" label="中文" default />}</video></section>}
     <section className="export-history">
       <div className="export-history-heading"><div><span className="eyebrow">任务与版本</span><h2>平台导出历史</h2></div><small>服务重启可恢复 · 失败可重试 · 已完成版本可回切</small></div>
       <div className="export-run-list">

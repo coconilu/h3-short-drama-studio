@@ -641,6 +641,8 @@ export type RoughCut = {
   has_audio?: boolean
   shot_count?: number
   size_bytes?: number
+  sha256?: string
+  export_run_id?: string
   updated_at?: string
   quality_note?: string
   run?: ExportRun
@@ -650,13 +652,21 @@ export type ExportSource = {
   shot_id: string
   ordinal: number
   title: string
-  source_type: 'candidate' | 'promotion'
+  source_type: 'candidate' | 'promotion' | 'hd_artifact'
   source_id: string
   source_detail?: string
   duration_seconds: number
   width: number
   height: number
   has_audio: boolean
+  checksum_sha256?: string
+  hd_artifact_id?: string
+  hd_master_version_id?: string
+  hd_strategy_type?: 'ref2va_regenerate' | 'original_model_regenerate' | 'deterministic_scale'
+  hd_strategy_kind?: 'model_regeneration' | 'pixel_scaling'
+  hd_plan_hash?: string
+  hd_model_id?: string
+  hd_workflow_id?: string
 }
 
 export type ExportPreflight = {

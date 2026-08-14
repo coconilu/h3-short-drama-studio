@@ -100,6 +100,12 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
     export_ids = _ids(export_runs)
     delivery_signoffs = _rows(db, "SELECT * FROM delivery_signoffs WHERE project_id = ? ORDER BY category, revision", (project_id,))
     acceptance_runs = _rows(db, "SELECT * FROM production_acceptance_runs WHERE project_id = ? ORDER BY created_at", (project_id,))
+    hd_plans = _rows(db, "SELECT * FROM hd_strategy_versions WHERE project_id = ? ORDER BY shot_id, revision", (project_id,))
+    hd_validations = _rows(db, "SELECT * FROM hd_validations WHERE project_id = ? ORDER BY created_at", (project_id,))
+    hd_jobs = _rows(db, "SELECT * FROM hd_generation_jobs WHERE project_id = ? ORDER BY created_at", (project_id,))
+    hd_artifacts = _rows(db, "SELECT * FROM hd_artifacts WHERE project_id = ? ORDER BY shot_id, version", (project_id,))
+    hd_reviews = _rows(db, "SELECT * FROM hd_artifact_reviews WHERE project_id = ? ORDER BY artifact_id, revision", (project_id,))
+    hd_masters = _rows(db, "SELECT * FROM hd_master_versions WHERE project_id = ? ORDER BY shot_id, revision", (project_id,))
     creative_briefs = _rows(db, "SELECT * FROM creative_briefs WHERE project_id = ?", (project_id,))
     creative_proposals = _rows(db, "SELECT * FROM creative_proposals WHERE project_id = ? ORDER BY ordinal", (project_id,))
     creative_characters = _rows(db, "SELECT * FROM creative_characters WHERE project_id = ? ORDER BY ordinal", (project_id,))
@@ -152,6 +158,13 @@ def project_snapshot(db: sqlite3.Connection, project_id: str) -> dict[str, list[
         "export_events": _by_ids(db, "export_events", "run_id", export_ids),
         "delivery_signoffs": delivery_signoffs,
         "production_acceptance_runs": acceptance_runs,
+        "hd_strategy_versions": hd_plans,
+        "hd_validations": hd_validations,
+        "hd_generation_jobs": hd_jobs,
+        "hd_shot_leases": _rows(db, "SELECT * FROM hd_shot_leases WHERE project_id = ? ORDER BY shot_id", (project_id,)),
+        "hd_artifacts": hd_artifacts,
+        "hd_artifact_reviews": hd_reviews,
+        "hd_master_versions": hd_masters,
         "creative_briefs": creative_briefs,
         "creative_proposals": creative_proposals,
         "creative_characters": creative_characters,
@@ -189,6 +202,9 @@ def _candidate_paths(snapshot: dict[str, list[dict[str, Any]]], export_root: Pat
     for promotion in snapshot["promotions"]:
         if promotion.get("selected") and promotion.get("output_file"):
             candidates.append(("selected-promotions", Path(promotion["output_file"])))
+    for artifact in snapshot.get("hd_artifacts", []):
+        if artifact.get("output_path"):
+            candidates.append(("hd-artifacts", Path(artifact["output_path"])))
     for run in snapshot["export_runs"]:
         if not run.get("is_current"):
             continue
@@ -207,6 +223,10 @@ def _collect_media(snapshot: dict[str, list[dict[str, Any]]], export_root: Path)
     included: list[dict[str, Any]] = []
     omitted: list[dict[str, str]] = []
     seen: set[Path] = set()
+    hd_checksums = {
+        str(Path(item["output_path"]).expanduser().resolve()): str(item.get("output_sha256") or "").lower()
+        for item in snapshot.get("hd_artifacts", []) if item.get("output_path")
+    }
     for category, raw_path in _candidate_paths(snapshot, export_root):
         try:
             path = raw_path.expanduser().resolve(strict=True)
@@ -220,6 +240,10 @@ def _collect_media(snapshot: dict[str, list[dict[str, Any]]], export_root: Path)
             omitted.append({"category": category, "path": str(path), "reason": "unsupported"})
             continue
         checksum = sha256_file(path)
+        expected_hd = hd_checksums.get(str(path))
+        if category == "hd-artifacts" and (len(expected_hd or "") != 64 or checksum.lower() != expected_hd):
+            omitted.append({"category": category, "path": str(path), "reason": "sha256-mismatch"})
+            continue
         included.append({
             "category": category,
             "source_path": str(path),

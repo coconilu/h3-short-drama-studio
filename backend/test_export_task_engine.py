@@ -269,6 +269,47 @@ class ExportTaskEngineTests(unittest.TestCase):
         )
         self.assertEqual([item["revision"] for item in revisions], [1, 2])
 
+    def test_delivery_signoff_is_bound_to_exact_export_version_and_sha(self) -> None:
+        request = studio.DeliverySignoffRequest(
+            category="picture_continuity",
+            decision="pass",
+            note="watched the entire frozen export",
+            source="unit-test-human",
+        )
+        export_a = {
+            "available": True,
+            "has_audio": True,
+            "width": 1344,
+            "height": 768,
+            "duration_seconds": 8.0,
+            "shot_count": 7,
+            "updated_at": "2026-08-14T01:00:00+00:00",
+            "export_run_id": "export-a",
+            "sha256": "a" * 64,
+        }
+        export_b = {
+            **export_a,
+            "updated_at": "2026-08-14T02:00:00+00:00",
+            "export_run_id": "export-b",
+            "sha256": "b" * 64,
+        }
+        with patch.object(studio, "current_export", return_value=export_a):
+            signed_a = studio.create_delivery_signoff(request)
+        self.assertEqual(signed_a["delivery"]["signoffs"]["picture_continuity"]["export_run_id"], "export-a")
+
+        with patch.object(studio, "current_export", return_value=export_b):
+            stale = studio.production_acceptance_payload()
+        self.assertNotIn("picture_continuity", stale["delivery"]["signoffs"])
+        picture_stage = next(stage for stage in stale["delivery"]["stages"] if stage["id"] == "picture_signoff")
+        self.assertEqual(picture_stage["status"], "block")
+
+        with patch.object(studio, "current_export", return_value=export_b):
+            signed_b = studio.create_delivery_signoff(request)
+        current = signed_b["delivery"]["signoffs"]["picture_continuity"]
+        self.assertEqual(current["revision"], 2)
+        self.assertEqual(current["export_run_id"], "export-b")
+        self.assertEqual(current["export_sha256"], "b" * 64)
+
 
 if __name__ == "__main__":
     unittest.main()
