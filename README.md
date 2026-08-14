@@ -59,7 +59,7 @@ React 导演台
 
 产物默认写入 `runtime\exports`。脚本会优先使用镜头定稿，其次使用已选草稿，并生成 MP4、可编辑 SRT 和来源追踪 JSON；任何镜头缺视频或音轨时会失败关闭。
 
-平台提交导出时会冻结镜头来源、字幕设置和输入路径。工作进程认领后先把每个来源复制到本次 run 私有、只读且以 SHA-256 命名的 staging；复制前后会同时复核原文件和副本哈希，FFmpeg 此后只读取副本，不再依赖可能变化的原路径。生产清单同时记录 original/staged 输入与输出 SHA-256，可用以下命令回归任务状态机：
+平台提交导出时会冻结镜头来源、字幕设置和输入路径。工作进程认领后先把每个来源复制到本次 run 私有、只读且以 SHA-256 命名的 staging；复制前后会同时复核原文件和副本哈希，FFmpeg 此后只读取副本，不再依赖可能变化的原路径。最终发布在 Windows 上还会为全部 staged 输入持有 `CreateFileW(GENERIC_READ, FILE_SHARE_READ)` 句柄，禁止并发写入或删除直到 manifest/current 的事务 CAS 完成；无法获得等价 OS 保护的平台会失败关闭。生产清单同时记录 original/staged 输入与输出 SHA-256，可用以下命令回归任务状态机：
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest backend.test_export_task_engine -v
@@ -590,13 +590,13 @@ append-only 草稿母版版本（可回滚，不覆盖候选）
 | 生产环节 | 门禁与可追溯行为 |
 |---|---|
 | 批次选择 | 后端无副作用 preflight 逐镜冻结批准计划、H3 adapter 输入哈希和对应 validation job；每镜至少 2 条候选，最长边不得超过 768。创建请求必须携带 preflight hash 与幂等键，事务内复核后才排队 |
-| 调度恢复 | `production_shot_leases` 保证同一镜头不能跨批次并行提交；attempt 绑定精确 draft job/revision/candidate set。外部同步或人工对账推进 job revision 后，调度器只在集合仍属于原 attempt 时用 CAS 消费；任何非权威结果、所有权或 CAS 冲突都会把 lease 置为 unknown，并在同一事务创建项目级可审计冲突，不会留下没有处理入口的未知占用 |
+| 调度恢复 | `production_shot_leases` 保证同一镜头不能跨批次并行提交；attempt 绑定精确 draft job/revision/candidate set。外部同步或人工对账推进 job revision 后，调度器只在集合仍属于原 attempt 时用 CAS 消费；人工对账请求必须携带明确 `job_id + expected_revision`，并在当前项目/镜头内原子核验，绝不按“最新任务”猜测目标。任何非权威结果、所有权或 CAS 冲突都会把 lease 置为 unknown，并在同一事务创建项目级可审计冲突，不会留下没有处理入口的未知占用 |
 | 冲突审计 | “项目队列”按当前项目展示升级重复 attempt 及运行期 poll 冲突。升级冲突要求每个条目的 `1..attempts` 都有独立、唯一 draft job 与各自零提交证明；运行期冲突冻结精确 attempt/job/revision，只有该 job 经人工确认或受信任 pre-spawn 证据证明零候选、零媒体提交后才能解除门禁并重试。解决记录保存人员、时间、说明和 revision CAS |
 | 候选证据 | 保存 H3 项目、prompt/candidate ID、实际 prompt、seed、规格、plan hash、输出路径、文件大小和媒体状态；旧候选缺失真实文件或任务证据会显示为“历史证据债务” |
 | 结构化审片 | `verified` 必须同时匹配唯一 production attempt、精确 draft job、plan/input hash、prompt、candidate ID、seed、规格和受管媒体 SHA-256；缺任一项都显示为历史债务且不计入“至少 2 条” |
 | 草稿母版 | `base_revision` 必填；同一写事务复核最新审片原始快照及媒体 path/size/mtime/SHA 后只追加选择/回滚修订，回滚不会删除或覆盖候选 |
 | 装配草案 | 每项规范化冻结 section revision、镜头正文/对白/字幕、candidate、master/review revision 和媒体路径/SHA，以及顺序、入点、出点和原声/静音策略；锁定事务逐项复核，旧计划缺凭证时失败关闭 |
-| 可复现导出 | 导出只使用锁定装配里的候选与校验和，不跟随后来变化的“当前选择”；认领后把每个来源复制成 run 私有、只读、内容寻址的 staging，复制前后验证 original/staged SHA，FFmpeg 真正应用 `trim/atrim`、静音和冻结字幕且只读取 staged 路径。生产清单同时保留 original/staged path+SHA；发布前复核 staged 副本，副本被改即零发布，原文件在复制成功后变化不影响本次确定性输出 |
+| 可复现导出 | 导出只使用锁定装配里的候选与校验和，不跟随后来变化的“当前选择”；认领后把每个来源复制成 run 私有、只读、内容寻址的 staging，复制前后验证 original/staged SHA，FFmpeg 真正应用 `trim/atrim`、静音和冻结字幕且只读取 staged 路径。最终发布从最后 SHA 校验到 manifest/current CAS 全程持有 Windows 禁写/禁删共享句柄；锁失败或 staged 副本被改即零发布，原文件在复制成功后变化不影响本次确定性输出 |
 | 项目归档 | 归档包包含生产批次、逐次 attempt、审片修订、母版历史和全部装配版本，原始候选媒体继续按既有受管媒体规则校验 |
 
 本阶段不执行高分辨率精修，也不会把普通放大称为高清重生成。自动化测试通过受控 fake 适配器验证提交、恢复和证据合同，不调用真实 GPU 或本地 Agent 额度。

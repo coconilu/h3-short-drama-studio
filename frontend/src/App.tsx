@@ -338,6 +338,7 @@ function App() {
         method: 'POST',
         body: JSON.stringify({
           action,
+          job_id: job.id,
           expected_revision: job.reconciliation_revision || 0,
           note,
           resolved_by: 'human:workbench',
@@ -1126,6 +1127,14 @@ function QueuePage({ jobs, onSync, onResolve }: {
     } finally { setBusy('') }
   }
 
+  const resolveConflictJob = async (job: Job) => {
+    setBusy(`job-${job.id}`)
+    try {
+      await onResolve(job, 'confirm_not_submitted')
+      await Promise.all([loadConflicts(), loadBatches()])
+    } finally { setBusy('') }
+  }
+
   const batchStateLabels: Record<ProductionBatch['state'], string> = {
     running: '运行中', paused: '已暂停', cancelling: '停止中', completed: '已完成',
     completed_with_errors: '有失败', cancelled: '已取消',
@@ -1143,7 +1152,8 @@ function QueuePage({ jobs, onSync, onResolve }: {
         <div className="conflict-summary"><span><b>{displayShotId(group.shot_id)}</b><strong>{group.shot_title}</strong></span><em>{group.state === 'resolved' ? '已解决' : group.can_resolve ? '证据完整' : '证据不足'}</em></div>
         <div className="conflict-attempts">{group.items.map((item) => {
           const target = item.evidence?.target_attempt
-          return <span className={item.proof.verified ? 'verified' : 'blocked'} key={item.id}><b>{item.item_title}</b><small>{item.original_state} · R{item.revision}{target?.attempt ? ` · attempt ${target.attempt}` : ''}{target?.draft_job_id ? ` · job #${target.draft_job_id}` : ''}{target?.item_job_revision !== undefined ? ` / R${target.item_job_revision}` : ''}</small><em>{item.proof.verified ? (item.proof.basis === 'queued_never_claimed' ? '从未领取' : '已证明零提交') : item.proof.reason}</em></span>
+          const targetJob = target?.draft_job_id ? jobs.find((job) => job.id === target.draft_job_id) : undefined
+          return <span className={item.proof.verified ? 'verified' : 'blocked'} key={item.id}><b>{item.item_title}</b><small>{item.original_state} · R{item.revision}{target?.attempt ? ` · attempt ${target.attempt}` : ''}{target?.draft_job_id ? ` · job #${target.draft_job_id}` : ''}{targetJob ? ` / R${targetJob.reconciliation_revision || 0}` : target?.item_job_revision !== undefined ? ` / R${target.item_job_revision}` : ''}</small><em>{item.proof.verified ? (item.proof.basis === 'queued_never_claimed' ? '从未领取' : '已证明零提交') : item.proof.reason}</em>{group.state === 'unresolved' && targetJob?.state === '待人工对账' && <button type="button" className="danger" disabled={busy === `job-${targetJob.id}`} onClick={() => void resolveConflictJob(targetJob)}>{busy === `job-${targetJob.id}` ? '正在写入审计…' : `确认 job #${targetJob.id} 未提交`}</button>}</span>
         })}</div>
         {group.state === 'unresolved' ? <div className="conflict-resolution"><label>审计说明<input aria-label={`${group.shot_title}冲突审计说明`} value={conflictNotes[group.shot_id] || ''} onChange={(event) => setConflictNotes((current) => ({ ...current, [group.shot_id]: event.target.value }))} placeholder="说明如何确认整组尝试均未提交" /></label><button disabled={!group.can_resolve || !conflictNotes[group.shot_id]?.trim() || Boolean(busy)} onClick={() => void resolveConflict(group)}>{busy === `conflict-${group.shot_id}` ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />}确认整组未提交并解除门禁</button></div> : <footer>{group.items[0]?.resolved_by} · {group.items[0]?.resolution_note} · {group.items[0]?.resolved_at ? new Date(group.items[0].resolved_at).toLocaleString('zh-CN', { hour12: false }) : ''}</footer>}
       </article>)}</div>
@@ -1172,7 +1182,7 @@ function QueuePage({ jobs, onSync, onResolve }: {
         </> : <div className="production-detail-empty"><ListVideo size={26} /><strong>选择一个生产批次</strong><span>查看逐镜提交、生成、恢复和失败重试状态。</span></div>}
       </section>
     </section>
-    <details className="legacy-job-log"><summary>底层 H3 任务日志 <span>{jobs.length}</span></summary><div className="queue-table"><div className="queue-head"><span>镜头</span><span>任务</span><span>说明</span><span>状态</span><span>时间</span><span>操作</span></div>{jobs.map(job => <div className="queue-row" key={job.id}><strong>{displayShotId(job.shot_id)}</strong><span>{job.kind}</span><span><b>{job.message}</b>{job.prompt_ids?.length ? <small>{job.prompt_ids.length} 个 prompt_id</small> : null}</span><StatusPill status={job.state} /><time>{new Date(job.updated_at || job.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time><span className="queue-reconciliation-actions">{job.state === '待人工对账' ? <><button onClick={() => void onResolve(job, 'accept_current_manifest')}><RefreshCw size={14} />接受证据</button><button className="danger" onClick={() => void onResolve(job, 'confirm_not_submitted')}>确认未提交</button></> : <button className="queue-sync" disabled={!job.h3_project || job.kind !== 'draft'} onClick={() => onSync(job.shot_id)}><RefreshCw size={14} />同步</button>}</span></div>)}</div></details>
+    <details className="legacy-job-log"><summary>底层 H3 任务日志 <span>{jobs.length}</span></summary><div className="queue-table"><div className="queue-head"><span>镜头</span><span>任务</span><span>说明</span><span>状态</span><span>时间</span><span>操作</span></div>{jobs.map(job => <div className="queue-row" key={job.id}><strong>{displayShotId(job.shot_id)}</strong><span>{job.kind}<small>job #{job.id} · R{job.reconciliation_revision || 0}</small></span><span><b>{job.message}</b>{job.prompt_ids?.length ? <small>{job.prompt_ids.length} 个 prompt_id</small> : null}</span><StatusPill status={job.state} /><time>{new Date(job.updated_at || job.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time><span className="queue-reconciliation-actions">{job.state === '待人工对账' ? <><button onClick={() => void onResolve(job, 'accept_current_manifest')}><RefreshCw size={14} />接受 job #{job.id} 证据</button><button className="danger" onClick={() => void onResolve(job, 'confirm_not_submitted')}>确认 job #{job.id} 未提交</button></> : <button className="queue-sync" disabled={!job.h3_project || job.kind !== 'draft'} onClick={() => onSync(job.shot_id)}><RefreshCw size={14} />同步</button>}</span></div>)}</div></details>
   </main>
 }
 

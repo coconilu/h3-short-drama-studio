@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -130,6 +132,28 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         return json.loads(
             (studio.export_staging_root(run_id) / "request.json").read_text(encoding="utf-8")
         )
+
+    def successful_render(self, run_id: str, stem: str):
+        test = self
+
+        class SuccessfulRender:
+            pid = 4545
+            returncode = 0
+            finished = False
+
+            def poll(self) -> int:
+                if not self.finished:
+                    staged = test.staged_snapshot(run_id)
+                    studio.EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+                    for suffix in (".mp4", ".srt", ".vtt"):
+                        (studio.EXPORT_ROOT / f"{stem}{suffix}").write_bytes(b"controlled-output")
+                    (studio.EXPORT_ROOT / f"{stem}.sources.json").write_text(
+                        json.dumps(staged["sources"], ensure_ascii=False), encoding="utf-8",
+                    )
+                    self.finished = True
+                return 0
+
+        return SuccessfulRender()
 
     def test_export_uses_frozen_candidate_checksum_and_edit_controls(self) -> None:
         with patch("backend.app.probe_media", side_effect=self.probe):
@@ -325,7 +349,7 @@ class FrozenDeliveryExportTests(unittest.TestCase):
             "backend.app._verify_frozen_export_sources", side_effect=replace_after_third_verify,
         ), patch("backend.app.probe_media", side_effect=self.probe):
             studio.run_export_job(queued["id"])
-        self.assertEqual(verify_calls, 4, "最终发布事务必须再次复核 staged path/SHA")
+        self.assertEqual(verify_calls, 5, "OS 锁获取后与最终发布事务都必须复核 staged path/SHA")
         with closing(sqlite3.connect(self.db_path)) as db:
             completed = db.execute(
                 "SELECT state, is_current, outputs FROM export_runs WHERE id = ?", (queued["id"],),
@@ -361,20 +385,20 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         original_verify = studio._verify_frozen_export_sources
         verify_calls = 0
 
-        def tamper_staged_after_external_verify(current_snapshot: dict, rendered_sources=None) -> None:
+        def tamper_staged_before_publication_lock(current_snapshot: dict, rendered_sources=None) -> None:
             nonlocal verify_calls
             verify_calls += 1
             original_verify(current_snapshot, rendered_sources)
-            if verify_calls == 3:
+            if verify_calls == 2:
                 staged_path = Path(current_snapshot["sources"][0]["path"])
                 staged_path.chmod(0o666)
                 staged_path.write_bytes(b"tampered-private-staging")
 
         with patch("backend.app.subprocess.Popen", return_value=SuccessfulRender()), patch(
-            "backend.app._verify_frozen_export_sources", side_effect=tamper_staged_after_external_verify,
+            "backend.app._verify_frozen_export_sources", side_effect=tamper_staged_before_publication_lock,
         ), patch("backend.app.probe_media", side_effect=self.probe):
             studio.run_export_job(queued["id"])
-        self.assertEqual(verify_calls, 4)
+        self.assertEqual(verify_calls, 3)
         with closing(sqlite3.connect(self.db_path)) as db:
             failed = db.execute(
                 "SELECT state, is_current, outputs FROM export_runs WHERE id = ?", (queued["id"],),
@@ -384,6 +408,119 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         self.assertEqual(json.loads(failed[2]), {})
         self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
         self.assertFalse(studio.export_staging_root(queued["id"]).exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows CreateFile sharing enforcement")
+    def test_os_lock_rejects_concurrent_staged_write_after_final_check(self) -> None:
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
+        self.assertEqual(studio.claim_next_export_run()["id"], queued["id"])
+        run = studio.row("SELECT * FROM export_runs WHERE id = ?", (queued["id"],))
+        stem = run["output_name"]
+        expected_sha = json.loads(run["source_snapshot"])["sources"][0]["checksum_sha256"]
+        original_hold = studio.hold_staged_export_sources
+        attempted = threading.Event()
+        write_result: list[str] = []
+
+        @contextmanager
+        def attack_after_locked_verification(snapshot: dict, rendered_sources=None):
+            with original_hold(snapshot, rendered_sources):
+                staged_path = Path(snapshot["sources"][0]["path"])
+
+                def attacker() -> None:
+                    try:
+                        staged_path.chmod(0o666)
+                        staged_path.write_bytes(b"tamper-after-final-locked-verification")
+                        write_result.append("wrote")
+                    except OSError as exc:
+                        write_result.append(f"rejected:{getattr(exc, 'winerror', None)}")
+                    finally:
+                        attempted.set()
+
+                thread = threading.Thread(target=attacker, daemon=True)
+                thread.start()
+                self.assertTrue(attempted.wait(5), "并发 staged 篡改请求没有完成")
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+                yield
+
+        with patch(
+            "backend.app.subprocess.Popen",
+            return_value=self.successful_render(queued["id"], stem),
+        ), patch(
+            "backend.app.hold_staged_export_sources",
+            side_effect=attack_after_locked_verification,
+        ), patch("backend.app.probe_media", side_effect=self.probe):
+            studio.run_export_job(queued["id"])
+
+        self.assertEqual(len(write_result), 1)
+        self.assertTrue(write_result[0].startswith("rejected:"), write_result)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            completed = db.execute(
+                "SELECT state, is_current FROM export_runs WHERE id = ?", (queued["id"],),
+            ).fetchone()
+        self.assertEqual(completed, ("已完成", 1))
+        manifest = json.loads(
+            (studio.EXPORT_ROOT / f"{stem}.production.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["inputs"][0]["staged"]["checksum_sha256"], expected_sha)
+        self.assertEqual(
+            studio.file_sha256(Path(manifest["inputs"][0]["staged"]["path"])), expected_sha,
+            "发布不得包含并发请求试图写入的 staged 字节",
+        )
+
+    def test_staged_lock_acquisition_failure_fails_without_publish_and_cleans(self) -> None:
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
+        self.assertEqual(studio.claim_next_export_run()["id"], queued["id"])
+        run = studio.row("SELECT * FROM export_runs WHERE id = ?", (queued["id"],))
+        stem = run["output_name"]
+        with patch(
+            "backend.app.subprocess.Popen",
+            return_value=self.successful_render(queued["id"], stem),
+        ), patch(
+            "backend.app.hold_staged_export_sources",
+            side_effect=RuntimeError("controlled OS staged lock acquisition failure"),
+        ), patch("backend.app.probe_media", side_effect=self.probe):
+            studio.run_export_job(queued["id"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            failed = db.execute(
+                "SELECT state, is_current, outputs, error FROM export_runs WHERE id = ?", (queued["id"],),
+            ).fetchone()
+        self.assertEqual((failed[0], failed[1], json.loads(failed[2])), ("失败", 0, {}))
+        self.assertIn("lock acquisition failure", failed[3])
+        self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
+        self.assertFalse(studio.export_staging_root(queued["id"]).exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows CreateFile sharing enforcement")
+    def test_exception_inside_staged_lock_releases_handles_and_cleans(self) -> None:
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
+        self.assertEqual(studio.claim_next_export_run()["id"], queued["id"])
+        run = studio.row("SELECT * FROM export_runs WHERE id = ?", (queued["id"],))
+        stem = run["output_name"]
+        original_validate = studio._validate_export_run_snapshot
+
+        def fail_inside_publish_lock(export_run: dict, *, db=None, verify_sources: bool = True):
+            if db is not None:
+                raise RuntimeError("controlled failure while staged handles are held")
+            return original_validate(export_run, db=db, verify_sources=verify_sources)
+
+        with patch(
+            "backend.app.subprocess.Popen",
+            return_value=self.successful_render(queued["id"], stem),
+        ), patch(
+            "backend.app._validate_export_run_snapshot",
+            side_effect=fail_inside_publish_lock,
+        ), patch("backend.app.probe_media", side_effect=self.probe):
+            studio.run_export_job(queued["id"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            failed = db.execute(
+                "SELECT state, is_current, error FROM export_runs WHERE id = ?", (queued["id"],),
+            ).fetchone()
+        self.assertEqual((failed[0], failed[1]), ("失败", 0))
+        self.assertIn("staged handles are held", failed[2])
+        self.assertFalse(studio.export_staging_root(queued["id"]).exists())
+        self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
 
     def _assert_delivery_mutation_during_render_fails(self, sql: str) -> None:
         with patch("backend.app.probe_media", side_effect=self.probe):

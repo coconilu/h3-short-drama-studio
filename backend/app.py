@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -2046,6 +2046,7 @@ class GenerateRequest(BaseModel):
 
 class ReconciliationResolutionRequest(BaseModel):
     action: Literal["confirm_not_submitted", "accept_current_manifest"]
+    job_id: int = Field(gt=0)
     expected_revision: int = Field(ge=0)
     note: str = Field(min_length=2, max_length=500)
     resolved_by: str = Field("human:workbench", min_length=2, max_length=120)
@@ -3227,6 +3228,67 @@ def _verify_frozen_export_sources(
             raise RuntimeError(f"镜头 {frozen.get('shot_id')} 的渲染来源与冻结快照不一致")
 
 
+@contextmanager
+def hold_staged_export_sources(
+    snapshot: dict[str, Any], rendered_sources: list[dict[str, Any]] | None = None,
+):
+    """Hold OS-enforced read-only handles through the publication CAS.
+
+    Windows ``CreateFileW`` sharing rules are mandatory here: ``FILE_SHARE_READ``
+    permits FFmpeg/readers but rejects later write or delete opens while these
+    handles are alive.  A POSIX advisory lock would not provide the same trust
+    boundary, so unsupported platforms fail closed instead of pretending that
+    chmod or flock makes mutable external files immutable.
+    """
+    if os.name != "nt":
+        raise RuntimeError("当前平台无法提供 staged 输入的 OS 级禁写/禁删发布锁，导出已失败关闭")
+    import ctypes
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    invalid_handle = ctypes.c_void_p(-1).value
+    staging_run_id = str(snapshot.get("staging_run_id") or "")
+    frozen_sources = snapshot.get("sources")
+    if not staging_run_id or not isinstance(frozen_sources, list) or not frozen_sources:
+        raise RuntimeError("导出 staged 发布锁缺少有效运行或来源快照")
+    handles: list[Any] = []
+    locked_paths: set[Path] = set()
+    try:
+        for frozen in frozen_sources:
+            path = allowed_staged_export_file(frozen.get("path"), staging_run_id)
+            if path in locked_paths:
+                continue
+            handle = create_file(
+                str(path), generic_read, file_share_read, None,
+                open_existing, file_attribute_normal, None,
+            )
+            if handle == invalid_handle:
+                error = ctypes.get_last_error()
+                raise RuntimeError(
+                    f"无法取得 staged 输入的 OS 级发布锁：{path.name}（Windows {error}: {ctypes.FormatError(error).strip()}）"
+                )
+            handles.append(handle)
+            locked_paths.add(path)
+        # Recompute SHA/path evidence only after every source is protected.
+        _verify_frozen_export_sources(snapshot, rendered_sources)
+        yield
+    finally:
+        for handle in reversed(handles):
+            close_handle(handle)
+
+
 def _validate_export_assembly(
     db: sqlite3.Connection,
     export_run: dict[str, Any],
@@ -3498,40 +3560,44 @@ def run_export_job(run_id: str) -> None:
         # Reject obvious source drift before taking the publication lock.  The
         # authoritative hash is repeated inside the final transaction below.
         _verify_frozen_export_sources(staged_snapshot, sources)
-        with closing(connect()) as db:
-            db.execute("BEGIN IMMEDIATE")
-            current_run = db.execute(
-                "SELECT * FROM export_runs WHERE id = ? AND state = '导出中' AND cancel_requested = 0",
-                (run_id,),
-            ).fetchone()
-            if not current_run:
-                raise RuntimeError("导出任务在发布前已被取消或修改")
-            current_run = dict(current_run)
-            if (
-                current_run.get("source_snapshot") != export_run.get("source_snapshot")
-                or current_run.get("config") != export_run.get("config")
-            ):
-                raise RuntimeError("导出任务冻结凭证在发布前发生变化")
-            # The mutable originals are no longer render inputs.  Revalidate
-            # the locked assembly and this run's private staged bytes in the
-            # publication transaction before exposing manifest/current.
-            _validate_export_run_snapshot(current_run, db=db, verify_sources=False)
-            _verify_frozen_export_sources(staged_snapshot, sources)
-            production_manifest_temp.replace(production_manifest_path)
-            db.execute("UPDATE export_runs SET is_current = 0 WHERE project_id = ?", (export_run["project_id"],))
-            published = db.execute(
-                """UPDATE export_runs SET state = '已完成', message = '横屏成片与生产清单已生成',
-                outputs = ?, updated_at = ?, completed_at = ?, error = NULL, worker_id = NULL,
-                cancel_requested = 0, is_current = 1 WHERE id = ? AND state = '导出中'
-                AND source_snapshot = ? AND config = ? AND cancel_requested = 0""",
-                (
-                    json.dumps(outputs, ensure_ascii=False), completed_at, completed_at, run_id,
-                    export_run.get("source_snapshot"), export_run.get("config"),
-                ),
-            )
-            if published.rowcount != 1:
-                raise RuntimeError("导出任务发布 CAS 失败")
-            db.commit()
+        # chmod is not a publication lock on Windows.  Keep handles that deny
+        # write/delete sharing alive from the final SHA check through manifest
+        # replacement and the current-version CAS.
+        with hold_staged_export_sources(staged_snapshot, sources):
+            with closing(connect()) as db:
+                db.execute("BEGIN IMMEDIATE")
+                current_run = db.execute(
+                    "SELECT * FROM export_runs WHERE id = ? AND state = '导出中' AND cancel_requested = 0",
+                    (run_id,),
+                ).fetchone()
+                if not current_run:
+                    raise RuntimeError("导出任务在发布前已被取消或修改")
+                current_run = dict(current_run)
+                if (
+                    current_run.get("source_snapshot") != export_run.get("source_snapshot")
+                    or current_run.get("config") != export_run.get("config")
+                ):
+                    raise RuntimeError("导出任务冻结凭证在发布前发生变化")
+                # The mutable originals are no longer render inputs.  Revalidate
+                # the locked assembly and the OS-protected staged bytes in the
+                # publication transaction before exposing manifest/current.
+                _validate_export_run_snapshot(current_run, db=db, verify_sources=False)
+                _verify_frozen_export_sources(staged_snapshot, sources)
+                production_manifest_temp.replace(production_manifest_path)
+                db.execute("UPDATE export_runs SET is_current = 0 WHERE project_id = ?", (export_run["project_id"],))
+                published = db.execute(
+                    """UPDATE export_runs SET state = '已完成', message = '横屏成片与生产清单已生成',
+                    outputs = ?, updated_at = ?, completed_at = ?, error = NULL, worker_id = NULL,
+                    cancel_requested = 0, is_current = 1 WHERE id = ? AND state = '导出中'
+                    AND source_snapshot = ? AND config = ? AND cancel_requested = 0""",
+                    (
+                        json.dumps(outputs, ensure_ascii=False), completed_at, completed_at, run_id,
+                        export_run.get("source_snapshot"), export_run.get("config"),
+                    ),
+                )
+                if published.rowcount != 1:
+                    raise RuntimeError("导出任务发布 CAS 失败")
+                db.commit()
         record_export_event(run_id, "completed", "媒体校验与生产清单写入完成，已设为当前版本")
     except ExportCancelled as exc:
         cleanup_export_outputs(export_run["output_name"])
@@ -4926,54 +4992,87 @@ def sync_shot(shot_id: str) -> dict[str, Any]:
 
 @app.post("/api/shots/{shot_id}/reconciliation/resolve")
 def resolve_reconciliation(shot_id: str, request: ReconciliationResolutionRequest) -> dict[str, Any]:
-    require_active_shot(shot_id)
     if not request.confirm:
         raise HTTPException(400, "人工解决对账前必须显式确认")
-    job = row(
-        """SELECT * FROM jobs WHERE shot_id = ? AND kind = 'draft'
-        AND state = '待人工对账' ORDER BY id DESC LIMIT 1""",
-        (shot_id,),
-    )
-    if not job:
-        raise HTTPException(409, "该镜头没有待人工解决的 H3 对账任务")
-    if int(job.get("reconciliation_revision") or 0) != request.expected_revision:
-        raise HTTPException(409, "对账任务已变化，请刷新后再确认")
-    try:
-        evidence = json.loads(job.get("reconciliation_snapshot") or "{}")
-    except (TypeError, json.JSONDecodeError):
-        evidence = {}
-    history = list(evidence.get("manual_resolutions") or [])
-    history.append({
-        "action": request.action,
-        "note": request.note,
-        "resolved_by": request.resolved_by,
-        "resolved_at": utc_now(),
-        "from_state": job["state"],
-        "from_revision": request.expected_revision,
-    })
-    evidence["manual_resolutions"] = history
-    if request.action == "confirm_not_submitted":
-        resolved = update_reconciliation_job(
-            job,
-            "提交失败",
-            f"{request.resolved_by} 已确认外部任务未提交，可在修复后重试：{request.note}",
-            evidence,
-            retry_safe=True,
-            completed=True,
+    now = utc_now()
+    with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        selected = db.execute(
+            """SELECT jobs.* FROM jobs
+            JOIN shots ON shots.id = jobs.shot_id
+            JOIN workspace_settings ON workspace_settings.key = 'active_project_id'
+              AND workspace_settings.value = shots.project_id
+            JOIN projects ON projects.id = shots.project_id AND projects.archived = 0
+            WHERE jobs.id = ? AND jobs.shot_id = ? AND jobs.kind = 'draft'
+              AND jobs.state = '待人工对账'
+              AND jobs.reconciliation_revision = ?""",
+            (request.job_id, shot_id, request.expected_revision),
+        ).fetchone()
+        if not selected:
+            db.rollback()
+            raise HTTPException(409, "指定对账任务不属于当前项目/镜头，或任务修订已变化")
+        job = dict(selected)
+        try:
+            evidence = json.loads(job.get("reconciliation_snapshot") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            evidence = {}
+        history = list(evidence.get("manual_resolutions") or [])
+        history.append({
+            "action": request.action,
+            "job_id": request.job_id,
+            "note": request.note,
+            "resolved_by": request.resolved_by,
+            "resolved_at": now,
+            "from_state": job["state"],
+            "from_revision": request.expected_revision,
+        })
+        evidence["manual_resolutions"] = history
+        next_state = "提交失败" if request.action == "confirm_not_submitted" else "提交状态未知"
+        message = (
+            f"{request.resolved_by} 已确认外部任务未提交，可在修复后重试：{request.note}"
+            if request.action == "confirm_not_submitted"
+            else f"{request.resolved_by} 请求按当前 manifest/ComfyUI 证据重新对账：{request.note}"
         )
-        if resolved["state"] != "提交失败" or not resolved.get("retry_safe"):
+        retry_safe = request.action == "confirm_not_submitted"
+        completed_at = now if retry_safe else None
+        changed = db.execute(
+            """UPDATE jobs SET state = ?, message = ?, reconciliation_snapshot = ?, retry_safe = ?,
+            candidate_ids = CASE WHEN ? = 1 THEN '[]' ELSE candidate_ids END,
+            updated_at = ?, completed_at = ?, reconciliation_revision = reconciliation_revision + 1
+            WHERE id = ? AND shot_id = ? AND kind = 'draft' AND state = '待人工对账'
+              AND reconciliation_revision = ?
+              AND EXISTS (
+                SELECT 1 FROM shots
+                JOIN workspace_settings ON workspace_settings.key = 'active_project_id'
+                  AND workspace_settings.value = shots.project_id
+                JOIN projects ON projects.id = shots.project_id AND projects.archived = 0
+                WHERE shots.id = jobs.shot_id
+              )""",
+            (
+                next_state,
+                message,
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                int(retry_safe),
+                int(retry_safe),
+                now,
+                completed_at,
+                request.job_id,
+                shot_id,
+                request.expected_revision,
+            ),
+        )
+        if changed.rowcount != 1:
+            db.rollback()
             raise HTTPException(409, "对账任务被另一请求更新，请刷新")
-        return {"ok": True, "job": resolved, "message": resolved["message"]}
+        updated = db.execute("SELECT * FROM jobs WHERE id = ?", (request.job_id,)).fetchone()
+        if not updated:
+            db.rollback()
+            raise HTTPException(409, "对账任务在更新后不可用")
+        db.commit()
+        prepared = dict(updated)
+    if request.action == "confirm_not_submitted":
+        return {"ok": True, "job": prepared, "message": prepared["message"]}
 
-    prepared = update_reconciliation_job(
-        job,
-        "提交状态未知",
-        f"{request.resolved_by} 请求按当前 manifest/ComfyUI 证据重新对账：{request.note}",
-        evidence,
-        completed=False,
-    )
-    if prepared["state"] != "提交状态未知" or int(prepared.get("reconciliation_revision") or 0) != request.expected_revision + 1:
-        raise HTTPException(409, "对账任务被另一请求更新，请刷新")
     reconciled = reconcile_generation_job(prepared)
     return {
         "ok": reconciled["state"] not in {"待人工对账", "提交状态未知"},
