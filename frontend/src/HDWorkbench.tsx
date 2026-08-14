@@ -166,17 +166,25 @@ export function HDWorkbench({ projectId, setNotice, onOpenTimeline }: {
   const [watched, setWatched] = useState(0)
   const videoRef = useRef<HTMLVideoElement | null>(null)
 
-  const load = useCallback(async (quiet = false) => {
+  const load = useCallback(async (quiet = false, signal?: AbortSignal) => {
     try {
-      const result = await request<HDWorkspace>('/api/hd/workspace')
+      const result = await request<HDWorkspace>('/api/hd/workspace', { signal })
+      if (signal?.aborted || result.project.id !== projectId) return
       setWorkspace(result)
       setSelectedShotId((current) => result.shots.some(item => item.shot.id === current) ? current : result.shots[0]?.shot.id || '')
     } catch (error) {
+      if (signal?.aborted) return
       if (!quiet) setNotice(error instanceof Error ? error.message : '高清工作台加载失败')
     }
-  }, [setNotice])
+  }, [projectId, setNotice])
 
-  useEffect(() => { void load() }, [load, projectId])
+  useEffect(() => {
+    setWorkspace(null)
+    setSelectedShotId('')
+    const controller = new AbortController()
+    void load(false, controller.signal)
+    return () => controller.abort()
+  }, [load, projectId])
   useEffect(() => {
     if (!workspace?.summary.active_job_count) return
     const timer = window.setInterval(() => void load(true), 1500)

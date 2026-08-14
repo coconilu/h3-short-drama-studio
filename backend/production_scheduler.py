@@ -339,6 +339,10 @@ def _table_exists(db: sqlite3.Connection, table: str) -> bool:
     return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone())
 
 
+def _column_exists(db: sqlite3.Connection, table: str, column: str) -> bool:
+    return column in {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
 def _canonical_hash(value: Any) -> str:
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -1229,6 +1233,10 @@ def create_batch(
                 raise HTTPException(409, "幂等键已用于不同的镜头集合")
             db.commit()
             return _batch_public(db, existing)
+        if _table_exists(db, "project_archive_leases") and db.execute(
+            "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project["id"],),
+        ).fetchone():
+            raise HTTPException(409, "项目正在冻结归档，禁止创建生产批次")
         for frozen in preflight["frozen_items"]:
             _verify_frozen_item(db, project["id"], frozen)
 
@@ -1327,10 +1335,16 @@ def claim_next_item(db_path: Path) -> dict[str, Any] | None:
         if active:
             db.commit()
             return None
+        archive_filter = (
+            "AND NOT EXISTS (SELECT 1 FROM project_archive_leases leases WHERE leases.project_id = batches.project_id)"
+            if _table_exists(db, "project_archive_leases") else ""
+        )
+        project_filter = "AND COALESCE(projects.archived, 0) = 0" if _column_exists(db, "projects", "archived") else ""
         item = db.execute(
-            """SELECT items.* FROM production_batch_items items
+            f"""SELECT items.* FROM production_batch_items items
             JOIN production_batches batches ON batches.id = items.batch_id
-            WHERE items.state = 'queued' AND batches.state = 'running'
+            JOIN projects ON projects.id = batches.project_id {project_filter}
+            WHERE items.state = 'queued' AND batches.state = 'running' {archive_filter}
             ORDER BY batches.created_at, items.ordinal, items.created_at LIMIT 1"""
         ).fetchone()
         if not item:

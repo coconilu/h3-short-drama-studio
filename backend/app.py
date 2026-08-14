@@ -199,6 +199,12 @@ def ensure_column(db: sqlite3.Connection, table: str, name: str, definition: str
         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
+def table_exists(db: sqlite3.Connection, name: str) -> bool:
+    return bool(db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,),
+    ).fetchone())
+
+
 def migrate_db(db: sqlite3.Connection) -> None:
     for name, definition in (
         ("subtitle_enabled", "INTEGER NOT NULL DEFAULT 1"),
@@ -716,12 +722,15 @@ def require_active_export_run(run_id: str) -> dict[str, Any]:
 
 
 def set_active_project(project_id: str) -> None:
-    project = row("SELECT id, archived FROM projects WHERE id = ?", (project_id,))
-    if not project:
-        raise HTTPException(404, "项目不存在")
-    if project["archived"]:
-        raise HTTPException(409, "归档项目不能直接打开，请先恢复到工作台")
     with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        project = db.execute("SELECT id, archived FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if not project:
+            raise HTTPException(404, "项目不存在")
+        if project["archived"]:
+            raise HTTPException(409, "归档项目不能直接打开，请先恢复到工作台")
+        if db.execute("SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project_id,)).fetchone():
+            raise HTTPException(409, "项目正在冻结归档，请稍后再打开")
         db.execute(
             """INSERT INTO workspace_settings (key, value, updated_at)
             VALUES ('active_project_id', ?, ?)
@@ -1477,6 +1486,54 @@ def _hd_prompt_file(plan_hash: str, prompt: str) -> Path:
     return path
 
 
+def _safe_hd_project_slug(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) or value in {".", ".."}:
+        raise HDRunnerError("H3 高清项目标识只能包含字母、数字、点、下划线和连字符", process_started=False)
+    return value
+
+
+def _hd_attempt_output_root(request: dict[str, Any], *, required: bool) -> Path | None:
+    raw = str(request.get("attempt_output_root") or "")
+    if not raw:
+        if required:
+            raise HDRunnerError("高清实际执行缺少私有 attempt 输出目录", process_started=False)
+        return None
+    root = Path(raw).resolve()
+    allowed = (COMFY_OUTPUT_ROOT / "hd-delivery" / "attempts").resolve()
+    try:
+        root.relative_to(allowed)
+    except ValueError as exc:
+        raise HDRunnerError("高清 attempt 输出目录越过专用受管根", process_started=False) from exc
+    return root
+
+
+def _copy_h3_result_to_attempt(source_value: str | None, attempt_root: Path, name: str) -> Path:
+    source = allowed_output_file(source_value)
+    attempt_root.mkdir(parents=True, exist_ok=True)
+    suffix = source.suffix.lower() if re.fullmatch(r"\.[a-z0-9]{1,8}", source.suffix.lower()) else ".media"
+    destination = (attempt_root / f"{name}{suffix}").resolve()
+    try:
+        destination.relative_to(attempt_root)
+    except ValueError as exc:
+        raise HDRunnerError("高清 H3 staging 输出路径越界", process_started=True) from exc
+    temporary = attempt_root / f".{name}-{uuid.uuid4().hex}.tmp"
+    before_sha = file_sha256(source)
+    before_size = source.stat().st_size
+    try:
+        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        after_sha = file_sha256(source)
+        copied_sha = file_sha256(temporary)
+        if before_sha != after_sha or before_size != source.stat().st_size or copied_sha != before_sha:
+            raise HDRunnerError("H3 manifest 产物在复制到私有 staging 期间发生变化", process_started=True)
+        temporary.replace(destination)
+        return destination
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _hd_manifest_record(project: str, collection: str, before_ids: set[str]) -> dict[str, Any]:
     manifest = read_manifest(project)
     records = manifest.get(collection)
@@ -1496,14 +1553,25 @@ def run_hd_operation(request: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     strategy = str(request.get("strategy_type") or "")
     source = request.get("source") or {}
     shot_id = str(source.get("shot_id") or "")
-    project = str(source.get("h3_project") or h3_project_for_shot(shot_id))
+    project = _safe_hd_project_slug(str(source.get("h3_project") or h3_project_for_shot(shot_id)))
     width = int(request.get("target_width") or 0)
     height = int(request.get("target_height") or 0)
     prompt = str(source.get("prompt") or "")
     plan_hash = str(request.get("plan_hash") or "")
+    attempt_root = _hd_attempt_output_root(request, required=not dry_run)
     if strategy == "deterministic_scale":
-        output_root = (COMFY_OUTPUT_ROOT / "hd-delivery" / project).resolve()
-        output_path = output_root / f"{request.get('expected_artifact_id') or plan_hash}-scale-{width}x{height}.mp4"
+        safe_artifact = _safe_hd_project_slug(str(request.get("expected_artifact_id") or plan_hash))
+        output_root = attempt_root or (COMFY_OUTPUT_ROOT / "hd-delivery" / "dry-run" / project).resolve()
+        allowed_root = (COMFY_OUTPUT_ROOT / "hd-delivery").resolve()
+        try:
+            output_root.relative_to(allowed_root)
+        except ValueError as exc:
+            raise HDRunnerError("确定性缩放输出越过专用高清根目录", process_started=False) from exc
+        output_path = (output_root / f"{safe_artifact}-scale-{width}x{height}.mp4").resolve()
+        try:
+            output_path.relative_to(output_root)
+        except ValueError as exc:
+            raise HDRunnerError("确定性缩放文件名越过 attempt 目录", process_started=False) from exc
         command = {
             "adapter": "ffmpeg", "operation": "lanczos_scale", "input": source.get("media", {}).get("path"),
             "output": str(output_path), "width": width, "height": height, "fit": "contain",
@@ -1538,42 +1606,70 @@ def run_hd_operation(request: dict[str, Any], dry_run: bool) -> dict[str, Any]:
 
     prompt_file = _hd_prompt_file(plan_hash, prompt)
     original_mode = str(source.get("original_mode") or "fl2va")
+    generation_seed = source.get("generation_seed")
+    if generation_seed is None:
+        raise HDRunnerError("模型重生成缺少提交前冻结 seed", process_started=False)
     manifest = read_manifest(project)
-    collection = "promotions" if strategy == "ref2va_regenerate" else "candidates"
+    collection = "candidates"
     before_ids = {str(record.get("id")) for record in manifest.get(collection, []) if record.get("id")}
+    reference_options = {"image": "--ref-image", "video": "--ref-video", "audio": "--ref-audio"}
+    ref_images: list[str] = []
+    ref_videos: list[str] = []
+    ref_audios: list[str] = []
+
+    def append_reference(reference_type: str, path_value: str) -> None:
+        if reference_type == "image":
+            ref_images.append(path_value)
+        elif reference_type == "video":
+            ref_videos.append(path_value)
+        elif reference_type == "audio":
+            ref_audios.append(path_value)
+
     if strategy == "ref2va_regenerate":
-        if manifest.get("selected_id") != source.get("candidate_external_id"):
-            raise HDRunnerError("H3 manifest 当前入选候选与锁定草稿母版不一致", process_started=False)
         arguments = [
-            "promote", "--project", project, "--strategy", "ref2va", "--width", str(width),
-            "--height", str(height), "--prompt-file", str(prompt_file),
+            "draft", "--project", project, "--mode", "ref2va", "--count", "1", "--width", str(width),
+            "--height", str(height), "--seconds", str((source.get("spec") or {}).get("duration_seconds") or 5),
+            "--prompt-file", str(prompt_file), "--seed", str(generation_seed),
         ]
+        source_video = str((source.get("media") or {}).get("path") or "")
+        arguments.extend(["--ref-video", source_video])
+        ref_videos.append(source_video)
+        for reference in source.get("references") or []:
+            option = reference_options.get(str(reference.get("reference_type")))
+            if option and reference.get("managed_path"):
+                path_value = str(reference["managed_path"])
+                arguments.extend([option, path_value])
+                append_reference(str(reference.get("reference_type")), path_value)
         model_id = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
-        workflow_id = "h3-promote-ref2va-v1"
+        workflow_id = "h3-ref2va-regenerate-v2"
     elif strategy == "original_model_regenerate":
         arguments = [
             "draft", "--project", project, "--mode", original_mode, "--count", "1", "--width", str(width),
             "--height", str(height), "--seconds", str((source.get("spec") or {}).get("duration_seconds") or 5),
-            "--prompt-file", str(prompt_file),
+            "--prompt-file", str(prompt_file), "--seed", str(generation_seed),
         ]
-        if source.get("seed") is not None:
-            arguments.extend(["--seed", str(source["seed"])])
         if original_mode == "ref2va":
-            reference_options = {"image": "--ref-image", "video": "--ref-video", "audio": "--ref-audio"}
             for reference in source.get("references") or []:
                 option = reference_options.get(str(reference.get("reference_type")))
                 if option and reference.get("managed_path"):
-                    arguments.extend([option, str(reference["managed_path"])])
+                    path_value = str(reference["managed_path"])
+                    arguments.extend([option, path_value])
+                    append_reference(str(reference.get("reference_type")), path_value)
         model_id = (
             "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
             if original_mode == "ref2va" else "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
         )
-        workflow_id = f"h3-draft-{original_mode}-target-v1"
+        workflow_id = f"h3-draft-{original_mode}-target-v2"
     else:
         raise HDRunnerError("不支持的高清策略", process_started=False)
     command = {
         "adapter": "h3-video-draft-refine", "arguments": arguments, "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "model_id": model_id, "workflow_id": workflow_id, "source_candidate_id": source.get("candidate_external_id"),
+        "seed": generation_seed,
+        "references": {
+            "ref_images": ref_images, "ref_videos": ref_videos, "ref_audios": ref_audios,
+            "first_frame": None, "last_frame": None,
+        },
     }
     if dry_run:
         try:
@@ -1589,9 +1685,21 @@ def run_hd_operation(request: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     except H3AdapterError as exc:
         raise HDRunnerError(str(exc.detail), process_started=exc.process_started) from exc
     record = _hd_manifest_record(project, collection, before_ids)
+    if (
+        record.get("seed") != generation_seed
+        or str(record.get("prompt") or "") != prompt
+        or int(record.get("width") or 0) != width
+        or int(record.get("height") or 0) != height
+        or record.get("references") != command["references"]
+        or record.get("mode") != ("ref2va" if strategy == "ref2va_regenerate" else original_mode)
+    ):
+        raise HDRunnerError("H3 manifest 与冻结的 seed、prompt、参考素材或规格不一致", process_started=True)
+    if attempt_root is None:
+        raise HDRunnerError("高清实际执行缺少私有 attempt 输出目录", process_started=True)
+    staged_output = _copy_h3_result_to_attempt(record.get("output_file"), attempt_root, str(request.get("expected_artifact_id") or "hd-output"))
     return {
         "gpu_submitted": True, "adapter": "h3-video-draft-refine", "model_id": model_id,
-        "workflow_id": workflow_id, "command": command, "output_file": record.get("output_file"),
+        "workflow_id": workflow_id, "command": command, "adapter_input": command, "output_file": str(staged_output),
         "prompt_id": record.get("prompt_id"), "comfy_task_id": record.get("prompt_id"), "manifest_record": record,
     }
 
@@ -3523,10 +3631,16 @@ def claim_next_export_run() -> dict[str, Any] | None:
     now = utc_now()
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
+        archive_filter = (
+            "AND NOT EXISTS (SELECT 1 FROM project_archive_leases leases WHERE leases.project_id = runs.project_id)"
+            if table_exists(db, "project_archive_leases") else ""
+        )
         pending = db.execute(
-            """SELECT * FROM export_runs
-            WHERE state IN ('排队中', '恢复排队') AND cancel_requested = 0
-            ORDER BY created_at, attempt LIMIT 1"""
+            f"""SELECT runs.* FROM export_runs runs
+            JOIN projects ON projects.id = runs.project_id AND projects.archived = 0
+            WHERE runs.state IN ('排队中', '恢复排队') AND runs.cancel_requested = 0
+              {archive_filter}
+            ORDER BY runs.created_at, runs.attempt LIMIT 1"""
         ).fetchone()
         if not pending:
             db.commit()
@@ -4026,6 +4140,11 @@ def create_export(payload: ExportRequest) -> dict[str, Any]:
     }
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
+        if table_exists(db, "project_archive_leases") and db.execute(
+            "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (preflight["project_id"],),
+        ).fetchone():
+            db.rollback()
+            raise HTTPException(409, "项目正在冻结归档，禁止创建导出任务")
         current_assembly = _locked_assembly_from_db(db, preflight["project_id"])
         if not current_assembly:
             db.rollback()
@@ -4880,6 +4999,11 @@ def generate(shot_id: str, request: GenerateRequest) -> dict[str, Any]:
     )
     with closing(connect()) as db:
         db.execute("BEGIN IMMEDIATE")
+        project_row = db.execute("SELECT archived FROM projects WHERE id = ?", (shot["project_id"],)).fetchone()
+        if not project_row or project_row["archived"]:
+            raise HTTPException(409, "项目已归档，禁止提交 H3")
+        if db.execute("SELECT 1 FROM project_archive_leases WHERE project_id = ?", (shot["project_id"],)).fetchone():
+            raise HTTPException(409, "项目正在冻结归档，禁止提交 H3")
         current_marker = draft_attempt_marker(shot_id, db)
         if current_marker != request_attempt_marker:
             raise HTTPException(409, "该请求读取生成状态后已有新的 H3 attempt，请刷新后再操作")

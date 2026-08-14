@@ -122,19 +122,50 @@ class HDDeliveryTests(unittest.TestCase):
         }
 
     def runner(self, request: dict, dry_run: bool) -> dict:
+        strategy = request["strategy_type"]
+        source = request["source"]
+        if strategy == "deterministic_scale":
+            model_id = "ffmpeg-lanczos"
+            workflow_id = "deterministic-scale-contain-v1"
+        else:
+            model_id = (
+                "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+                if strategy == "ref2va_regenerate" or source.get("original_mode") == "ref2va"
+                else "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+            )
+            workflow_id = "h3-ref2va-regenerate-v2" if strategy == "ref2va_regenerate" else f"h3-draft-{source.get('original_mode')}-target-v2"
         if dry_run:
             return {
                 "gpu_submitted": False, "adapter": "controlled-fake-h3",
-                "model_id": "minimax_h3_ref2va_fake.safetensors" if request["strategy_type"] == "ref2va_regenerate" else "ffmpeg-lanczos",
-                "workflow_id": "fake-workflow-v1", "command": request,
+                "model_id": model_id, "workflow_id": workflow_id, "command": request,
             }
-        output = self.root / f"{request['expected_artifact_id']}.mp4"
-        output.write_bytes(b"controlled-fake-hd-media-" + request["strategy_type"].encode())
-        return {
-            "gpu_submitted": request["strategy_type"] != "deterministic_scale",
-            "output_file": str(output), "model_id": "fake-model", "workflow_id": "fake-workflow-v1",
+        output_root = Path(request["attempt_output_root"])
+        output_root.mkdir(parents=True, exist_ok=True)
+        output = output_root / f"{request['expected_artifact_id']}.mp4"
+        output.write_bytes(b"controlled-fake-hd-media-" + strategy.encode())
+        result = {
+            "gpu_submitted": strategy != "deterministic_scale",
+            "output_file": str(output), "model_id": model_id, "workflow_id": workflow_id,
             "prompt_id": "fake-prompt", "comfy_task_id": "fake-comfy-task",
         }
+        if strategy != "deterministic_scale":
+            refs = {"ref_images": [], "ref_videos": [], "ref_audios": [], "first_frame": None, "last_frame": None}
+            if strategy == "ref2va_regenerate":
+                refs["ref_videos"].append(source["media"]["path"])
+            for reference in source.get("references") or []:
+                refs[f"ref_{reference['reference_type']}s"].append(reference["managed_path"])
+            adapter_input = {
+                "seed": source["generation_seed"],
+                "prompt_sha256": hashlib.sha256(source["prompt"].encode()).hexdigest(),
+                "model_id": model_id, "workflow_id": workflow_id, "references": refs,
+            }
+            result["adapter_input"] = adapter_input
+            result["manifest_record"] = {
+                "status": "completed", "prompt_id": "fake-prompt", "seed": source["generation_seed"],
+                "prompt": source["prompt"], "width": request["target_width"], "height": request["target_height"],
+                "references": refs,
+            }
+        return result
 
     def plan_and_validation(self, strategy: str = "ref2va_regenerate"):
         plan = create_hd_plan(self.db_path, self.root, "s1", HDPlanCreate(strategy_type=strategy))
@@ -280,6 +311,191 @@ class HDDeliveryTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(changed.exception.status_code, 409)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM hd_generation_jobs").fetchone()[0], 0)
+
+    def test_source_change_after_submit_fails_before_runner_and_releases_lease(self) -> None:
+        _, validation = self.plan_and_validation()
+        job = submit_hd_job(
+            self.db_path, self.root, "s1",
+            HDSubmitRequest(
+                validation_id=validation["id"], expected_validation_hash=validation["validation_hash"],
+                idempotency_key="stale-after-submit", confirm=True,
+            ),
+        )
+        self.source.write_bytes(b"changed-after-the-frozen-job-was-created")
+        calls: list[dict] = []
+
+        def must_not_run(request: dict, _dry_run: bool) -> dict:
+            calls.append(request)
+            return self.runner(request, False)
+
+        self.assertTrue(process_next_hd_job(self.db_path, self.root, must_not_run, self.probe))
+        self.assertEqual(calls, [])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            failed = dict(db.execute("SELECT * FROM hd_generation_jobs WHERE id = ?", (job["id"],)).fetchone())
+            self.assertEqual(failed["state"], "failed")
+            self.assertEqual(failed["retry_safe"], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM hd_artifacts").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM hd_shot_leases").fetchone()[0], 0)
+        self.assertFalse((self.root / "hd-delivery" / "attempts" / job["id"]).exists())
+
+    def test_reference_change_after_submit_fails_before_runner(self) -> None:
+        reference = self.root / "reference.png"
+        reference.write_bytes(b"trusted-reference")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute(
+                "INSERT INTO assets (id, name, managed_path, checksum_sha256) VALUES (?, ?, ?, ?)",
+                ("a1", "reference", str(reference.resolve()), hashlib.sha256(reference.read_bytes()).hexdigest()),
+            )
+            db.execute(
+                "INSERT INTO shot_references (id, shot_id, asset_id, reference_type, ordinal, role) VALUES (?, ?, ?, ?, ?, ?)",
+                ("ref1", "s1", "a1", "image", 1, "character"),
+            )
+            db.commit()
+        _, validation = self.plan_and_validation()
+        submit_hd_job(
+            self.db_path, self.root, "s1",
+            HDSubmitRequest(
+                validation_id=validation["id"], expected_validation_hash=validation["validation_hash"],
+                idempotency_key="reference-stale-after-submit", confirm=True,
+            ),
+        )
+        reference.write_bytes(b"reference-was-replaced")
+        calls = 0
+
+        def must_not_run(_request: dict, _dry_run: bool) -> dict:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("runner must not be called")
+
+        self.assertTrue(process_next_hd_job(self.db_path, self.root, must_not_run, self.probe))
+        self.assertEqual(calls, 0)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            job = db.execute("SELECT state, retry_safe FROM hd_generation_jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            self.assertEqual(tuple(job), ("failed", 1))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM hd_artifacts").fetchone()[0], 0)
+
+    def test_manifest_mismatch_keeps_full_reconciliation_evidence_without_artifact(self) -> None:
+        _, validation = self.plan_and_validation()
+        submitted = submit_hd_job(
+            self.db_path, self.root, "s1",
+            HDSubmitRequest(
+                validation_id=validation["id"], expected_validation_hash=validation["validation_hash"],
+                idempotency_key="manifest-mismatch", confirm=True,
+            ),
+        )
+
+        def mismatched(request: dict, dry_run: bool) -> dict:
+            result = self.runner(request, dry_run)
+            result["manifest_record"]["seed"] += 1
+            return result
+
+        self.assertTrue(process_next_hd_job(self.db_path, self.root, mismatched, self.probe))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            job = dict(db.execute("SELECT * FROM hd_generation_jobs WHERE id = ?", (submitted["id"],)).fetchone())
+            evidence = json.loads(job["evidence"])
+            self.assertEqual(job["state"], "submission_outcome_unknown")
+            self.assertEqual(evidence["runner_result"]["manifest_record"]["seed"], 43)
+            self.assertTrue(evidence["runner_called"])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM hd_artifacts").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT state FROM hd_shot_leases WHERE job_id = ?", (job["id"],)).fetchone()[0], "unknown")
+        artifact_root = self.root / "hd-delivery" / "artifacts"
+        self.assertEqual(list(artifact_root.glob("*")) if artifact_root.exists() else [], [])
+
+    def test_windows_publication_lock_rejects_probe_time_tamper(self) -> None:
+        _, validation = self.plan_and_validation("deterministic_scale")
+        submit_hd_job(
+            self.db_path, self.root, "s1",
+            HDSubmitRequest(
+                validation_id=validation["id"], expected_validation_hash=validation["validation_hash"],
+                idempotency_key="publication-lock", confirm=True,
+            ),
+        )
+        denied: list[bool] = []
+
+        def hostile_probe(path: Path) -> dict:
+            try:
+                path.chmod(0o600)
+                path.write_bytes(b"tampered-during-final-publication")
+            except OSError:
+                denied.append(True)
+            return self.probe(path)
+
+        self.assertTrue(process_next_hd_job(self.db_path, self.root, self.runner, hostile_probe))
+        self.assertEqual(denied, [True])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            artifact = db.execute("SELECT output_path, output_sha256 FROM hd_artifacts").fetchone()
+            self.assertIsNotNone(artifact)
+            output = Path(artifact[0])
+            self.assertEqual(hashlib.sha256(output.read_bytes()).hexdigest(), artifact[1])
+
+    def test_archive_lease_keeps_queued_job_unclaimed_until_freeze_ends(self) -> None:
+        _, validation = self.plan_and_validation("deterministic_scale")
+        submitted = submit_hd_job(
+            self.db_path, self.root, "s1",
+            HDSubmitRequest(
+                validation_id=validation["id"], expected_validation_hash=validation["validation_hash"],
+                idempotency_key="archive-freeze", confirm=True,
+            ),
+        )
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute(
+                "CREATE TABLE project_archive_leases (project_id TEXT PRIMARY KEY, lease_id TEXT NOT NULL, operation TEXT NOT NULL, created_at TEXT NOT NULL)"
+            )
+            db.execute("INSERT INTO project_archive_leases VALUES ('p1', 'freeze-1', 'archive', 'now')")
+            db.commit()
+        self.assertFalse(process_next_hd_job(self.db_path, self.root, self.runner, self.probe))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT state FROM hd_generation_jobs WHERE id = ?", (submitted["id"],)).fetchone()[0], "queued")
+            db.execute("DELETE FROM project_archive_leases")
+            db.commit()
+        self.assertTrue(process_next_hd_job(self.db_path, self.root, self.runner, self.probe))
+
+    def test_archive_freeze_rejects_hd_dry_run_and_new_submission(self) -> None:
+        plan = create_hd_plan(self.db_path, self.root, "s1", HDPlanCreate(strategy_type="deterministic_scale"))
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute(
+                "CREATE TABLE project_archive_leases (project_id TEXT PRIMARY KEY, lease_id TEXT NOT NULL, operation TEXT NOT NULL, created_at TEXT NOT NULL)"
+            )
+            db.execute("INSERT INTO project_archive_leases VALUES ('p1', 'freeze-1', 'archive', 'now')")
+            db.commit()
+        calls = 0
+
+        def must_not_run(_request: dict, _dry_run: bool) -> dict:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("dry-run adapter must not start while archive is frozen")
+
+        with self.assertRaises(HTTPException) as frozen:
+            validate_hd_plan(
+                self.db_path, self.root,
+                HDValidationRequest(plan_id=plan["id"], expected_plan_hash=plan["plan_hash"]), must_not_run,
+            )
+        self.assertEqual(frozen.exception.status_code, 409)
+        self.assertEqual(calls, 0)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM hd_validation_leases").fetchone()[0], 0)
+            db.execute("DELETE FROM project_archive_leases")
+            db.commit()
+        validation = validate_hd_plan(
+            self.db_path, self.root,
+            HDValidationRequest(plan_id=plan["id"], expected_plan_hash=plan["plan_hash"]), self.runner,
+        )
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("INSERT INTO project_archive_leases VALUES ('p1', 'freeze-2', 'archive', 'now')")
+            db.commit()
+        with self.assertRaises(HTTPException) as blocked:
+            submit_hd_job(
+                self.db_path, self.root, "s1",
+                HDSubmitRequest(
+                    validation_id=validation["id"], expected_validation_hash=validation["validation_hash"],
+                    idempotency_key="frozen-new-submit", confirm=True,
+                ),
+            )
+        self.assertEqual(blocked.exception.status_code, 409)
         with closing(sqlite3.connect(self.db_path)) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM hd_generation_jobs").fetchone()[0], 0)
 

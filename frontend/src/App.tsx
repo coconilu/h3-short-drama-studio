@@ -84,6 +84,10 @@ const api = async <T,>(path: string, options?: ApiOptions): Promise<T> => {
   const headers = new Headers(options?.headers)
   if (!(options?.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
   const controller = new AbortController()
+  const callerSignal = options?.signal
+  const cancelFromCaller = () => controller.abort()
+  if (callerSignal?.aborted) controller.abort()
+  else callerSignal?.addEventListener('abort', cancelFromCaller, { once: true })
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
   try {
     const response = await fetch(path, { ...fetchOptions, headers, signal: controller.signal })
@@ -103,11 +107,15 @@ const api = async <T,>(path: string, options?: ApiOptions): Promise<T> => {
     }
     return response.json()
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') throw new Error(`API 响应超时（${timeoutMs / 1000} 秒）`)
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      if (callerSignal?.aborted) throw error
+      throw new Error(`API 响应超时（${timeoutMs / 1000} 秒）`)
+    }
     if (error instanceof TypeError) throw new Error('无法连接镜场 API，正在自动重试')
     throw error
   } finally {
     window.clearTimeout(timeout)
+    callerSignal?.removeEventListener('abort', cancelFromCaller)
   }
 }
 
@@ -187,7 +195,7 @@ function App() {
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([])
   const [deliveryWorkspace, setDeliveryWorkspace] = useState<DeliveryWorkspace | null>(null)
   const [acceptance, setAcceptance] = useState<ProductionAcceptance | null>(null)
-  const [selectedShotId, setSelectedShotId] = useState('EP01-S01-03')
+  const [selectedShotId, setSelectedShotId] = useState('')
   const [candidates, setCandidates] = useState<Candidate[]>([])
   const [promotions, setPromotions] = useState<Promotion[]>([])
   const [reviewWorkspace, setReviewWorkspace] = useState<ReviewWorkspace | null>(null)
@@ -201,26 +209,30 @@ function App() {
   const [modal, setModal] = useState<'new' | 'project' | 'confirm' | null>(null)
   const initialPreferencesApplied = useRef(false)
   const apiOnlineRef = useRef(true)
+  const projectSwitchSequence = useRef(0)
+  const projectSwitchController = useRef<AbortController | null>(null)
 
   const selectedShot = useMemo(
     () => project?.shots.find((shot) => shot.id === selectedShotId) || project?.shots[0],
     [project, selectedShotId],
   )
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (signal?: AbortSignal) => {
+    const requestOptions = signal ? { signal } : undefined
     const [projectData, workbenchData, settingsData, healthData, assetData, jobData, roughCutData, preflightData, exportRunData, deliveryData, acceptanceData] = await Promise.all([
-      api<Project>('/api/project'),
-      api<Workbench>('/api/workbench'),
-      api<WorkspaceSettings>('/api/settings'),
-      api<Health>('/api/health'),
-      api<Asset[]>('/api/assets'),
-      api<Job[]>('/api/jobs'),
-      api<RoughCut>('/api/exports/current'),
-      api<ExportPreflight>('/api/exports/preflight'),
-      api<ExportRun[]>('/api/exports'),
-      api<DeliveryWorkspace>('/api/delivery-plan'),
-      api<ProductionAcceptance>('/api/acceptance'),
+      api<Project>('/api/project', requestOptions),
+      api<Workbench>('/api/workbench', requestOptions),
+      api<WorkspaceSettings>('/api/settings', requestOptions),
+      api<Health>('/api/health', requestOptions),
+      api<Asset[]>('/api/assets', requestOptions),
+      api<Job[]>('/api/jobs', requestOptions),
+      api<RoughCut>('/api/exports/current', requestOptions),
+      api<ExportPreflight>('/api/exports/preflight', requestOptions),
+      api<ExportRun[]>('/api/exports', requestOptions),
+      api<DeliveryWorkspace>('/api/delivery-plan', requestOptions),
+      api<ProductionAcceptance>('/api/acceptance', requestOptions),
     ])
+    if (signal?.aborted) return
     setProject(projectData)
     setWorkbench(workbenchData)
     setSettings(settingsData)
@@ -240,12 +252,12 @@ function App() {
     }
   }, [])
 
-  const refreshShotReview = useCallback(async (shotId: string) => {
+  const refreshShotReview = useCallback(async (shotId: string, signal?: AbortSignal) => {
     const [candidateData, promotionData, referenceData, reviewData] = await Promise.all([
-      api<Candidate[]>(`/api/shots/${shotId}/candidates`),
-      api<Promotion[]>(`/api/shots/${shotId}/promotions`),
-      api<ShotReference[]>(`/api/shots/${shotId}/references`),
-      api<ReviewWorkspace>(`/api/shots/${shotId}/review-workspace`),
+      api<Candidate[]>(`/api/shots/${shotId}/candidates`, { signal }),
+      api<Promotion[]>(`/api/shots/${shotId}/promotions`, { signal }),
+      api<ShotReference[]>(`/api/shots/${shotId}/references`, { signal }),
+      api<ReviewWorkspace>(`/api/shots/${shotId}/review-workspace`, { signal }),
     ])
     setCandidates(candidateData)
     setPromotions(promotionData)
@@ -308,14 +320,27 @@ function App() {
   }, [project, refresh])
 
   useEffect(() => {
-    if (!selectedShotId) return
-    refreshShotReview(selectedShotId).catch(() => {
+    const belongsToLoadedProject = Boolean(
+      project && selectedShotId && project.shots.some(shot => shot.id === selectedShotId),
+    )
+    if (!belongsToLoadedProject) {
       setCandidates([])
       setPromotions([])
       setReferences([])
       setReviewWorkspace(null)
+      return
+    }
+    const controller = new AbortController()
+    refreshShotReview(selectedShotId, controller.signal).catch((error) => {
+      if (controller.signal.aborted) return
+      setCandidates([])
+      setPromotions([])
+      setReferences([])
+      setReviewWorkspace(null)
+      setNotice(error instanceof Error ? error.message : '镜头子资源加载失败')
     })
-  }, [selectedShotId, jobs, refreshShotReview])
+    return () => controller.abort()
+  }, [project?.id, selectedShotId, jobs, refreshShotReview])
 
   const syncShot = useCallback(async (shotId: string, announce = true) => {
     try {
@@ -403,19 +428,31 @@ function App() {
   }
 
   const switchProject = async (projectId: string, destination?: 'overview' | 'planning' | 'script' | 'storyboard' | 'assets') => {
-    if (projectId === project?.id) {
+    const hadPendingSwitch = projectSwitchController.current !== null
+    const sequence = projectSwitchSequence.current + 1
+    projectSwitchSequence.current = sequence
+    projectSwitchController.current?.abort()
+    projectSwitchController.current = null
+    if (projectId === project?.id && !hadPendingSwitch) {
       if (destination) setActivePage(destination)
       return
     }
+    const controller = new AbortController()
+    projectSwitchController.current = controller
     setNotice('正在切换项目工作区…')
     try {
-      const activated = await api<Project>(`/api/projects/${projectId}/activate`, { method: 'POST' })
+      const activated = await api<Project>(`/api/projects/${projectId}/activate`, { method: 'POST', signal: controller.signal })
+      if (controller.signal.aborted || projectSwitchSequence.current !== sequence) return
       setSelectedShotId(activated.shots[0]?.id || '')
-      await refresh()
+      await refresh(controller.signal)
+      if (controller.signal.aborted || projectSwitchSequence.current !== sequence) return
       if (destination) setActivePage(destination)
       setNotice(`已切换到“${activated.title}”`)
     } catch (error) {
+      if (controller.signal.aborted || projectSwitchSequence.current !== sequence) return
       setNotice(error instanceof Error ? error.message : '项目切换失败')
+    } finally {
+      if (projectSwitchSequence.current === sequence) projectSwitchController.current = null
     }
   }
 

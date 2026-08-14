@@ -4,8 +4,10 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from backend import app as studio
+from backend.hd_delivery import HDRunnerError
 
 
 class HDFFmpegIntegrationTests(unittest.TestCase):
@@ -74,7 +76,8 @@ class HDFFmpegIntegrationTests(unittest.TestCase):
         self.assertEqual(dry_run["workflow_id"], "deterministic-scale-contain-v1")
         self.assertFalse(Path(dry_run["command"]["output"]).exists())
 
-        result = studio.run_hd_operation(request, False)
+        attempt_root = studio.COMFY_OUTPUT_ROOT / "hd-delivery" / "attempts" / "real-attempt" / "output"
+        result = studio.run_hd_operation({**request, "attempt_output_root": str(attempt_root)}, False)
         self.assertFalse(result["gpu_submitted"])
         output = Path(result["output_file"])
         self.assertTrue(output.is_file())
@@ -82,6 +85,39 @@ class HDFFmpegIntegrationTests(unittest.TestCase):
         self.assertEqual((probe["width"], probe["height"]), (1344, 768))
         self.assertEqual(probe["has_audio"], 1)
         self.assertGreater(probe["duration_seconds"], 0.5)
+
+    def test_project_slug_traversal_is_rejected_before_dry_run_or_process_side_effects(self) -> None:
+        request = {
+            "strategy_type": "deterministic_scale",
+            "target_width": 1344,
+            "target_height": 768,
+            "plan_hash": "d" * 64,
+            "expected_artifact_id": "safe-artifact",
+            "source": {
+                "shot_id": "fixture-shot",
+                "h3_project": "../outside",
+                "prompt": "must never reach an adapter",
+                "media": {"path": str(self.source)},
+            },
+        }
+        outside = studio.COMFY_OUTPUT_ROOT.parent / "outside"
+        with patch.object(studio.subprocess, "run") as process:
+            with self.assertRaises(HDRunnerError) as dry_run:
+                studio.run_hd_operation(request, True)
+            self.assertFalse(dry_run.exception.process_started)
+            with self.assertRaises(HDRunnerError) as actual:
+                studio.run_hd_operation(
+                    {
+                        **request,
+                        "attempt_output_root": str(
+                            studio.COMFY_OUTPUT_ROOT / "hd-delivery" / "attempts" / "safe-attempt" / "output"
+                        ),
+                    },
+                    False,
+                )
+            self.assertFalse(actual.exception.process_started)
+            process.assert_not_called()
+        self.assertFalse(outside.exists())
 
 
 if __name__ == "__main__":

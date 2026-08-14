@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import shutil
 import sqlite3
 import subprocess
 import threading
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -106,6 +109,14 @@ def init_hd_schema(db: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_hd_validations_plan ON hd_validations(plan_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS hd_validation_leases (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          shot_id TEXT NOT NULL UNIQUE REFERENCES shots(id) ON DELETE CASCADE,
+          plan_id TEXT NOT NULL REFERENCES hd_strategy_versions(id) ON DELETE CASCADE,
+          created_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS hd_generation_jobs (
           id TEXT PRIMARY KEY,
@@ -352,6 +363,18 @@ def _references(db: sqlite3.Connection, shot_id: str) -> list[dict[str, Any]]:
         (shot_id,),
     ).fetchall():
         item = dict(row)
+        raw_path = str(item.get("managed_path") or "")
+        expected_sha = str(item.get("checksum_sha256") or "").lower()
+        if not raw_path or not Path(raw_path).is_absolute() or len(expected_sha) != 64:
+            raise HTTPException(409, f"参考素材 {item.get('asset_id')} 缺少规范化受管路径或 SHA-256")
+        path = Path(raw_path).resolve()
+        if not path.is_file():
+            raise HTTPException(409, f"参考素材 {item.get('asset_id')} 文件不存在")
+        current_sha = _sha256(path).lower()
+        if current_sha != expected_sha:
+            raise HTTPException(409, f"参考素材 {item.get('asset_id')} 的文件与冻结 SHA-256 不一致")
+        item["managed_path"] = str(path)
+        item["size_bytes"] = path.stat().st_size
         records.append(item)
     return records
 
@@ -423,6 +446,179 @@ def _source_matches(current: dict[str, Any], frozen: dict[str, Any]) -> bool:
     )
 
 
+def _safe_component(value: str, label: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}", value) or value in {".", ".."}:
+        raise HDRunnerError(f"{label} 不是安全路径标识", process_started=False)
+    return value
+
+
+def _attempt_root(output_root: Path, job_id: str) -> Path:
+    root = (output_root.resolve() / "hd-delivery" / "attempts").resolve()
+    path = (root / _safe_component(job_id, "高清任务 ID")).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise HDRunnerError("高清任务 staging 越过受管目录", process_started=False) from exc
+    return path
+
+
+def _cleanup_attempt_staging(output_root: Path, job_id: str) -> None:
+    path = _attempt_root(output_root, job_id)
+    if not path.exists():
+        return
+
+    def writable_then_retry(function: Any, raw_path: str, _error: Any) -> None:
+        os.chmod(raw_path, 0o700)
+        function(raw_path)
+
+    shutil.rmtree(path, onerror=writable_then_retry)
+
+
+def _copy_stable(source: Path, destination: Path, expected_sha: str) -> dict[str, Any]:
+    before_size = source.stat().st_size
+    before_sha = _sha256(source).lower()
+    if len(expected_sha) != 64 or before_sha != expected_sha.lower():
+        raise HDRunnerError("高清输入在 staging 前已变化", process_started=False)
+    temporary = destination.parent / f".{destination.name}-{uuid.uuid4().hex}.tmp"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        after_size = source.stat().st_size
+        after_sha = _sha256(source).lower()
+        staged_sha = _sha256(temporary).lower()
+        if before_size != after_size or before_sha != after_sha or staged_sha != expected_sha.lower():
+            raise HDRunnerError("高清输入在 staging 复制期间发生变化", process_started=False)
+        temporary.replace(destination)
+        os.chmod(destination, 0o444)
+        return {
+            "path": str(destination.resolve()), "size_bytes": destination.stat().st_size,
+            "checksum_sha256": staged_sha, "original_path": str(source.resolve()),
+        }
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _stage_execution_inputs(output_root: Path, job: dict[str, Any], request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    root = _attempt_root(output_root, job["id"])
+    _cleanup_attempt_staging(output_root, job["id"])
+    input_root = root / "inputs"
+    output_path = root / "output"
+    root.mkdir(parents=True, exist_ok=False)
+    input_root.mkdir(exist_ok=False)
+    output_path.mkdir(exist_ok=False)
+    try:
+        frozen_source = request.get("source") if isinstance(request.get("source"), dict) else {}
+        media = frozen_source.get("media") if isinstance(frozen_source.get("media"), dict) else {}
+        source_path = Path(str(media.get("path") or "")).resolve()
+        source_suffix = source_path.suffix.lower() if re.fullmatch(r"\.[a-z0-9]{1,8}", source_path.suffix.lower()) else ".media"
+        source_copy = _copy_stable(
+            source_path, input_root / f"source-{str(media.get('checksum_sha256')).lower()}{source_suffix}",
+            str(media.get("checksum_sha256") or ""),
+        )
+        staged_references: list[dict[str, Any]] = []
+        for index, reference in enumerate(frozen_source.get("references") or [], 1):
+            reference_path = Path(str(reference.get("managed_path") or "")).resolve()
+            suffix = reference_path.suffix.lower() if re.fullmatch(r"\.[a-z0-9]{1,8}", reference_path.suffix.lower()) else ".media"
+            copy = _copy_stable(
+                reference_path,
+                input_root / f"ref-{index:03d}-{str(reference.get('checksum_sha256')).lower()}{suffix}",
+                str(reference.get("checksum_sha256") or ""),
+            )
+            staged_references.append({**reference, "managed_path": copy["path"], "staged": copy})
+        staged_source = {
+            **frozen_source,
+            "media": {**media, **source_copy, "staged": True},
+            "references": staged_references,
+        }
+        staged_request = {
+            **request, "source": staged_source, "attempt_output_root": str(output_path.resolve()),
+            "attempt_id": job["id"],
+        }
+        staging = {
+            "root": str(root.resolve()), "source": source_copy,
+            "references": [item["staged"] for item in staged_references],
+            "output_root": str(output_path.resolve()),
+        }
+        return staged_request, staging
+    except Exception:
+        _cleanup_attempt_staging(output_root, job["id"])
+        raise
+
+
+def _verify_staging_snapshot(output_root: Path, job_id: str, staging: dict[str, Any]) -> None:
+    root = _attempt_root(output_root, job_id)
+    if Path(str(staging.get("root") or "")).resolve() != root:
+        raise HDRunnerError("高清任务 staging 根目录凭证不一致", process_started=False)
+    records = [staging.get("source"), *(staging.get("references") or [])]
+    for record in records:
+        if not isinstance(record, dict):
+            raise HDRunnerError("高清任务 staging 输入凭证不完整", process_started=False)
+        path = Path(str(record.get("path") or "")).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise HDRunnerError("高清任务 staging 输入越过受管目录", process_started=False) from exc
+        current = _file_snapshot(path)
+        if current["checksum_sha256"] != record.get("checksum_sha256") or current["size_bytes"] != record.get("size_bytes"):
+            raise HDRunnerError("高清任务 staged 输入已变化", process_started=False)
+
+
+def _execution_gate(
+    db_path: Path, output_root: Path, job: dict[str, Any], staging: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        current_job = db.execute(
+            "SELECT * FROM hd_generation_jobs WHERE id = ? AND state = 'running' AND revision = ?",
+            (job["id"], job["revision"]),
+        ).fetchone()
+        lease = db.execute(
+            "SELECT * FROM hd_shot_leases WHERE shot_id = ? AND job_id = ? AND state = 'active'",
+            (job["shot_id"], job["id"]),
+        ).fetchone()
+        project = db.execute("SELECT * FROM projects WHERE id = ?", (job["project_id"],)).fetchone()
+        frozen = db.execute(
+            "SELECT 1 FROM project_archive_leases WHERE project_id = ?",
+            (job["project_id"],),
+        ).fetchone() if _table_exists(db, "project_archive_leases") else None
+        if not current_job or not lease:
+            raise HDRunnerError("高清任务 claim/lease 已变化", process_started=False)
+        if not project or ("archived" in project.keys() and project["archived"]):
+            raise HDRunnerError("高清任务所属项目已归档", process_started=False)
+        if frozen:
+            raise HDRunnerError("项目正在冻结归档，高清任务禁止启动", process_started=False)
+        plan, current_source = _require_latest_plan(db, job["project_id"], job["plan_id"], output_root)
+        if plan["plan_hash"] != job["plan_hash"]:
+            raise HDRunnerError("高清任务 plan hash 已变化", process_started=False)
+        command = _json(current_job["command_snapshot"], {})
+        request = command.get("request") if isinstance(command.get("request"), dict) else command
+        if (
+            request.get("plan_hash") != plan["plan_hash"]
+            or request.get("source") != plan["source_snapshot"]
+            or not _source_matches(current_source, plan["source_snapshot"])
+        ):
+            raise HDRunnerError("高清任务冻结 master/source/reference 已变化", process_started=False)
+        validation = db.execute(
+            "SELECT * FROM hd_validations WHERE id = ? AND plan_id = ? AND validation_hash = ?",
+            (job["validation_id"], job["plan_id"], job["validation_hash"]),
+        ).fetchone()
+        if not validation:
+            raise HDRunnerError("高清任务 dry-run 凭证已变化", process_started=False)
+        if staging is not None:
+            _verify_staging_snapshot(output_root, job["id"], staging)
+            evidence = _json(current_job["evidence"], {})
+            evidence["execution_gate"] = {"checked_at": utc_now(), "staging": staging}
+            db.execute(
+                "UPDATE hd_generation_jobs SET evidence = ?, updated_at = ? WHERE id = ? AND state = 'running' AND revision = ?",
+                (json.dumps(evidence, ensure_ascii=False, sort_keys=True), utc_now(), job["id"], job["revision"]),
+            )
+        db.commit()
+        return plan
+
+
 def _validate_target(width: int, height: int) -> None:
     if width % 32 or height % 32:
         raise HTTPException(422, "H3 目标宽高都必须能被 32 整除")
@@ -476,6 +672,11 @@ def create_hd_plan(db_path: Path, output_root: Path, shot_id: str, payload: HDPl
         db.execute("BEGIN IMMEDIATE")
         project = _active_project(db)
         source = _current_master_source(db, project["id"], shot_id, output_root)
+        if payload.strategy_type != "deterministic_scale":
+            # A model regeneration must carry the exact seed that will be sent
+            # to the adapter.  If the historical master has no seed, freeze a
+            # new one now instead of later claiming that a random run reused it.
+            source["generation_seed"] = int(source["seed"]) if source.get("seed") is not None else int.from_bytes(os.urandom(8), "big") % (2**63)
         revision = int(db.execute(
             "SELECT COALESCE(MAX(revision), 0) + 1 FROM hd_strategy_versions WHERE shot_id = ?", (shot_id,),
         ).fetchone()[0])
@@ -531,47 +732,80 @@ def _require_latest_plan(db: sqlite3.Connection, project_id: str, plan_id: str, 
 def validate_hd_plan(
     db_path: Path, output_root: Path, payload: HDValidationRequest, runner: HDRunner,
 ) -> dict[str, Any]:
-    with closing(connect(db_path)) as db:
-        project = _active_project(db)
-        plan, _ = _require_latest_plan(db, project["id"], payload.plan_id, output_root)
-    if plan["plan_hash"] != payload.expected_plan_hash:
-        raise HTTPException(409, "高清策略 plan hash 已变化")
-    request = {
-        "operation": "hd_promote", "plan_id": plan["id"], "plan_hash": plan["plan_hash"],
-        "strategy_type": plan["strategy_type"], "target_width": plan["target_width"],
-        "target_height": plan["target_height"], "source": plan["source_snapshot"],
-    }
-    result = runner(request, True)
-    if result.get("gpu_submitted"):
-        raise HTTPException(502, "高清 dry-run 适配器错误地提交了 GPU 任务")
-    adapter_command = result.get("command") if isinstance(result.get("command"), dict) else request
-    command = {"request": request, "adapter_command": adapter_command}
-    adapter = str(result.get("adapter") or "unknown")
-    model_id = str(result.get("model_id") or ("ffmpeg-lanczos" if plan["strategy_type"] == "deterministic_scale" else "unverified"))
-    workflow_id = str(result.get("workflow_id") or "unverified")
-    evidence = {**result, "gpu_submitted": False, "plan_hash": plan["plan_hash"]}
-    validation_hash = _canonical_hash({"plan": plan, "command": command, "adapter": adapter, "model_id": model_id, "workflow_id": workflow_id})
+    lease_id = f"hd-validation-lease-{uuid.uuid4().hex[:12]}"
+    lease_acquired = False
     with closing(connect(db_path)) as db:
         db.execute("BEGIN IMMEDIATE")
         project = _active_project(db)
-        current_plan, _ = _require_latest_plan(db, project["id"], payload.plan_id, output_root)
-        if current_plan["plan_hash"] != payload.expected_plan_hash:
-            raise HTTPException(409, "dry-run 期间高清策略发生变化，结果未保存")
-        validation_id = f"hd-validation-{uuid.uuid4().hex[:12]}"
-        db.execute(
-            """INSERT INTO hd_validations
-            (id, project_id, shot_id, plan_id, plan_hash, validation_hash, adapter, model_id,
-             workflow_id, command_snapshot, evidence, gpu_submitted, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
-            (
-                validation_id, project["id"], current_plan["shot_id"], current_plan["id"], current_plan["plan_hash"],
-                validation_hash, adapter, model_id, workflow_id, json.dumps(command, ensure_ascii=False, sort_keys=True),
-                json.dumps(evidence, ensure_ascii=False, sort_keys=True), utc_now(),
-            ),
-        )
-        row = db.execute("SELECT * FROM hd_validations WHERE id = ?", (validation_id,)).fetchone()
+        if _table_exists(db, "project_archive_leases") and db.execute(
+            "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project["id"],),
+        ).fetchone():
+            raise HTTPException(409, "项目正在冻结归档，禁止启动高清 dry-run")
+        plan, _ = _require_latest_plan(db, project["id"], payload.plan_id, output_root)
+        if plan["plan_hash"] != payload.expected_plan_hash:
+            raise HTTPException(409, "高清策略 plan hash 已变化")
+        try:
+            db.execute(
+                "INSERT INTO hd_validation_leases (id, project_id, shot_id, plan_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                (lease_id, project["id"], plan["shot_id"], plan["id"], utc_now()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "这个镜头已有进行中的高清 dry-run") from exc
         db.commit()
-        return _validation_public(row)
+        lease_acquired = True
+    try:
+        request = {
+            "operation": "hd_promote", "plan_id": plan["id"], "plan_hash": plan["plan_hash"],
+            "strategy_type": plan["strategy_type"], "target_width": plan["target_width"],
+            "target_height": plan["target_height"], "source": plan["source_snapshot"],
+        }
+        result = runner(request, True)
+        if result.get("gpu_submitted"):
+            raise HTTPException(502, "高清 dry-run 适配器错误地提交了 GPU 任务")
+        adapter_command = result.get("command") if isinstance(result.get("command"), dict) else request
+        command = {"request": request, "adapter_command": adapter_command}
+        adapter = str(result.get("adapter") or "unknown")
+        model_id = str(result.get("model_id") or ("ffmpeg-lanczos" if plan["strategy_type"] == "deterministic_scale" else "unverified"))
+        workflow_id = str(result.get("workflow_id") or "unverified")
+        evidence = {**result, "gpu_submitted": False, "plan_hash": plan["plan_hash"]}
+        validation_hash = _canonical_hash({"plan": plan, "command": command, "adapter": adapter, "model_id": model_id, "workflow_id": workflow_id})
+        with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            project = _active_project(db)
+            lease = db.execute(
+                "SELECT 1 FROM hd_validation_leases WHERE id = ? AND project_id = ? AND plan_id = ?",
+                (lease_id, project["id"], payload.plan_id),
+            ).fetchone()
+            frozen = _table_exists(db, "project_archive_leases") and db.execute(
+                "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project["id"],),
+            ).fetchone()
+            if not lease or frozen:
+                raise HTTPException(409, "高清 dry-run 返回时项目归档冻结或 lease 已变化，结果未保存")
+            current_plan, _ = _require_latest_plan(db, project["id"], payload.plan_id, output_root)
+            if current_plan["plan_hash"] != payload.expected_plan_hash:
+                raise HTTPException(409, "dry-run 期间高清策略发生变化，结果未保存")
+            validation_id = f"hd-validation-{uuid.uuid4().hex[:12]}"
+            db.execute(
+                """INSERT INTO hd_validations
+                (id, project_id, shot_id, plan_id, plan_hash, validation_hash, adapter, model_id,
+                 workflow_id, command_snapshot, evidence, gpu_submitted, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                (
+                    validation_id, project["id"], current_plan["shot_id"], current_plan["id"], current_plan["plan_hash"],
+                    validation_hash, adapter, model_id, workflow_id, json.dumps(command, ensure_ascii=False, sort_keys=True),
+                    json.dumps(evidence, ensure_ascii=False, sort_keys=True), utc_now(),
+                ),
+            )
+            db.execute("DELETE FROM hd_validation_leases WHERE id = ?", (lease_id,))
+            row = db.execute("SELECT * FROM hd_validations WHERE id = ?", (validation_id,)).fetchone()
+            db.commit()
+            lease_acquired = False
+            return _validation_public(row)
+    finally:
+        if lease_acquired:
+            with closing(connect(db_path)) as db:
+                db.execute("DELETE FROM hd_validation_leases WHERE id = ?", (lease_id,))
+                db.commit()
 
 
 def submit_hd_job(db_path: Path, output_root: Path, shot_id: str, payload: HDSubmitRequest) -> dict[str, Any]:
@@ -589,6 +823,10 @@ def submit_hd_job(db_path: Path, output_root: Path, shot_id: str, payload: HDSub
                 raise HTTPException(409, "幂等键已用于其他高清提交")
             db.commit()
             return _job_public(existing)
+        if _table_exists(db, "project_archive_leases") and db.execute(
+            "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project["id"],),
+        ).fetchone():
+            raise HTTPException(409, "项目正在冻结归档，禁止提交高清任务")
         validation_row = db.execute(
             "SELECT * FROM hd_validations WHERE id = ? AND project_id = ? AND shot_id = ?",
             (payload.validation_id, project["id"], shot_id),
@@ -668,10 +906,97 @@ def _default_probe(path: Path) -> dict[str, Any]:
     }
 
 
+@contextmanager
+def _hold_no_write_or_delete(path: Path):
+    """Hold a Windows share-mode lock while evidence is read and committed."""
+    if os.name != "nt":
+        raise HDRunnerError("当前平台无法提供高清产物的 OS 级禁写/禁删锁", process_started=True)
+    import ctypes
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    handle = create_file(str(path), 0x80000000, 0x00000001, None, 3, 0x00000080, None)
+    invalid = ctypes.c_void_p(-1).value
+    if handle == invalid:
+        error = ctypes.get_last_error()
+        raise HDRunnerError(
+            f"无法锁定高清产物 {path.name}（Windows {error}: {ctypes.FormatError(error).strip()}）",
+            process_started=True,
+        )
+    try:
+        yield
+    finally:
+        close_handle(handle)
+
+
+def _allowed_attempt_output(raw_path: str | None, output_root: Path, job_id: str) -> Path:
+    path = Path(str(raw_path or "")).resolve()
+    root = (_attempt_root(output_root, job_id) / "output").resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise HDRunnerError("适配器输出不在本次高清任务私有 staging", process_started=True) from exc
+    if not path.is_file():
+        raise HDRunnerError("高清 staging 产物不存在", process_started=True)
+    return path
+
+
+def _publish_hd_output(output_root: Path, job: dict[str, Any], staged: Path) -> tuple[Path, dict[str, Any]]:
+    artifact_root = (output_root.resolve() / "hd-delivery" / "artifacts").resolve()
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    with _hold_no_write_or_delete(staged):
+        staged_snapshot = _file_snapshot(staged)
+        suffix = staged.suffix.lower() if re.fullmatch(r"\.[a-z0-9]{1,8}", staged.suffix.lower()) else ".media"
+        artifact_name = f"{_safe_component(job['expected_artifact_id'], '高清产物 ID')}-{staged_snapshot['checksum_sha256']}{suffix}"
+        final_path = (artifact_root / artifact_name).resolve()
+        try:
+            final_path.relative_to(artifact_root)
+        except ValueError as exc:
+            raise HDRunnerError("高清产物发布路径越界", process_started=True) from exc
+        temporary = artifact_root / f".{artifact_name}-{uuid.uuid4().hex}.tmp"
+        try:
+            with staged.open("rb") as source_handle, temporary.open("xb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
+            copied = _file_snapshot(temporary)
+            staged_after = _file_snapshot(staged)
+            if staged_after != staged_snapshot or copied["checksum_sha256"] != staged_snapshot["checksum_sha256"] or copied["size_bytes"] != staged_snapshot["size_bytes"]:
+                raise HDRunnerError("高清 staging 产物在发布复制期间发生变化", process_started=True)
+            if final_path.exists():
+                existing = _file_snapshot(final_path)
+                if existing["checksum_sha256"] != staged_snapshot["checksum_sha256"]:
+                    raise HDRunnerError("高清内容寻址发布路径已被其他内容占用", process_started=True)
+                temporary.unlink(missing_ok=True)
+            else:
+                temporary.replace(final_path)
+            os.chmod(final_path, 0o444)
+            return final_path, staged_snapshot
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def _claim_job(db_path: Path) -> dict[str, Any] | None:
     with closing(connect(db_path)) as db:
         db.execute("BEGIN IMMEDIATE")
-        pending = db.execute("SELECT * FROM hd_generation_jobs WHERE state = 'queued' ORDER BY created_at LIMIT 1").fetchone()
+        archive_filter = (
+            "AND NOT EXISTS (SELECT 1 FROM project_archive_leases leases WHERE leases.project_id = jobs.project_id)"
+            if _table_exists(db, "project_archive_leases") else ""
+        )
+        pending = db.execute(
+            f"""SELECT jobs.* FROM hd_generation_jobs jobs
+            JOIN projects ON projects.id = jobs.project_id AND COALESCE(projects.archived, 0) = 0
+            WHERE jobs.state = 'queued' {archive_filter}
+            ORDER BY jobs.created_at LIMIT 1"""
+        ).fetchone()
         if not pending:
             db.commit()
             return None
@@ -690,77 +1015,155 @@ def _claim_job(db_path: Path) -> dict[str, Any] | None:
         return _job_public(row)
 
 
+def _verify_completion_evidence(plan: dict[str, Any], result: dict[str, Any]) -> tuple[str, str]:
+    strategy = plan["strategy_type"]
+    source = plan["source_snapshot"]
+    model_id = str(result.get("model_id") or "")
+    workflow_id = str(result.get("workflow_id") or "")
+    if strategy == "deterministic_scale":
+        if result.get("gpu_submitted") or model_id != "ffmpeg-lanczos" or workflow_id != "deterministic-scale-contain-v1":
+            raise HDRunnerError("确定性缩放返回了错误的模型、工作流或 GPU 证据", process_started=True)
+        return model_id, workflow_id
+    expected_model = (
+        "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+        if strategy == "ref2va_regenerate" or source.get("original_mode") == "ref2va"
+        else "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+    )
+    expected_workflow = "h3-ref2va-regenerate-v2" if strategy == "ref2va_regenerate" else f"h3-draft-{source.get('original_mode')}-target-v2"
+    adapter_input = result.get("adapter_input")
+    record = result.get("manifest_record")
+    if not result.get("gpu_submitted") or model_id != expected_model or workflow_id != expected_workflow:
+        raise HDRunnerError("模型重生成返回的 model/workflow/GPU 证据不一致", process_started=True)
+    if not isinstance(adapter_input, dict) or not isinstance(record, dict):
+        raise HDRunnerError("模型重生成缺少精确 adapter input 或 manifest 记录", process_started=True)
+    expected_seed = source.get("generation_seed")
+    expected_prompt_sha = hashlib.sha256(str(source.get("prompt") or "").encode("utf-8")).hexdigest()
+    if (
+        adapter_input.get("seed") != expected_seed
+        or adapter_input.get("prompt_sha256") != expected_prompt_sha
+        or adapter_input.get("model_id") != expected_model
+        or adapter_input.get("workflow_id") != expected_workflow
+        or record.get("seed") != expected_seed
+        or hashlib.sha256(str(record.get("prompt") or "").encode("utf-8")).hexdigest() != expected_prompt_sha
+        or int(record.get("width") or 0) != int(plan["target_width"])
+        or int(record.get("height") or 0) != int(plan["target_height"])
+        or record.get("status") != "completed"
+        or not record.get("prompt_id")
+    ):
+        raise HDRunnerError("模型重生成 manifest 的 seed/prompt/spec/task 与冻结输入不一致", process_started=True)
+    if adapter_input.get("references") != record.get("references"):
+        raise HDRunnerError("模型重生成 manifest 的参考素材与实际 adapter input 不一致", process_started=True)
+    return model_id, workflow_id
+
+
+def _remove_published(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        os.chmod(path, 0o600)
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _complete_hd_job(db_path: Path, output_root: Path, job: dict[str, Any], result: dict[str, Any], probe: MediaProbe) -> None:
-    output = _allowed_media(result.get("output_file"), output_root)
-    media = _file_snapshot(output)
-    technical = probe(output)
-    if not technical.get("ok"):
-        raise HDRunnerError("高清产物技术检查未通过：" + "；".join(technical.get("issues") or []), process_started=True)
-    with closing(connect(db_path)) as db:
-        db.execute("BEGIN IMMEDIATE")
-        current_job = db.execute("SELECT * FROM hd_generation_jobs WHERE id = ? AND state = 'running'", (job["id"],)).fetchone()
-        if not current_job or int(current_job["revision"]) != int(job["revision"]):
-            raise HDRunnerError("高清任务完成 CAS 失败，保留为待人工对账", process_started=True)
-        project = db.execute("SELECT * FROM projects WHERE id = ?", (job["project_id"],)).fetchone()
-        if not project:
-            raise HDRunnerError("高清任务所属项目已不存在", process_started=True)
-        plan, _ = _require_plan(db, job["project_id"], job["plan_id"], output_root)
-        if plan["plan_hash"] != job["plan_hash"]:
-            raise HDRunnerError("高清任务运行期间 plan hash 变化", process_started=True)
-        source = plan["source_snapshot"]
-        version = int(db.execute(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM hd_artifacts WHERE shot_id = ?", (job["shot_id"],),
-        ).fetchone()[0])
-        artifact_id = current_job["expected_artifact_id"]
-        model_id = str(result.get("model_id") or ("ffmpeg-lanczos" if plan["strategy_type"] == "deterministic_scale" else "unverified"))
-        workflow_id = str(result.get("workflow_id") or "unverified")
-        spec = {
-            "requested": {"width": plan["target_width"], "height": plan["target_height"]},
-            "actual": {
-                "width": int((technical.get("video") or {}).get("width") or 0),
-                "height": int((technical.get("video") or {}).get("height") or 0),
-                "duration_seconds": float(technical.get("duration_seconds") or 0),
-            },
-        }
-        if spec["actual"]["width"] < plan["target_width"] or spec["actual"]["height"] < plan["target_height"]:
-            raise HDRunnerError("高清产物未达到目标规格", process_started=True)
-        provenance = {
-            "schema_version": 1, "strategy": _strategy_public(plan["strategy_type"]),
-            "plan_id": plan["id"], "plan_hash": plan["plan_hash"], "validation_id": job["validation_id"],
-            "job_id": job["id"], "attempt": job["attempt"], "model_id": model_id, "workflow_id": workflow_id,
-            "prompt": source["prompt"], "seed": source.get("seed"), "source_spec": source.get("spec"),
-            "target_spec": spec, "references": source.get("references", []), "source_media": source["media"],
-            "output_media": media, "adapter_result": result, "technical_probe": technical,
-        }
-        db.execute(
-            """INSERT INTO hd_artifacts
-            (id, project_id, shot_id, job_id, plan_id, version, strategy_type, strategy_kind,
-             source_candidate_id, source_master_version_id, prompt, seed, spec, plan_hash, model_id, workflow_id,
-             reference_snapshot, source_path, source_sha256, output_path, output_sha256, size_bytes,
-             width, height, duration_seconds, has_audio, prompt_id, comfy_task_id, provenance, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                artifact_id, job["project_id"], job["shot_id"], job["id"], plan["id"], version,
-                plan["strategy_type"], STRATEGY_DETAILS[plan["strategy_type"]]["kind"], source["candidate_id"],
-                source["master_version_id"], source["prompt"], source.get("seed"), json.dumps(spec, ensure_ascii=False, sort_keys=True),
-                plan["plan_hash"], model_id, workflow_id, json.dumps(source.get("references", []), ensure_ascii=False, sort_keys=True),
-                source["media"]["path"], source["media"]["checksum_sha256"], media["path"], media["checksum_sha256"], media["size_bytes"],
-                spec["actual"]["width"], spec["actual"]["height"], spec["actual"]["duration_seconds"],
-                int(bool((technical.get("audio") or {}).get("present"))), result.get("prompt_id"), result.get("comfy_task_id"),
-                json.dumps(provenance, ensure_ascii=False, sort_keys=True), utc_now(),
-            ),
-        )
-        now = utc_now()
-        changed = db.execute(
-            """UPDATE hd_generation_jobs SET state = 'completed', revision = revision + 1, gpu_submitted = ?,
-            message = '高清产物已完成并写入不可变证据', evidence = ?, updated_at = ?, completed_at = ?, error = NULL
-            WHERE id = ? AND state = 'running' AND revision = ?""",
-            (int(bool(result.get("gpu_submitted"))), json.dumps(result, ensure_ascii=False, sort_keys=True), now, now, job["id"], job["revision"]),
-        )
-        if changed.rowcount != 1:
-            raise HDRunnerError("高清任务完成写入 CAS 失败", process_started=True)
-        db.execute("DELETE FROM hd_shot_leases WHERE job_id = ?", (job["id"],))
-        db.commit()
+    staged = _allowed_attempt_output(result.get("output_file"), output_root, job["id"])
+    published, staged_snapshot = _publish_hd_output(output_root, job, staged)
+    committed = False
+    try:
+        with _hold_no_write_or_delete(published):
+            media = _file_snapshot(published)
+            if media["checksum_sha256"] != staged_snapshot["checksum_sha256"] or media["size_bytes"] != staged_snapshot["size_bytes"]:
+                raise HDRunnerError("高清发布产物与私有 staging 不一致", process_started=True)
+            technical = probe(published)
+            if not technical.get("ok"):
+                raise HDRunnerError("高清产物技术检查未通过：" + "；".join(technical.get("issues") or []), process_started=True)
+            with closing(connect(db_path)) as db:
+                db.execute("BEGIN IMMEDIATE")
+                current_job = db.execute(
+                    "SELECT * FROM hd_generation_jobs WHERE id = ? AND state = 'running' AND revision = ?",
+                    (job["id"], job["revision"]),
+                ).fetchone()
+                lease = db.execute(
+                    "SELECT 1 FROM hd_shot_leases WHERE shot_id = ? AND job_id = ? AND state = 'active'",
+                    (job["shot_id"], job["id"]),
+                ).fetchone()
+                project = db.execute("SELECT * FROM projects WHERE id = ?", (job["project_id"],)).fetchone()
+                archive_lease = db.execute(
+                    "SELECT 1 FROM project_archive_leases WHERE project_id = ?", (job["project_id"],),
+                ).fetchone() if _table_exists(db, "project_archive_leases") else None
+                if not current_job or not lease:
+                    raise HDRunnerError("高清任务完成 CAS/lease 失败，保留为待人工对账", process_started=True)
+                if not project or ("archived" in project.keys() and project["archived"]) or archive_lease:
+                    raise HDRunnerError("项目已归档或正在冻结，高清产物不能发布", process_started=True)
+                plan, _ = _require_latest_plan(db, job["project_id"], job["plan_id"], output_root)
+                if plan["plan_hash"] != job["plan_hash"]:
+                    raise HDRunnerError("高清任务运行期间 plan hash 变化", process_started=True)
+                model_id, workflow_id = _verify_completion_evidence(plan, result)
+                # Recompute protected path/size/SHA inside the publication transaction.
+                final_media = _file_snapshot(published)
+                if final_media != media:
+                    raise HDRunnerError("高清产物在最终发布事务前发生变化", process_started=True)
+                source = plan["source_snapshot"]
+                version = int(db.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 FROM hd_artifacts WHERE shot_id = ?", (job["shot_id"],),
+                ).fetchone()[0])
+                artifact_id = current_job["expected_artifact_id"]
+                spec = {
+                    "requested": {"width": plan["target_width"], "height": plan["target_height"]},
+                    "actual": {
+                        "width": int((technical.get("video") or {}).get("width") or 0),
+                        "height": int((technical.get("video") or {}).get("height") or 0),
+                        "duration_seconds": float(technical.get("duration_seconds") or 0),
+                    },
+                }
+                if spec["actual"]["width"] < plan["target_width"] or spec["actual"]["height"] < plan["target_height"]:
+                    raise HDRunnerError("高清产物未达到目标规格", process_started=True)
+                provenance = {
+                    "schema_version": 2, "strategy": _strategy_public(plan["strategy_type"]),
+                    "plan_id": plan["id"], "plan_hash": plan["plan_hash"], "validation_id": job["validation_id"],
+                    "job_id": job["id"], "attempt": job["attempt"], "model_id": model_id, "workflow_id": workflow_id,
+                    "prompt": source["prompt"], "seed": source.get("generation_seed", source.get("seed")),
+                    "source_seed": source.get("seed"), "source_spec": source.get("spec"), "target_spec": spec,
+                    "references": source.get("references", []), "source_media": source["media"],
+                    "staged_output_media": staged_snapshot, "output_media": final_media,
+                    "adapter_result": result, "technical_probe": technical,
+                }
+                db.execute(
+                    """INSERT INTO hd_artifacts
+                    (id, project_id, shot_id, job_id, plan_id, version, strategy_type, strategy_kind,
+                     source_candidate_id, source_master_version_id, prompt, seed, spec, plan_hash, model_id, workflow_id,
+                     reference_snapshot, source_path, source_sha256, output_path, output_sha256, size_bytes,
+                     width, height, duration_seconds, has_audio, prompt_id, comfy_task_id, provenance, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        artifact_id, job["project_id"], job["shot_id"], job["id"], plan["id"], version,
+                        plan["strategy_type"], STRATEGY_DETAILS[plan["strategy_type"]]["kind"], source["candidate_id"],
+                        source["master_version_id"], source["prompt"], source.get("generation_seed", source.get("seed")),
+                        json.dumps(spec, ensure_ascii=False, sort_keys=True), plan["plan_hash"], model_id, workflow_id,
+                        json.dumps(source.get("references", []), ensure_ascii=False, sort_keys=True),
+                        source["media"]["path"], source["media"]["checksum_sha256"], final_media["path"],
+                        final_media["checksum_sha256"], final_media["size_bytes"], spec["actual"]["width"],
+                        spec["actual"]["height"], spec["actual"]["duration_seconds"],
+                        int(bool((technical.get("audio") or {}).get("present"))), result.get("prompt_id"), result.get("comfy_task_id"),
+                        json.dumps(provenance, ensure_ascii=False, sort_keys=True), utc_now(),
+                    ),
+                )
+                now = utc_now()
+                changed = db.execute(
+                    """UPDATE hd_generation_jobs SET state = 'completed', revision = revision + 1, gpu_submitted = ?,
+                    message = '高清产物已完成并写入不可变证据', evidence = ?, updated_at = ?, completed_at = ?, error = NULL
+                    WHERE id = ? AND state = 'running' AND revision = ?""",
+                    (int(bool(result.get("gpu_submitted"))), json.dumps(result, ensure_ascii=False, sort_keys=True), now, now, job["id"], job["revision"]),
+                )
+                if changed.rowcount != 1:
+                    raise HDRunnerError("高清任务完成写入 CAS 失败", process_started=True)
+                db.execute("DELETE FROM hd_shot_leases WHERE job_id = ?", (job["id"],))
+                db.commit()
+                committed = True
+    finally:
+        if not committed:
+            _remove_published(published)
 
 
 def process_next_hd_job(
@@ -776,34 +1179,56 @@ def process_next_hd_job(
     job = _claim_job(active_db)
     if not job:
         return False
+    runner_called = False
+    staging: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
     try:
         frozen_command = job["command_snapshot"]
         frozen_request = frozen_command.get("request") if isinstance(frozen_command.get("request"), dict) else frozen_command
-        execution_request = {
+        base_request = {
             **frozen_request,
             "validation_id": job["validation_id"], "validation_hash": job["validation_hash"],
             "expected_artifact_id": job["expected_artifact_id"],
         }
+        _execution_gate(active_db, active_root, job)
+        execution_request, staging = _stage_execution_inputs(active_root, job, base_request)
+        # The first check protects staging; this second short transaction is
+        # the final side-effect gate immediately before invoking the adapter.
+        _execution_gate(active_db, active_root, job, staging)
+        runner_called = True
         result = active_runner(execution_request, False)
         _complete_hd_job(active_db, active_root, job, result, active_probe)
+        _cleanup_attempt_staging(active_root, job["id"])
     except Exception as exc:
-        process_started = bool(getattr(exc, "process_started", True))
+        process_started = bool(getattr(exc, "process_started", runner_called))
         now = utc_now()
         with closing(connect(active_db)) as db:
             db.execute("BEGIN IMMEDIATE")
             state = "failed" if not process_started else "submission_outcome_unknown"
             retry_safe = 1 if not process_started else 0
             message = "高清适配器确认未启动，可安全重试" if retry_safe else "外部提交结果未知，必须人工对账"
+            current = db.execute("SELECT evidence FROM hd_generation_jobs WHERE id = ?", (job["id"],)).fetchone()
+            evidence = _json(current["evidence"], {}) if current else {}
+            evidence.update({
+                "process_started": process_started,
+                "runner_called": runner_called,
+                "error": str(exc),
+                "staging": staging,
+                "runner_result": result,
+                "failed_at": now,
+            })
             db.execute(
                 """UPDATE hd_generation_jobs SET state = ?, revision = revision + 1, retry_safe = ?, message = ?,
                 error = ?, evidence = ?, updated_at = ?, completed_at = ? WHERE id = ? AND state = 'running'""",
-                (state, retry_safe, message, str(exc), json.dumps({"process_started": process_started}, ensure_ascii=False), now, now, job["id"]),
+                (state, retry_safe, message, str(exc), json.dumps(evidence, ensure_ascii=False, sort_keys=True), now, now, job["id"]),
             )
             if retry_safe:
                 db.execute("DELETE FROM hd_shot_leases WHERE job_id = ?", (job["id"],))
             else:
                 db.execute("UPDATE hd_shot_leases SET state = 'unknown', updated_at = ? WHERE job_id = ?", (now, job["id"]))
             db.commit()
+        if retry_safe:
+            _cleanup_attempt_staging(active_root, job["id"])
     return True
 
 

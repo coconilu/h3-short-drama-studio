@@ -7,10 +7,12 @@ import unittest
 import zipfile
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from backend import app as studio
+from backend import project_archive as archive_module
 from backend.hd_delivery import (
     HDPlanCreate,
     HDReviewRequest,
@@ -125,6 +127,57 @@ class ProjectArchiveTests(unittest.TestCase):
         self.assertEqual(result["state"], "invalid")
         self.assertIn("SHA-256", result["errors"][0])
 
+    def test_active_work_blocks_archive_without_package_or_persistent_lease(self) -> None:
+        now = studio.utc_now()
+        with closing(studio.connect()) as db:
+            db.execute(
+                """INSERT INTO production_batches
+                (id, project_id, name, state, item_count, config, message, created_at, updated_at)
+                VALUES ('active-batch', ?, 'active', 'running', 0, '{}', 'running', ?, ?)""",
+                (self.project["id"], now, now),
+            )
+            db.commit()
+        with self.assertRaises(HTTPException) as blocked:
+            create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
+        self.assertEqual(blocked.exception.status_code, 409)
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archive_leases").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archives").fetchone()[0], 0)
+        self.assertEqual(list(self.backup_root.rglob("*.jingchang.zip")), [])
+
+    def test_media_mutation_during_staging_fails_closed_and_cleans_lease(self) -> None:
+        video = studio.EXPORT_ROOT / "mutable-delivery.mp4"
+        video.write_bytes(b"trusted-media-before-archive")
+        now = studio.utc_now()
+        with closing(studio.connect()) as db:
+            db.execute(
+                """INSERT INTO export_runs
+                (id, project_id, state, message, output_name, width, height, config, outputs,
+                 created_at, updated_at, source_snapshot, is_current)
+                VALUES ('mutable-delivery', ?, ?, 'done', 'delivery', 1344, 768, '{}', ?, ?, ?, '{}', 1)""",
+                (self.project["id"], "已完成", json.dumps({"video": "mutable-delivery.mp4"}), now, now),
+            )
+            db.commit()
+        original_copy = archive_module.shutil.copyfileobj
+        mutated = False
+
+        def mutate_after_copy(source_handle, target_handle, length=0):
+            nonlocal mutated
+            original_copy(source_handle, target_handle, length=length)
+            if not mutated:
+                mutated = True
+                video.write_bytes(b"media-mutated-during-staging")
+
+        with patch.object(archive_module.shutil, "copyfileobj", side_effect=mutate_after_copy):
+            with self.assertRaises(HTTPException) as blocked:
+                create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"], studio.EXPORT_ROOT)
+        self.assertEqual(blocked.exception.status_code, 409)
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archive_leases").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archives").fetchone()[0], 0)
+        self.assertEqual(list(self.backup_root.rglob("*.jingchang.zip")), [])
+        self.assertFalse((self.backup_root / ".staging").exists() and any((self.backup_root / ".staging").iterdir()))
+
     def test_archive_contains_candidate_master_and_generation_attempt_history(self) -> None:
         shot_id = self.project["shots"][0]["id"]
         now = studio.utc_now()
@@ -223,23 +276,51 @@ class ProjectArchiveTests(unittest.TestCase):
             db.commit()
 
         def runner(request: dict, dry_run: bool) -> dict:
+            source = request["source"]
+            model_id = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+            workflow_id = "h3-ref2va-regenerate-v2"
             if dry_run:
                 return {
                     "gpu_submitted": False,
                     "adapter": "controlled-fake-h3",
-                    "model_id": "fake-ref2va",
-                    "workflow_id": "fixture-workflow-v1",
+                    "model_id": model_id,
+                    "workflow_id": workflow_id,
                     "command": request,
                 }
-            output = studio.COMFY_OUTPUT_ROOT / f"{request['expected_artifact_id']}.mp4"
+            output_root = Path(request["attempt_output_root"])
+            output_root.mkdir(parents=True, exist_ok=True)
+            output = output_root / f"{request['expected_artifact_id']}.mp4"
             output.write_bytes(b"controlled-fake-hd-archive-media")
+            references = {
+                "ref_images": [],
+                "ref_videos": [source["media"]["path"]],
+                "ref_audios": [],
+                "first_frame": None,
+                "last_frame": None,
+            }
             return {
                 "gpu_submitted": True,
                 "output_file": str(output),
-                "model_id": "fake-ref2va",
-                "workflow_id": "fixture-workflow-v1",
+                "model_id": model_id,
+                "workflow_id": workflow_id,
                 "prompt_id": "fixture-hd-prompt",
                 "comfy_task_id": "fixture-comfy-task",
+                "adapter_input": {
+                    "seed": source["generation_seed"],
+                    "prompt_sha256": hashlib.sha256(source["prompt"].encode()).hexdigest(),
+                    "model_id": model_id,
+                    "workflow_id": workflow_id,
+                    "references": references,
+                },
+                "manifest_record": {
+                    "status": "completed",
+                    "prompt_id": "fixture-hd-prompt",
+                    "seed": source["generation_seed"],
+                    "prompt": source["prompt"],
+                    "width": request["target_width"],
+                    "height": request["target_height"],
+                    "references": references,
+                },
             }
 
         def probe(path: Path) -> dict:
@@ -318,10 +399,14 @@ class ProjectArchiveTests(unittest.TestCase):
         self.assertEqual(archive["omitted_count"], 0)
         self.assertTrue(verify_project_archive(studio.DB_PATH, archive["id"])["ok"])
 
-        Path(artifact["output_path"]).write_bytes(b"tampered-after-record")
-        corrupted = create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
-        self.assertEqual(corrupted["omitted_count"], 1)
-        self.assertEqual(corrupted["media_count"], 1)
+        artifact_path = Path(artifact["output_path"])
+        artifact_path.chmod(0o600)
+        artifact_path.write_bytes(b"tampered-after-record")
+        with self.assertRaises(HTTPException) as corrupted:
+            create_project_archive(studio.DB_PATH, self.backup_root, self.project["id"])
+        self.assertEqual(corrupted.exception.status_code, 409)
+        with closing(studio.connect()) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM project_archives").fetchone()[0], 1)
 
 
 if __name__ == "__main__":

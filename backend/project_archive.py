@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import sqlite3
 import uuid
 import zipfile
@@ -14,7 +16,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 
-ARCHIVE_SCHEMA_VERSION = 1
+ARCHIVE_SCHEMA_VERSION = 2
 MEDIA_SUFFIXES = {".aac", ".flac", ".jpeg", ".jpg", ".json", ".m4a", ".mov", ".mp3", ".mp4", ".png", ".srt", ".vtt", ".wav", ".webm", ".webp"}
 
 
@@ -53,8 +55,42 @@ def init_archive_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_project_archives_project
           ON project_archives(project_id, revision DESC);
+        CREATE TABLE IF NOT EXISTS project_archive_leases (
+          project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+          lease_id TEXT NOT NULL UNIQUE,
+          operation TEXT NOT NULL CHECK(operation IN ('snapshot','archive')),
+          created_at TEXT NOT NULL
+        );
         """
     )
+
+
+def _table_exists(db: sqlite3.Connection, name: str) -> bool:
+    return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone())
+
+
+def project_has_active_work(db: sqlite3.Connection, project_id: str) -> list[str]:
+    """Return durable blockers that make a project snapshot unsafe."""
+    blockers: list[str] = []
+    checks = (
+        ("hd_generation_jobs", "SELECT 1 FROM hd_generation_jobs WHERE project_id = ? AND state IN ('queued','running','submission_outcome_unknown') LIMIT 1", "高清任务"),
+        ("hd_validation_leases", "SELECT 1 FROM hd_validation_leases WHERE project_id = ? LIMIT 1", "高清 dry-run"),
+        ("production_batches", "SELECT 1 FROM production_batches WHERE project_id = ? AND state IN ('running','paused','cancelling') LIMIT 1", "生产批次"),
+        ("export_runs", "SELECT 1 FROM export_runs WHERE project_id = ? AND state IN ('排队中','恢复排队','导出中','取消中') LIMIT 1", "导出任务"),
+        ("jobs", """SELECT 1 FROM jobs JOIN shots ON shots.id = jobs.shot_id
+            WHERE shots.project_id = ? AND jobs.state IN ('提交中','已提交待对账','提交状态未知','已提交','排队中','运行中','待人工对账') LIMIT 1""", "H3 任务"),
+        ("production_shot_leases", """SELECT 1 FROM production_shot_leases leases
+            JOIN production_batches batches ON batches.id = leases.batch_id WHERE batches.project_id = ? LIMIT 1""", "生产镜头占用"),
+        ("hd_shot_leases", "SELECT 1 FROM hd_shot_leases WHERE project_id = ? LIMIT 1", "高清镜头占用"),
+        ("h3_generation_leases", """SELECT 1 FROM h3_generation_leases leases
+            JOIN shots ON shots.id = leases.shot_id WHERE shots.project_id = ? LIMIT 1""", "H3 提交占用"),
+        ("h3_validation_leases", """SELECT 1 FROM h3_validation_leases leases
+            JOIN shots ON shots.id = leases.shot_id WHERE shots.project_id = ? LIMIT 1""", "H3 校验占用"),
+    )
+    for table, sql, label in checks:
+        if _table_exists(db, table) and db.execute(sql, (project_id,)).fetchone():
+            blockers.append(label)
+    return blockers
 
 
 def _rows(db: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
@@ -267,16 +303,122 @@ def archive_public(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def create_project_archive(db_path: Path, backup_root: Path, project_id: str, export_root: Path | None = None) -> dict[str, Any]:
+def _cleanup_tree(path: Path) -> None:
+    if not path.exists():
+        return
+
+    def writable_then_retry(function: Any, raw_path: str, _error: Any) -> None:
+        os.chmod(raw_path, 0o700)
+        function(raw_path)
+
+    shutil.rmtree(path, onerror=writable_then_retry)
+
+
+def _stage_archive_media(staging_root: Path, media: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    staged: list[dict[str, Any]] = []
+    media_root = staging_root / "media"
+    staging_root.mkdir(parents=True, exist_ok=False)
+    media_root.mkdir(exist_ok=False)
+    for index, item in enumerate(media, 1):
+        source = Path(item["path"]).resolve()
+        expected_sha = str(item["checksum_sha256"]).lower()
+        before_size = source.stat().st_size
+        before_sha = sha256_file(source).lower()
+        if before_sha != expected_sha or before_size != int(item["size_bytes"]):
+            raise HTTPException(409, f"归档媒体在冻结前已变化：{source.name}")
+        suffix = source.suffix.lower() if source.suffix.lower() in MEDIA_SUFFIXES else ".media"
+        staged_path = media_root / f"{index:04d}-{expected_sha}{suffix}"
+        temporary = media_root / f".{index:04d}-{uuid.uuid4().hex}.tmp"
+        try:
+            with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
+            after_size = source.stat().st_size
+            after_sha = sha256_file(source).lower()
+            staged_sha = sha256_file(temporary).lower()
+            if before_size != after_size or before_sha != after_sha or staged_sha != expected_sha:
+                raise HTTPException(409, f"归档媒体在 staging 复制期间发生变化：{source.name}")
+            temporary.replace(staged_path)
+            os.chmod(staged_path, 0o444)
+            staged.append({**item, "staged_path": staged_path})
+        finally:
+            temporary.unlink(missing_ok=True)
+    return staged
+
+
+def _verify_built_archive(path: Path, manifest_bytes: bytes, data_bytes: bytes, media: list[dict[str, Any]]) -> None:
+    expected_names = {"archive-manifest.json", "project-data.json", *[item["archive_path"] for item in media]}
+    try:
+        with zipfile.ZipFile(path) as package:
+            if package.testzip() is not None or set(package.namelist()) != expected_names:
+                raise HTTPException(500, "归档 ZIP 目录或 CRC 校验失败")
+            if package.read("archive-manifest.json") != manifest_bytes:
+                raise HTTPException(500, "归档 manifest 与冻结凭证不一致")
+            packaged_data = package.read("project-data.json")
+            if packaged_data != data_bytes:
+                raise HTTPException(500, "归档项目数据与冻结凭证不一致")
+            for item in media:
+                payload = package.read(item["archive_path"])
+                if len(payload) != int(item["size_bytes"]) or hashlib.sha256(payload).hexdigest() != item["checksum_sha256"]:
+                    raise HTTPException(500, f"归档媒体校验失败：{item['archive_path']}")
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+        raise HTTPException(500, f"归档 ZIP 完整验证失败：{exc}") from exc
+
+
+def _release_archive_lease(db_path: Path, project_id: str, lease_id: str) -> None:
     with closing(connect(db_path)) as db:
-        db.execute("BEGIN")
-        snapshot = project_snapshot(db, project_id)
-        previous = db.execute("SELECT COALESCE(MAX(revision), 0) FROM project_archives WHERE project_id = ?", (project_id,)).fetchone()[0]
-        revision = int(previous) + 1
-        project = snapshot["projects"][0]
+        db.execute("DELETE FROM project_archive_leases WHERE project_id = ? AND lease_id = ?", (project_id, lease_id))
+        db.commit()
+
+
+def create_project_archive(
+    db_path: Path, backup_root: Path, project_id: str, export_root: Path | None = None, *, mark_archived: bool = False,
+) -> dict[str, Any]:
+    lease_id = f"archive-lease-{uuid.uuid4().hex[:12]}"
+    archive_id = f"project-archive-{uuid.uuid4().hex[:12]}"
+    created_at = utc_now()
+    snapshot: dict[str, list[dict[str, Any]]]
+    revision = 0
+    lease_acquired = False
+    final_path: Path | None = None
+    partial_path: Path | None = None
+    staging_root = (backup_root.resolve() / ".staging" / lease_id).resolve()
+    try:
+        with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            project = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if not project:
+                raise HTTPException(404, "项目不存在")
+            if project["archived"]:
+                raise HTTPException(409, "项目已经归档")
+            if db.execute("SELECT 1 FROM project_archive_leases WHERE project_id = ?", (project_id,)).fetchone():
+                raise HTTPException(409, "项目已有归档冻结任务")
+            blockers = project_has_active_work(db, project_id)
+            if blockers:
+                raise HTTPException(409, "项目仍有活动任务，不能归档：" + "、".join(blockers))
+            if mark_archived:
+                active = db.execute("SELECT value FROM workspace_settings WHERE key = 'active_project_id'").fetchone()
+                if active and active["value"] == project_id:
+                    raise HTTPException(409, "当前项目不能归档，请先切换到另一个项目")
+            db.execute(
+                "INSERT INTO project_archive_leases (project_id, lease_id, operation, created_at) VALUES (?, ?, ?, ?)",
+                (project_id, lease_id, "archive" if mark_archived else "snapshot", created_at),
+            )
+            lease_acquired = True
+            snapshot = project_snapshot(db, project_id)
+            previous = db.execute(
+                "SELECT COALESCE(MAX(revision), 0) FROM project_archives WHERE project_id = ?", (project_id,),
+            ).fetchone()[0]
+            revision = int(previous) + 1
+            db.commit()
+
         media, omitted = _collect_media(snapshot, (export_root or backup_root.parent / "exports").resolve())
-        archive_id = f"project-archive-{uuid.uuid4().hex[:12]}"
-        created_at = utc_now()
+        if omitted:
+            details = "；".join(f"{item['reason']}:{item['path']}" for item in omitted[:5])
+            raise HTTPException(409, f"归档包含 {len(omitted)} 个缺失或不可信媒体，未发布：{details}")
+        staged_media = _stage_archive_media(staging_root, media)
+        project = snapshot["projects"][0]
         manifest = {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
             "archive_id": archive_id,
@@ -285,44 +427,80 @@ def create_project_archive(db_path: Path, backup_root: Path, project_id: str, ex
             "revision": revision,
             "created_at": created_at,
             "row_counts": {table: len(records) for table, records in snapshot.items()},
-            "media": [{key: value for key, value in item.items() if key != "path"} for item in media],
-            "omitted_media": omitted,
+            "media": [{key: value for key, value in item.items() if key not in {"path", "staged_path"}} for item in staged_media],
+            "omitted_media": [],
             "model_weights_included": False,
         }
-        data_bytes = json.dumps({"schema_version": ARCHIVE_SCHEMA_VERSION, "tables": snapshot}, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+        data_bytes = json.dumps(
+            {"schema_version": ARCHIVE_SCHEMA_VERSION, "tables": snapshot},
+            ensure_ascii=False, sort_keys=True, indent=2,
+        ).encode("utf-8")
         manifest["data_sha256"] = hashlib.sha256(data_bytes).hexdigest()
         manifest_bytes = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
 
-    archive_dir = (backup_root / project_id).resolve()
-    backup_root = backup_root.resolve()
-    try:
-        archive_dir.relative_to(backup_root)
-    except ValueError as exc:
-        raise HTTPException(400, "项目标识无法映射到归档目录") from exc
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    final_path = archive_dir / f"{project_id}-R{revision}.jingchang.zip"
-    partial_path = archive_dir / f".{archive_id}.partial"
-    try:
+        backup_root = backup_root.resolve()
+        archive_dir = (backup_root / project_id).resolve()
+        try:
+            archive_dir.relative_to(backup_root)
+        except ValueError as exc:
+            raise HTTPException(400, "项目标识无法映射到归档目录") from exc
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        final_path = archive_dir / f"{project_id}-R{revision}-{archive_id}.jingchang.zip"
+        partial_path = archive_dir / f".{archive_id}.partial"
         with zipfile.ZipFile(partial_path, "w", allowZip64=True) as package:
             package.writestr("archive-manifest.json", manifest_bytes, compress_type=zipfile.ZIP_DEFLATED)
             package.writestr("project-data.json", data_bytes, compress_type=zipfile.ZIP_DEFLATED)
-            for item in media:
-                package.write(item["path"], item["archive_path"], compress_type=zipfile.ZIP_STORED)
+            for item in staged_media:
+                package.write(item["staged_path"], item["archive_path"], compress_type=zipfile.ZIP_STORED)
+        _verify_built_archive(partial_path, manifest_bytes, data_bytes, staged_media)
         partial_path.replace(final_path)
+        _verify_built_archive(final_path, manifest_bytes, data_bytes, staged_media)
+        checksum = sha256_file(final_path)
+        size_bytes = final_path.stat().st_size
+
+        with closing(connect(db_path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            lease = db.execute(
+                "SELECT * FROM project_archive_leases WHERE project_id = ? AND lease_id = ?", (project_id, lease_id),
+            ).fetchone()
+            project = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if not lease or not project or project["archived"] or project_has_active_work(db, project_id):
+                raise HTTPException(409, "归档冻结期间项目状态或任务发生变化，未发布")
+            current_snapshot = project_snapshot(db, project_id)
+            current_data = json.dumps(
+                {"schema_version": ARCHIVE_SCHEMA_VERSION, "tables": current_snapshot},
+                ensure_ascii=False, sort_keys=True, indent=2,
+            ).encode("utf-8")
+            if hashlib.sha256(current_data).hexdigest() != manifest["data_sha256"]:
+                raise HTTPException(409, "归档冻结期间项目数据发生变化，未发布")
+            if mark_archived:
+                active = db.execute("SELECT value FROM workspace_settings WHERE key = 'active_project_id'").fetchone()
+                if active and active["value"] == project_id:
+                    raise HTTPException(409, "项目在归档期间被重新激活，未发布")
+            verified_at = utc_now()
+            db.execute(
+                """INSERT INTO project_archives
+                (id, project_id, revision, state, package_path, size_bytes, checksum_sha256, manifest, created_at, verified_at)
+                VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)""",
+                (archive_id, project_id, revision, str(final_path), size_bytes, checksum, json.dumps(manifest, ensure_ascii=False), created_at, verified_at),
+            )
+            if mark_archived:
+                db.execute("UPDATE projects SET archived = 1, archived_at = ? WHERE id = ? AND archived = 0", (verified_at, project_id))
+            db.execute("DELETE FROM project_archive_leases WHERE project_id = ? AND lease_id = ?", (project_id, lease_id))
+            record = dict(db.execute("SELECT * FROM project_archives WHERE id = ?", (archive_id,)).fetchone())
+            db.commit()
+            lease_acquired = False
+        return archive_public(record)
+    except Exception:
+        if final_path is not None:
+            final_path.unlink(missing_ok=True)
+        raise
     finally:
-        partial_path.unlink(missing_ok=True)
-    checksum = sha256_file(final_path)
-    size_bytes = final_path.stat().st_size
-    with closing(connect(db_path)) as db:
-        db.execute(
-            """INSERT INTO project_archives
-            (id, project_id, revision, state, package_path, size_bytes, checksum_sha256, manifest, created_at, verified_at)
-            VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)""",
-            (archive_id, project_id, revision, str(final_path), size_bytes, checksum, json.dumps(manifest, ensure_ascii=False), created_at, created_at),
-        )
-        db.commit()
-        record = dict(db.execute("SELECT * FROM project_archives WHERE id = ?", (archive_id,)).fetchone())
-    return archive_public(record)
+        if partial_path is not None:
+            partial_path.unlink(missing_ok=True)
+        _cleanup_tree(staging_root)
+        if lease_acquired:
+            _release_archive_lease(db_path, project_id, lease_id)
 
 
 def verify_project_archive(db_path: Path, archive_id: str) -> dict[str, Any]:
@@ -392,10 +570,7 @@ def create_archive_router(db_path: Path, backup_root: Path, export_root: Path | 
                 raise HTTPException(404, "项目不存在")
             if active and active["value"] == project_id:
                 raise HTTPException(409, "当前项目不能归档，请先切换到另一个项目")
-        archive = create_project_archive(db_path, backup_root, project_id, export_root)
-        with closing(connect(db_path)) as db:
-            db.execute("UPDATE projects SET archived = 1, archived_at = ? WHERE id = ?", (utc_now(), project_id))
-            db.commit()
+        archive = create_project_archive(db_path, backup_root, project_id, export_root, mark_archived=True)
         return {"project_id": project_id, "archived": True, "archive": archive}
 
     @router.post("/api/projects/{project_id}/restore")
