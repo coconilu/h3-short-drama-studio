@@ -23,7 +23,7 @@ import {
   Settings2,
   WandSparkles,
 } from 'lucide-react'
-import type { Health, LocalAgentProvider, Workbench, WorkbenchActivity, WorkbenchProject, WorkspaceSettings } from './types'
+import type { ArchiveReconciliation, Health, LocalAgentProvider, Workbench, WorkbenchActivity, WorkbenchProject, WorkspaceSettings } from './types'
 
 type ProjectDestination = 'overview' | 'planning' | 'storyboard' | 'assets'
 
@@ -75,7 +75,7 @@ function ActivityRow({ item, compact = false }: { item: WorkbenchActivity; compa
   </div>
 }
 
-export function ProjectsWorkbench({ workbench, health, search, onOpenProject, onOpenSettings, onCreateArchive, onArchiveProject, onRestoreProject }: {
+export function ProjectsWorkbench({ workbench, health, search, onOpenProject, onOpenSettings, onCreateArchive, onArchiveProject, onRestoreProject, onResolveArchiveReconciliation }: {
   workbench: Workbench
   health: Health | null
   search: string
@@ -84,12 +84,16 @@ export function ProjectsWorkbench({ workbench, health, search, onOpenProject, on
   onCreateArchive: (projectId: string) => Promise<void>
   onArchiveProject: (projectId: string) => Promise<void>
   onRestoreProject: (projectId: string) => Promise<void>
+  onResolveArchiveReconciliation: (record: ArchiveReconciliation, note: string) => Promise<void>
 }) {
   const [filter, setFilter] = useState<'all' | WorkbenchProject['category']>('all')
   const [sort, setSort] = useState<'active' | 'updated' | 'created' | 'progress'>('active')
   const [view, setView] = useState<'list' | 'grid'>('list')
   const [openMenu, setOpenMenu] = useState<string | null>(null)
   const [busyProject, setBusyProject] = useState<string | null>(null)
+  const [busyReconciliation, setBusyReconciliation] = useState<string | null>(null)
+  const [reconciliationNotes, setReconciliationNotes] = useState<Record<string, string>>({})
+  const [reconciliationConfirmations, setReconciliationConfirmations] = useState<Record<string, boolean>>({})
   const runProjectAction = async (projectId: string, action: (projectId: string) => Promise<void>) => {
     setBusyProject(projectId)
     try {
@@ -98,6 +102,23 @@ export function ProjectsWorkbench({ workbench, health, search, onOpenProject, on
     } finally {
       setBusyProject(null)
     }
+  }
+  const resolveReconciliation = async (record: ArchiveReconciliation) => {
+    const note = reconciliationNotes[record.id]?.trim() || ''
+    if (!reconciliationConfirmations[record.id] || note.length < 8) return
+    if (!window.confirm(`确认“${record.project_title || record.project_id}”没有存活归档进程，并解除这条异常冻结吗？`)) return
+    setBusyReconciliation(record.id)
+    try {
+      await onResolveArchiveReconciliation(record, note)
+    } finally {
+      setBusyReconciliation(null)
+    }
+  }
+  const reconciliationReason: Record<ArchiveReconciliation['reason'], string> = {
+    taskless_lease: '旧版冻结缺少归档任务',
+    terminal_task_lease: '终态任务仍持有冻结',
+    task_project_mismatch: '任务与冻结所属项目不一致',
+    task_lease_owner_mismatch: '任务与冻结 owner 不一致',
   }
   const projects = useMemo(() => {
     const query = search.trim().toLocaleLowerCase('zh-CN')
@@ -179,6 +200,36 @@ export function ProjectsWorkbench({ workbench, health, search, onOpenProject, on
       </div>
 
       <aside className="workbench-rail">
+        {!!workbench.archive_reconciliations.length && <section className="archive-reconciliation-panel" aria-label="归档冻结对账">
+          <div className="rail-heading"><h2>归档冻结对账</h2><ArchiveRestore size={15} /></div>
+          <p className="archive-reconciliation-warning">检测到旧版或不一致的归档冻结。系统不会自动解除；请先确认本机没有存活归档进程。</p>
+          {workbench.archive_reconciliations.map((record) => <article key={record.id} className="archive-reconciliation-card">
+            <header><strong>{record.project_title || record.project_id}</strong><em>R{record.revision}</em></header>
+            <p>{reconciliationReason[record.reason] || record.reason}</p>
+            <small>lease {record.lease_id}{record.task_id ? ` · task ${record.task_id}` : ' · 无 task'}</small>
+            <textarea
+              aria-label={`${record.project_title || record.project_id}归档对账说明`}
+              placeholder="记录检查过的进程、日志和判断依据（至少 8 个字符）"
+              value={reconciliationNotes[record.id] || ''}
+              onChange={(event) => setReconciliationNotes((items) => ({ ...items, [record.id]: event.target.value }))}
+            />
+            <label className="archive-reconciliation-confirm">
+              <input
+                type="checkbox"
+                checked={!!reconciliationConfirmations[record.id]}
+                onChange={(event) => setReconciliationConfirmations((items) => ({ ...items, [record.id]: event.target.checked }))}
+              />
+              我已确认没有存活归档进程
+            </label>
+            <button
+              onClick={() => resolveReconciliation(record)}
+              disabled={busyReconciliation === record.id || !reconciliationConfirmations[record.id] || (reconciliationNotes[record.id]?.trim().length || 0) < 8}
+            >
+              {busyReconciliation === record.id ? <LoaderCircle className="spin" size={13} /> : <ArchiveRestore size={13} />}
+              确认并解除异常冻结
+            </button>
+          </article>)}
+        </section>}
         <section><div className="rail-heading"><h2>最近活动</h2><Activity size={15} /></div>{workbench.activities.slice(0, 5).map((item) => <ActivityRow item={item} compact key={item.id} />)}{!workbench.activities.length && <p className="rail-empty">还没有生产活动。</p>}</section>
         <section className="system-card">
           <div className="rail-heading"><h2>系统状态</h2><button aria-label="打开系统设置" title="打开系统设置" onClick={onOpenSettings}><Settings2 size={15} /></button></div>

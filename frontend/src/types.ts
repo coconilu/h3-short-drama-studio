@@ -397,6 +397,24 @@ export type StorageStatus = {
   disk_free_bytes: number
 }
 
+export type ArchiveReconciliation = {
+  id: string
+  project_id: string
+  project_title?: string
+  lease_id: string
+  task_id?: string
+  reason: 'taskless_lease' | 'terminal_task_lease' | 'task_project_mismatch' | 'task_lease_owner_mismatch'
+  state: 'unresolved' | 'resolved'
+  revision: number
+  evidence: Record<string, unknown>
+  confirmed_no_live_process: boolean
+  resolved_by?: string
+  resolution_note?: string
+  created_at: string
+  updated_at: string
+  resolved_at?: string
+}
+
 export type Workbench = {
   summary: {
     project_count: number
@@ -408,6 +426,7 @@ export type Workbench = {
   projects: WorkbenchProject[]
   activities: WorkbenchActivity[]
   queue: WorkbenchActivity[]
+  archive_reconciliations: ArchiveReconciliation[]
   storage: StorageStatus
 }
 

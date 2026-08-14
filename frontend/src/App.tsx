@@ -42,7 +42,7 @@ import {
   WandSparkles,
   X,
 } from 'lucide-react'
-import type { Asset, BatchGenerationResult, Candidate, CandidateReview, DeliveryPlanItem, DeliveryWorkspace, DryRunResult, ExportPreflight, ExportRun, Health, Job, ProductionAcceptance, ProductionBatch, ProductionConflictGroup, Project, ProjectArchive, Promotion, PromptPlan, ReviewWorkspace, RoughCut, Shot, ShotReference, Workbench, WorkspaceSettings } from './types'
+import type { ArchiveReconciliation, Asset, BatchGenerationResult, Candidate, CandidateReview, DeliveryPlanItem, DeliveryWorkspace, DryRunResult, ExportPreflight, ExportRun, Health, Job, ProductionAcceptance, ProductionBatch, ProductionConflictGroup, Project, ProjectArchive, Promotion, PromptPlan, ReviewWorkspace, RoughCut, Shot, ShotReference, Workbench, WorkspaceSettings } from './types'
 import { GlobalActivityPage, GlobalQueuePage, ProjectsWorkbench, SettingsPage } from './WorkbenchPages'
 import { ScriptStudio } from './ScriptStudio'
 import { CreativePlanning } from './CreativePlanning'
@@ -498,6 +498,26 @@ function App() {
     }
   }
 
+  const resolveArchiveReconciliation = async (record: ArchiveReconciliation, note: string) => {
+    setNotice('正在核验并解除异常归档冻结…')
+    try {
+      await api(`/api/projects/${record.project_id}/archive-reconciliations/${record.id}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_revision: record.revision,
+          confirmed_by: '本机操作员',
+          note,
+          confirm_no_live_archive_process: true,
+        }),
+      })
+      await refresh()
+      setNotice(`“${record.project_title || record.project_id}”的异常归档冻结已审计解除`)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '异常归档冻结对账失败')
+      throw error
+    }
+  }
+
   const runAcceptance = async () => {
     setNotice('正在冻结当前生产验收证据…')
     try {
@@ -671,7 +691,7 @@ function App() {
 
         {notice && <button className="notice" onClick={() => setNotice('')}>{notice}<X size={15} /></button>}
 
-        {activePage === 'projects' && <ProjectsWorkbench workbench={workbench} health={health} search={projectSearch} onOpenProject={switchProject} onOpenSettings={() => setActivePage('settings')} onCreateArchive={createProjectArchive} onArchiveProject={archiveProject} onRestoreProject={restoreProject} />}
+        {activePage === 'projects' && <ProjectsWorkbench workbench={workbench} health={health} search={projectSearch} onOpenProject={switchProject} onOpenSettings={() => setActivePage('settings')} onCreateArchive={createProjectArchive} onArchiveProject={archiveProject} onRestoreProject={restoreProject} onResolveArchiveReconciliation={resolveArchiveReconciliation} />}
         {activePage === 'activity' && <GlobalActivityPage workbench={workbench} onOpenProject={switchProject} />}
         {activePage === 'global-queue' && <GlobalQueuePage workbench={workbench} onOpenProject={switchProject} />}
         {activePage === 'settings' && <SettingsPage settings={settings} health={health} onSave={saveSettings} onTest={testConnection} onRestartApi={restartApi} />}

@@ -16,6 +16,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 
 ARCHIVE_SCHEMA_VERSION = 2
@@ -96,6 +97,24 @@ def init_archive_schema(db: sqlite3.Connection) -> None:
           owner_process_identity TEXT,
           heartbeat_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS project_archive_reconciliations (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          lease_id TEXT NOT NULL UNIQUE,
+          task_id TEXT,
+          reason TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('unresolved','resolved')) DEFAULT 'unresolved',
+          revision INTEGER NOT NULL DEFAULT 0,
+          evidence TEXT NOT NULL DEFAULT '{}',
+          confirmed_no_live_process INTEGER NOT NULL DEFAULT 0,
+          resolved_by TEXT,
+          resolution_note TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_archive_reconciliations_open
+          ON project_archive_reconciliations(project_id, state, updated_at DESC);
         """
     )
     lease_columns = {row[1] for row in db.execute("PRAGMA table_info(project_archive_leases)").fetchall()}
@@ -109,6 +128,7 @@ def init_archive_schema(db: sqlite3.Connection) -> None:
     ):
         if name not in lease_columns:
             db.execute(f"ALTER TABLE project_archive_leases ADD COLUMN {name} {definition}")
+    _audit_archive_lease_reconciliations(db)
 
 
 def _process_identity(pid: int) -> tuple[bool | None, str | None]:
@@ -188,6 +208,113 @@ def _current_owner() -> dict[str, Any]:
         "owner_pid": os.getpid(),
         "owner_process_identity": identity,
     }
+
+
+class ArchiveReconciliationResolve(BaseModel):
+    expected_revision: int = Field(ge=0)
+    confirmed_by: str = Field(min_length=2, max_length=80)
+    note: str = Field(min_length=8, max_length=1000)
+    confirm_no_live_archive_process: bool
+
+
+def _lease_anomaly(
+    lease: dict[str, Any], task: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]] | None:
+    lease_owner = {
+        key: lease.get(key)
+        for key in ("owner_instance", "owner_host", "owner_pid", "owner_process_identity")
+    }
+    evidence: dict[str, Any] = {
+        "lease": {
+            "project_id": lease.get("project_id"),
+            "lease_id": lease.get("lease_id"),
+            "task_id": lease.get("task_id"),
+            "operation": lease.get("operation"),
+            "created_at": lease.get("created_at"),
+            "heartbeat_at": lease.get("heartbeat_at"),
+            "owner": lease_owner,
+        }
+    }
+    if not lease.get("task_id") or task is None:
+        evidence["task"] = None
+        return "taskless_lease", evidence
+    task_owner = {
+        key: task.get(key)
+        for key in ("owner_instance", "owner_host", "owner_pid", "owner_process_identity")
+    }
+    evidence["task"] = {
+        "id": task.get("id"),
+        "project_id": task.get("project_id"),
+        "state": task.get("state"),
+        "stage": task.get("stage"),
+        "revision": task.get("revision"),
+        "operation": task.get("operation"),
+        "owner": task_owner,
+    }
+    if task.get("project_id") != lease.get("project_id"):
+        return "task_project_mismatch", evidence
+    if task.get("state") != "running":
+        return "terminal_task_lease", evidence
+    owner_mismatches = [key for key in task_owner if task_owner[key] != lease_owner[key]]
+    if owner_mismatches or task.get("operation") != lease.get("operation"):
+        evidence["mismatches"] = owner_mismatches + (
+            ["operation"] if task.get("operation") != lease.get("operation") else []
+        )
+        return "task_lease_owner_mismatch", evidence
+    return None
+
+
+def _audit_archive_lease_reconciliations(db: sqlite3.Connection) -> int:
+    """Persist abnormal leases without ever releasing their project freeze."""
+    if not _table_exists(db, "project_archive_leases") or not _table_exists(db, "project_archive_reconciliations"):
+        return 0
+    now = utc_now()
+    changed = 0
+    leases = [dict(row) for row in db.execute("SELECT * FROM project_archive_leases ORDER BY project_id").fetchall()]
+    for lease in leases:
+        task_row = None
+        if lease.get("task_id") and _table_exists(db, "project_archive_tasks"):
+            task_row = db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (lease["task_id"],)).fetchone()
+        anomaly = _lease_anomaly(lease, dict(task_row) if task_row else None)
+        if anomaly is None:
+            continue
+        reason, evidence = anomaly
+        serialized = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+        existing = db.execute(
+            "SELECT * FROM project_archive_reconciliations WHERE lease_id = ?", (lease["lease_id"],),
+        ).fetchone()
+        if existing is None:
+            db.execute(
+                """INSERT INTO project_archive_reconciliations
+                (id, project_id, lease_id, task_id, reason, state, revision, evidence, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'unresolved', 0, ?, ?, ?)""",
+                (
+                    f"archive-reconciliation-{uuid.uuid4().hex[:12]}", lease["project_id"], lease["lease_id"],
+                    lease.get("task_id"), reason, serialized, now, now,
+                ),
+            )
+            changed += 1
+            continue
+        if (
+            existing["state"] != "unresolved"
+            or existing["project_id"] != lease["project_id"]
+            or existing["task_id"] != lease.get("task_id")
+            or existing["reason"] != reason
+            or existing["evidence"] != serialized
+        ):
+            db.execute(
+                """UPDATE project_archive_reconciliations
+                SET project_id = ?, task_id = ?, reason = ?, state = 'unresolved', evidence = ?,
+                    confirmed_no_live_process = 0, resolved_by = NULL, resolution_note = NULL,
+                    resolved_at = NULL, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND revision = ?""",
+                (
+                    lease["project_id"], lease.get("task_id"), reason, serialized, now,
+                    existing["id"], int(existing["revision"]),
+                ),
+            )
+            changed += 1
+    return changed
 
 
 def _table_exists(db: sqlite3.Connection, name: str) -> bool:
@@ -453,6 +580,218 @@ def archive_task_public(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def archive_reconciliation_public(record: dict[str, Any]) -> dict[str, Any]:
+    try:
+        evidence = json.loads(record.get("evidence") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        evidence = {"parse_error": "stored evidence is not valid JSON"}
+    return {
+        "id": record["id"],
+        "project_id": record["project_id"],
+        "project_title": record.get("project_title"),
+        "lease_id": record["lease_id"],
+        "task_id": record.get("task_id"),
+        "reason": record["reason"],
+        "state": record["state"],
+        "revision": int(record.get("revision") or 0),
+        "evidence": evidence,
+        "confirmed_no_live_process": bool(record.get("confirmed_no_live_process")),
+        "resolved_by": record.get("resolved_by"),
+        "resolution_note": record.get("resolution_note"),
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+        "resolved_at": record.get("resolved_at"),
+    }
+
+
+def list_archive_reconciliations(
+    db_path: Path, project_id: str | None = None, *, include_resolved: bool = True,
+) -> list[dict[str, Any]]:
+    with closing(connect(db_path)) as db:
+        if project_id is not None and not db.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone():
+            raise HTTPException(404, "项目不存在")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append("reconciliations.project_id = ?")
+            params.append(project_id)
+        if not include_resolved:
+            clauses.append("reconciliations.state = 'unresolved'")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        records = _rows(
+            db,
+            f"""SELECT reconciliations.*, projects.title AS project_title
+            FROM project_archive_reconciliations reconciliations
+            JOIN projects ON projects.id = reconciliations.project_id
+            {where} ORDER BY reconciliations.updated_at DESC, reconciliations.id""",
+            tuple(params),
+        )
+    return [archive_reconciliation_public(record) for record in records]
+
+
+def _owner_is_definitely_current(task: dict[str, Any]) -> bool:
+    if task.get("owner_instance") == ARCHIVE_OWNER_INSTANCE:
+        return True
+    if str(task.get("owner_host") or "").casefold() != ARCHIVE_OWNER_HOST:
+        return False
+    try:
+        pid = int(task.get("owner_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    alive, identity = _process_identity(pid)
+    if alive is not True:
+        return False
+    stored = str(task.get("owner_process_identity") or "")
+    current = str(identity or "")
+    stored_kind = stored.split(":", 1)[0] if ":" in stored else ""
+    current_kind = current.split(":", 1)[0] if ":" in current else ""
+    return stored_kind in {"win-filetime", "proc-start"} and current_kind == stored_kind and stored == current
+
+
+def resolve_archive_reconciliation(
+    db_path: Path,
+    backup_root: Path,
+    project_id: str,
+    reconciliation_id: str,
+    payload: ArchiveReconciliationResolve,
+) -> dict[str, Any]:
+    if not payload.confirm_no_live_archive_process:
+        raise HTTPException(400, "必须明确确认没有存活的归档进程")
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        _audit_archive_lease_reconciliations(db)
+        record = db.execute(
+            """SELECT * FROM project_archive_reconciliations
+            WHERE id = ? AND project_id = ?""",
+            (reconciliation_id, project_id),
+        ).fetchone()
+        if not record:
+            db.rollback()
+            raise HTTPException(404, "归档冻结对账记录不存在")
+        if record["state"] != "unresolved" or int(record["revision"]) != payload.expected_revision:
+            db.rollback()
+            raise HTTPException(409, "归档冻结对账记录已变化，请刷新后重试")
+        lease_row = db.execute(
+            "SELECT * FROM project_archive_leases WHERE project_id = ? AND lease_id = ?",
+            (project_id, record["lease_id"]),
+        ).fetchone()
+        if not lease_row:
+            db.rollback()
+            raise HTTPException(409, "异常归档 lease 已变化，保持对账记录且未写入")
+        task_row = None
+        if lease_row["task_id"]:
+            task_row = db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (lease_row["task_id"],)).fetchone()
+        anomaly = _lease_anomaly(dict(lease_row), dict(task_row) if task_row else None)
+        if anomaly is None:
+            db.rollback()
+            raise HTTPException(409, "当前 lease 与任务已恢复一致，不能按旧证据解除")
+        if task_row and task_row["state"] == "running" and _owner_is_definitely_current(dict(task_row)):
+            db.rollback()
+            raise HTTPException(409, "检测到归档任务 owner 仍存活，不能解除冻结")
+        task = dict(task_row) if task_row else None
+        db.rollback()
+
+    cleanup_errors = _cleanup_archive_task_paths(db_path, backup_root, task) if task and task["state"] == "running" else []
+    if cleanup_errors:
+        raise HTTPException(409, "无法安全清理异常归档任务文件，冻结保持：" + "；".join(cleanup_errors))
+
+    now = utc_now()
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        _audit_archive_lease_reconciliations(db)
+        record = db.execute(
+            "SELECT * FROM project_archive_reconciliations WHERE id = ? AND project_id = ?",
+            (reconciliation_id, project_id),
+        ).fetchone()
+        if not record or record["state"] != "unresolved" or int(record["revision"]) != payload.expected_revision:
+            db.rollback()
+            raise HTTPException(409, "归档冻结对账记录已被其他请求处理")
+        lease_row = db.execute(
+            "SELECT * FROM project_archive_leases WHERE project_id = ? AND lease_id = ?",
+            (project_id, record["lease_id"]),
+        ).fetchone()
+        if not lease_row:
+            db.rollback()
+            raise HTTPException(409, "异常归档 lease 已变化，未解除其他冻结")
+        task_row = None
+        if lease_row["task_id"]:
+            task_row = db.execute("SELECT * FROM project_archive_tasks WHERE id = ?", (lease_row["task_id"],)).fetchone()
+        anomaly = _lease_anomaly(dict(lease_row), dict(task_row) if task_row else None)
+        if anomaly is None:
+            db.rollback()
+            raise HTTPException(409, "当前 lease 与任务已恢复一致，未解除")
+        reason, current_evidence = anomaly
+        try:
+            reconciliation_audit = json.loads(record["evidence"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            reconciliation_audit = {}
+        reconciliation_audit["resolution"] = {
+            "confirmed_no_live_archive_process": True,
+            "confirmed_by": payload.confirmed_by.strip(),
+            "note": payload.note.strip(),
+            "reason_at_resolution": reason,
+            "evidence_at_resolution": current_evidence,
+            "resolved_at": now,
+        }
+        cursor = db.execute(
+            """UPDATE project_archive_reconciliations
+            SET state = 'resolved', confirmed_no_live_process = 1, resolved_by = ?, resolution_note = ?,
+                evidence = ?, updated_at = ?, resolved_at = ?, revision = revision + 1
+            WHERE id = ? AND project_id = ? AND state = 'unresolved' AND revision = ?""",
+            (
+                payload.confirmed_by.strip(), payload.note.strip(),
+                json.dumps(reconciliation_audit, ensure_ascii=False, sort_keys=True), now, now,
+                reconciliation_id, project_id, payload.expected_revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "归档冻结对账记录已被其他请求处理")
+        if task_row:
+            task = dict(task_row)
+            try:
+                task_audit = json.loads(task["audit"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                task_audit = {}
+            task_audit["manual_reconciliation"] = reconciliation_audit["resolution"]
+            if task["state"] == "running":
+                task_cursor = db.execute(
+                    """UPDATE project_archive_tasks
+                    SET state = 'failed', stage = 'reconciled_failed', error = ?, audit = ?,
+                        heartbeat_at = ?, updated_at = ?, completed_at = ?, revision = revision + 1
+                    WHERE id = ? AND project_id = ? AND state = 'running' AND revision = ?""",
+                    (
+                        "人工确认无存活归档进程并解除异常冻结",
+                        json.dumps(task_audit, ensure_ascii=False, sort_keys=True), now, now, now,
+                        task["id"], project_id, int(task["revision"]),
+                    ),
+                )
+            else:
+                task_cursor = db.execute(
+                    """UPDATE project_archive_tasks
+                    SET audit = ?, updated_at = ?, revision = revision + 1
+                    WHERE id = ? AND project_id = ? AND state = ? AND revision = ?""",
+                    (
+                        json.dumps(task_audit, ensure_ascii=False, sort_keys=True), now,
+                        task["id"], project_id, task["state"], int(task["revision"]),
+                    ),
+                )
+            if task_cursor.rowcount != 1:
+                db.rollback()
+                raise HTTPException(409, "归档任务在对账期间变化，零写入")
+        lease_cursor = db.execute(
+            "DELETE FROM project_archive_leases WHERE project_id = ? AND lease_id = ?",
+            (project_id, record["lease_id"]),
+        )
+        if lease_cursor.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "异常归档 lease 在对账期间变化，零写入")
+        db.commit()
+    return next(
+        item for item in list_archive_reconciliations(db_path, project_id) if item["id"] == reconciliation_id
+    )
+
+
 def _cleanup_tree(path: Path) -> None:
     if not path.exists():
         return
@@ -679,6 +1018,8 @@ def _cleanup_archive_task_paths(db_path: Path, backup_root: Path, task: dict[str
 
 
 def _task_owner_is_dead(task: dict[str, Any]) -> bool:
+    if task.get("owner_instance") == ARCHIVE_OWNER_INSTANCE:
+        return False
     if str(task.get("owner_host") or "").casefold() != ARCHIVE_OWNER_HOST:
         return False
     try:
@@ -688,19 +1029,42 @@ def _task_owner_is_dead(task: dict[str, Any]) -> bool:
     alive, current_identity = _process_identity(pid)
     if alive is False:
         return True
-    if alive is True and current_identity and task.get("owner_process_identity"):
-        return current_identity != task["owner_process_identity"]
+    stored_identity = str(task.get("owner_process_identity") or "")
+    current_identity = str(current_identity or "")
+    stored_kind = stored_identity.split(":", 1)[0] if ":" in stored_identity else ""
+    current_kind = current_identity.split(":", 1)[0] if ":" in current_identity else ""
+    verified_kinds = {"win-filetime", "proc-start"}
+    if (
+        alive is True
+        and stored_kind in verified_kinds
+        and current_kind == stored_kind
+        and stored_identity
+        and current_identity
+    ):
+        return current_identity != stored_identity
     return False
 
 
 def recover_archive_tasks(db_path: Path, backup_root: Path) -> int:
     """Fail and clean only tasks whose local owner process is proven dead."""
     with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        _audit_archive_lease_reconciliations(db)
+        db.commit()
+        blocked_task_ids = {
+            row[0]
+            for row in db.execute(
+                """SELECT task_id FROM project_archive_reconciliations
+                WHERE state = 'unresolved' AND task_id IS NOT NULL"""
+            ).fetchall()
+        }
         tasks = [dict(row) for row in db.execute(
             "SELECT * FROM project_archive_tasks WHERE state = 'running' ORDER BY created_at",
         ).fetchall()]
     recovered = 0
     for task in tasks:
+        if task["id"] in blocked_task_ids:
+            continue
         if not _task_owner_is_dead(task):
             continue
         cleanup_errors = _cleanup_archive_task_paths(db_path, backup_root, task)
@@ -962,6 +1326,20 @@ def create_archive_router(db_path: Path, backup_root: Path, export_root: Path | 
                 (project_id,),
             )
         return [archive_task_public(record) for record in records]
+
+    @router.get("/api/projects/{project_id}/archive-reconciliations")
+    def api_list_archive_reconciliations(
+        project_id: str, include_resolved: bool = True,
+    ) -> list[dict[str, Any]]:
+        return list_archive_reconciliations(db_path, project_id, include_resolved=include_resolved)
+
+    @router.post("/api/projects/{project_id}/archive-reconciliations/{reconciliation_id}/resolve")
+    def api_resolve_archive_reconciliation(
+        project_id: str, reconciliation_id: str, payload: ArchiveReconciliationResolve,
+    ) -> dict[str, Any]:
+        return resolve_archive_reconciliation(
+            db_path, backup_root, project_id, reconciliation_id, payload,
+        )
 
     @router.post("/api/project-archives/{archive_id}/verify")
     def verify_archive(archive_id: str) -> dict[str, Any]:

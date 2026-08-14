@@ -629,7 +629,9 @@ append-only 草稿母版版本（可回滚，不覆盖候选）
 
 交付装配只引用锁定时的高清 artifact、高清母版修订和媒体 SHA。导出仍使用每次 run 私有的内容寻址 staging；单镜头和多镜头的 `.sources.json` 都固定为 JSON 数组。当前成片必须至少为 1344×768 横屏、可解码、镜头覆盖完整且包含音轨，画面连续性与声音签署必须绑定精确 `export_run_id + video SHA-256`；切换或重新导出后旧签署不会授权新成片。项目归档包含全部高清计划、验证、任务、产物、审片、定稿历史和经 SHA 校验的高清媒体；归档媒体也先进入私有 staging，并对 ZIP 目录、项目数据和每个媒体的大小/SHA 做完整复验。任何媒体缺失、被替换或复制期间变化都会让本次归档失败关闭，既不发布不完整 ZIP，也不把项目标记为已归档。
 
-归档冻结由持久 `project_archive_tasks` 与项目级 lease 共同管理：任务记录进程 owner、阶段、heartbeat、私有 staging/partial/final 路径和 CAS revision。服务启动时只接管本机且已能证明 owner 进程死亡或 PID 身份变化的任务；活进程即使 heartbeat 陈旧也不会被其他实例清理。崩溃恢复会删除私有 staging、partial 和未登记 final，把任务保留为可审计失败记录并释放 lease，但绝不创建 `ready` 归档或修改项目归档状态；失败记录会出现在“所有项目”的最近活动中，也可通过 `/api/projects/{project_id}/archive-tasks` 查看。无法确认 owner 死亡或无法安全清理文件时继续保持冻结，等待人工排查。
+归档冻结由持久 `project_archive_tasks` 与项目级 lease 共同管理：任务记录进程 owner、阶段、heartbeat、私有 staging/partial/final 路径和 CAS revision。服务启动时只接管本机且已能证明 owner 进程死亡或 PID 身份变化的任务；只有存储值和当前值都属于同一种可验证 OS 身份（Windows `win-filetime` 或 Linux `/proc` start time）时，身份差异才可证明 PID 被复用。活进程、runtime fallback、身份不可读或不可比较时即使 heartbeat 陈旧也不会被其他实例清理。崩溃恢复会删除私有 staging、partial 和未登记 final，把任务保留为可审计失败记录并释放 lease，但绝不创建 `ready` 归档或修改项目归档状态；失败记录会出现在“所有项目”的最近活动中，也可通过 `/api/projects/{project_id}/archive-tasks` 查看。
+
+旧版本遗留的 taskless lease、终态任务仍占 lease、任务与 lease 的项目或 owner 不一致都不会被启动恢复静默删除。系统会把它们迁移为项目隔离的 `project_archive_reconciliations` 记录并继续冻结 H3、生产批次、HD 和导出认领；“所有项目”侧栏会展示归档冻结对账卡。操作员必须检查本机进程和日志，填写说明，显式勾选“我已确认没有存活归档进程”，再按记录 revision 提交；后端以项目、记录、lease 和 CAS revision 同事务核验并写入解决审计，随后才释放冻结。历史和解决结果可通过 `GET /api/projects/{project_id}/archive-reconciliations?include_resolved=true` 查询，不能安全确认时应保留冻结而不是直接删数据库记录。
 
 ### 本地配置与能力边界
 

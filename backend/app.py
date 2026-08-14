@@ -39,7 +39,12 @@ try:
     )
     from .local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from .delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
-    from .project_archive import create_archive_router, init_archive_schema, recover_archive_tasks
+    from .project_archive import (
+        create_archive_router,
+        init_archive_schema,
+        list_archive_reconciliations,
+        recover_archive_tasks,
+    )
     from .production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from .prompt_compiler import (
         approve_plan,
@@ -77,7 +82,7 @@ except ImportError:  # Support `uvicorn app:app` when backend is the working dir
     )
     from local_agents import create_local_agent_router, init_local_agent_schema, recover_local_agent_runs
     from delivery_plan import create_delivery_router, delivery_plan_hash, init_delivery_schema, locked_delivery_plan
-    from project_archive import create_archive_router, init_archive_schema, recover_archive_tasks
+    from project_archive import create_archive_router, init_archive_schema, list_archive_reconciliations, recover_archive_tasks
     from production_bible import create_bible_router, init_bible_schema, sync_creative_character_rules
     from prompt_compiler import (
         approve_plan,
@@ -2750,6 +2755,7 @@ def get_workbench() -> dict[str, Any]:
         "projects": projects,
         "activities": activities,
         "queue": queue_items,
+        "archive_reconciliations": list_archive_reconciliations(DB_PATH, include_resolved=False),
         "storage": storage_payload(),
     }
 
