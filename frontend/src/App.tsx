@@ -42,7 +42,7 @@ import {
   WandSparkles,
   X,
 } from 'lucide-react'
-import type { Asset, BatchGenerationResult, Candidate, CandidateReview, DeliveryPlanItem, DeliveryWorkspace, DryRunResult, ExportPreflight, ExportRun, Health, Job, ProductionAcceptance, ProductionBatch, Project, ProjectArchive, Promotion, PromptPlan, ReviewWorkspace, RoughCut, Shot, ShotReference, Workbench, WorkspaceSettings } from './types'
+import type { Asset, BatchGenerationResult, Candidate, CandidateReview, DeliveryPlanItem, DeliveryWorkspace, DryRunResult, ExportPreflight, ExportRun, Health, Job, ProductionAcceptance, ProductionBatch, ProductionConflictGroup, Project, ProjectArchive, Promotion, PromptPlan, ReviewWorkspace, RoughCut, Shot, ShotReference, Workbench, WorkspaceSettings } from './types'
 import { GlobalActivityPage, GlobalQueuePage, ProjectsWorkbench, SettingsPage } from './WorkbenchPages'
 import { ScriptStudio } from './ScriptStudio'
 import { CreativePlanning } from './CreativePlanning'
@@ -1034,6 +1034,8 @@ function QueuePage({ jobs, onSync, onResolve }: {
   const [batches, setBatches] = useState<ProductionBatch[]>([])
   const [selectedBatchId, setSelectedBatchId] = useState('')
   const [selectedBatch, setSelectedBatch] = useState<ProductionBatch | null>(null)
+  const [conflicts, setConflicts] = useState<ProductionConflictGroup[]>([])
+  const [conflictNotes, setConflictNotes] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState('')
   const [queueError, setQueueError] = useState('')
 
@@ -1060,7 +1062,16 @@ function QueuePage({ jobs, onSync, onResolve }: {
     }
   }, [])
 
+  const loadConflicts = useCallback(async () => {
+    try {
+      setConflicts(await api<ProductionConflictGroup[]>('/api/production-conflicts?include_resolved=true'))
+    } catch (error) {
+      setQueueError(error instanceof Error ? error.message : '历史生产冲突加载失败')
+    }
+  }, [])
+
   useEffect(() => { void loadBatches() }, [loadBatches])
+  useEffect(() => { void loadConflicts() }, [loadConflicts])
   useEffect(() => { void loadDetail(selectedBatchId) }, [loadDetail, selectedBatchId])
   useEffect(() => {
     const hasActive = batches.some((batch) => ['running', 'paused', 'cancelling'].includes(batch.state))
@@ -1092,6 +1103,29 @@ function QueuePage({ jobs, onSync, onResolve }: {
     } finally { setBusy('') }
   }
 
+  const resolveConflict = async (group: ProductionConflictGroup) => {
+    const note = (conflictNotes[group.shot_id] || '').trim()
+    if (!note) { setQueueError('请填写本次冲突审计说明'); return }
+    setBusy(`conflict-${group.shot_id}`)
+    try {
+      await api<ProductionConflictGroup>(`/api/production-conflicts/${group.shot_id}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({
+          confirm: true,
+          expected_revisions: group.expected_revisions,
+          resolved_by: '本机操作员',
+          note,
+        }),
+      })
+      setConflictNotes((current) => ({ ...current, [group.shot_id]: '' }))
+      await Promise.all([loadConflicts(), loadBatches()])
+      setQueueError('')
+    } catch (error) {
+      setQueueError(error instanceof Error ? error.message : '生产所有权冲突解决失败')
+      await loadConflicts()
+    } finally { setBusy('') }
+  }
+
   const batchStateLabels: Record<ProductionBatch['state'], string> = {
     running: '运行中', paused: '已暂停', cancelling: '停止中', completed: '已完成',
     completed_with_errors: '有失败', cancelled: '已取消',
@@ -1103,6 +1137,14 @@ function QueuePage({ jobs, onSync, onResolve }: {
   return <main className="page production-queue-page">
     <div className="page-heading"><div><span className="eyebrow">持久化单 GPU 调度</span><h1>项目队列</h1><p>只消费已批准的生成计划；批次、逐镜快照和恢复事件都保存在本地数据库。</p></div><div className="queue-safety"><ShieldCheck size={17} /><span><strong>重启可恢复</strong><small>提交结果不确定时失败关闭，绝不自动重复扣算力</small></span></div></div>
     {queueError && <div className="queue-error"><AlertTriangle size={16} />{queueError}</div>}
+    {conflicts.length > 0 && <section className="ownership-conflicts" aria-label="历史生产所有权冲突">
+      <header><div><AlertTriangle size={16} /><span><strong>历史生产所有权审计</strong><small>升级前的重复尝试不会自动选定所有者；整组均证明未提交后才解除镜头门禁。</small></span></div><button onClick={() => void loadConflicts()}><RefreshCw size={14} />刷新证据</button></header>
+      <div>{conflicts.map((group) => <article className={group.state} key={group.shot_id}>
+        <div className="conflict-summary"><span><b>{displayShotId(group.shot_id)}</b><strong>{group.shot_title}</strong></span><em>{group.state === 'resolved' ? '已解决' : group.can_resolve ? '证据完整' : '证据不足'}</em></div>
+        <div className="conflict-attempts">{group.items.map((item) => <span className={item.proof.verified ? 'verified' : 'blocked'} key={item.id}><b>{item.item_title}</b><small>{item.original_state} · R{item.revision}</small><em>{item.proof.verified ? (item.proof.basis === 'queued_never_claimed' ? '从未领取' : '已证明零提交') : item.proof.reason}</em></span>)}</div>
+        {group.state === 'unresolved' ? <div className="conflict-resolution"><label>审计说明<input aria-label={`${group.shot_title}冲突审计说明`} value={conflictNotes[group.shot_id] || ''} onChange={(event) => setConflictNotes((current) => ({ ...current, [group.shot_id]: event.target.value }))} placeholder="说明如何确认整组尝试均未提交" /></label><button disabled={!group.can_resolve || !conflictNotes[group.shot_id]?.trim() || Boolean(busy)} onClick={() => void resolveConflict(group)}>{busy === `conflict-${group.shot_id}` ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />}确认整组未提交并解除门禁</button></div> : <footer>{group.items[0]?.resolved_by} · {group.items[0]?.resolution_note} · {group.items[0]?.resolved_at ? new Date(group.items[0].resolved_at).toLocaleString('zh-CN', { hour12: false }) : ''}</footer>}
+      </article>)}</div>
+    </section>}
     <section className="production-queue-grid">
       <aside className="production-batches">
         <header><span>生产批次</span><button onClick={() => void loadBatches()}><RefreshCw size={14} /></button></header>

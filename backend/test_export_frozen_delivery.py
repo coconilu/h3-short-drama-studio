@@ -252,6 +252,62 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         self.assertEqual(json.loads(failed[2]), {})
         self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
 
+    def _assert_delivery_mutation_during_render_fails(self, sql: str) -> None:
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
+        self.assertEqual(studio.claim_next_export_run()["id"], queued["id"])
+        run = studio.row("SELECT * FROM export_runs WHERE id = ?", (queued["id"],))
+        snapshot = json.loads(run["source_snapshot"])
+        stem = run["output_name"]
+
+        class SuccessfulRenderWithDeliveryMutation:
+            pid = 4343
+            returncode = 0
+
+            def __init__(self, test: "FrozenDeliveryExportTests") -> None:
+                self.test = test
+                self.finished = False
+
+            def poll(self) -> int:
+                if not self.finished:
+                    studio.EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+                    for suffix in (".mp4", ".srt", ".vtt"):
+                        (studio.EXPORT_ROOT / f"{stem}{suffix}").write_bytes(b"controlled-output")
+                    (studio.EXPORT_ROOT / f"{stem}.sources.json").write_text(
+                        json.dumps(snapshot["sources"], ensure_ascii=False), encoding="utf-8",
+                    )
+                    with closing(sqlite3.connect(self.test.db_path)) as db:
+                        db.execute(sql)
+                        db.commit()
+                    self.finished = True
+                return 0
+
+        with patch("backend.app.subprocess.Popen", return_value=SuccessfulRenderWithDeliveryMutation(self)):
+            studio.run_export_job(queued["id"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            failed = db.execute(
+                "SELECT state, is_current, outputs FROM export_runs WHERE id = ?", (queued["id"],),
+            ).fetchone()
+        self.assertEqual(failed[0], "失败")
+        self.assertEqual(failed[1], 0)
+        self.assertEqual(json.loads(failed[2]), {})
+        self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
+
+    def test_delivery_item_change_after_render_fails_before_publish(self) -> None:
+        self._assert_delivery_mutation_during_render_fails(
+            "UPDATE delivery_plan_items SET dialogue_mode = 'original'",
+        )
+
+    def test_delivery_status_change_after_render_fails_before_publish(self) -> None:
+        self._assert_delivery_mutation_during_render_fails(
+            "UPDATE delivery_plans SET status = 'draft'",
+        )
+
+    def test_delivery_revision_change_after_render_fails_before_publish(self) -> None:
+        self._assert_delivery_mutation_during_render_fails(
+            "UPDATE delivery_plans SET revision = revision + 1",
+        )
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe") and shutil.which("powershell.exe"), "requires FFmpeg and Windows PowerShell")
     def test_export_script_applies_trim_mute_and_frozen_subtitle(self) -> None:
         source = self.root / "real-source.mp4"

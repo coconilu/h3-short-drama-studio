@@ -2151,12 +2151,20 @@ def sync_production_item(item: dict[str, Any]) -> dict[str, Any]:
             "candidate_ids": [],
         }
     base_revision = int(job.get("reconciliation_revision") or 0)
-    if base_revision != int(item.get("draft_job_revision") or 0):
+    item_revision = int(item.get("draft_job_revision") or 0)
+    if base_revision != item_revision:
         return {
-            "authoritative": False,
-            "state": "待人工对账",
-            "message": "draft job 修订已被其他同步或人工动作更新；生产条目保持运行并等待重新对账",
+            # The scheduler owns the CAS that advances the production item.  It
+            # can only consume this newer revision after re-checking the exact
+            # prompt/candidate set persisted by this attempt.  Returning the
+            # current exact job here avoids leaving a production item running
+            # forever after an external sync or manual reconciliation.
+            "authoritative": True,
+            "revision_advanced": True,
+            "state": job["state"],
+            "message": job["message"],
             "job_id": int(job["id"]),
+            "base_job_revision": item_revision,
             "job_revision": base_revision,
             "prompt_ids": string_list(job.get("prompt_ids")),
             "candidate_ids": draft_attempt_candidate_ids(job),
@@ -3119,18 +3127,14 @@ def _verify_frozen_export_sources(
             raise RuntimeError(f"镜头 {frozen.get('shot_id')} 的渲染来源与冻结快照不一致")
 
 
-def _validate_export_run_snapshot(export_run: dict[str, Any]) -> dict[str, Any]:
-    try:
-        snapshot = json.loads(export_run.get("source_snapshot") or "{}")
-        config = json.loads(export_run.get("config") or "{}")
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("导出任务冻结快照无法解析") from exc
-    snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
-    if hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest() != config.get("source_snapshot_sha256"):
-        raise RuntimeError("导出任务冻结快照 hash 不一致")
+def _validate_export_assembly(
+    db: sqlite3.Connection,
+    export_run: dict[str, Any],
+    snapshot: dict[str, Any],
+    config: dict[str, Any],
+) -> None:
     delivery = snapshot.get("delivery_plan") or {}
-    with closing(connect()) as db:
-        assembly = _locked_assembly_from_db(db, str(export_run.get("project_id") or ""))
+    assembly = _locked_assembly_from_db(db, str(export_run.get("project_id") or ""))
     if not assembly:
         raise RuntimeError("导出任务对应的锁定装配已不存在")
     integrity = _assembly_integrity(assembly)
@@ -3145,7 +3149,26 @@ def _validate_export_run_snapshot(export_run: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("当前锁定装配与任务冻结的规范化快照不一致")
     if config.get("delivery_plan_hash") != assembly["plan_hash"] or config.get("assembly_snapshot_hash") != integrity["snapshot_hash"]:
         raise RuntimeError("导出任务的装配 hash 凭证不一致")
-    _verify_frozen_export_sources(snapshot)
+
+
+def _validate_export_run_snapshot(
+    export_run: dict[str, Any], *, db: sqlite3.Connection | None = None, verify_sources: bool = True,
+) -> dict[str, Any]:
+    try:
+        snapshot = json.loads(export_run.get("source_snapshot") or "{}")
+        config = json.loads(export_run.get("config") or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("导出任务冻结快照无法解析") from exc
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    if hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest() != config.get("source_snapshot_sha256"):
+        raise RuntimeError("导出任务冻结快照 hash 不一致")
+    if db is None:
+        with closing(connect()) as current_db:
+            _validate_export_assembly(current_db, export_run, snapshot, config)
+    else:
+        _validate_export_assembly(db, export_run, snapshot, config)
+    if verify_sources:
+        _verify_frozen_export_sources(snapshot)
     return snapshot
 
 
@@ -3300,6 +3323,10 @@ def run_export_job(run_id: str) -> None:
         # any production manifest/current version.  A mid-render replacement
         # must fail closed even when the output process itself succeeded.
         _verify_frozen_export_sources(snapshot, sources)
+        # FFmpeg may run for a long time.  Revalidate the complete normalized
+        # locked assembly after it exits, not only the media files frozen at
+        # worker start.
+        snapshot = _validate_export_run_snapshot(export_run)
         verified_sources = []
         for source in sources:
             source_path = allowed_output_file(source.get("path"))
@@ -3329,7 +3356,6 @@ def run_export_job(run_id: str) -> None:
         production_manifest_temp.write_text(
             json.dumps(production_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        production_manifest_temp.replace(production_manifest_path)
         outputs = {
             "video": video_path.name,
             "subtitles": subtitles_path.name,
@@ -3340,14 +3366,42 @@ def run_export_job(run_id: str) -> None:
             "size_bytes": video_path.stat().st_size,
         }
         completed_at = utc_now()
+        # Keep expensive file hashing outside the final database write lock.
+        # The following short transaction protects the mutable assembly rows;
+        # the source set itself is immutable by frozen path+SHA contract.
+        _verify_frozen_export_sources(snapshot, sources)
         with closing(connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            current_run = db.execute(
+                "SELECT * FROM export_runs WHERE id = ? AND state = '导出中' AND cancel_requested = 0",
+                (run_id,),
+            ).fetchone()
+            if not current_run:
+                raise RuntimeError("导出任务在发布前已被取消或修改")
+            current_run = dict(current_run)
+            if (
+                current_run.get("source_snapshot") != export_run.get("source_snapshot")
+                or current_run.get("config") != export_run.get("config")
+            ):
+                raise RuntimeError("导出任务冻结凭证在发布前发生变化")
+            # This final validation and the current-version CAS share one short
+            # write transaction, so a delivery row/status/revision edit cannot
+            # slip between validation and publication.
+            _validate_export_run_snapshot(current_run, db=db, verify_sources=False)
+            production_manifest_temp.replace(production_manifest_path)
             db.execute("UPDATE export_runs SET is_current = 0 WHERE project_id = ?", (export_run["project_id"],))
-            db.execute(
+            published = db.execute(
                 """UPDATE export_runs SET state = '已完成', message = '横屏成片与生产清单已生成',
                 outputs = ?, updated_at = ?, completed_at = ?, error = NULL, worker_id = NULL,
-                cancel_requested = 0, is_current = 1 WHERE id = ?""",
-                (json.dumps(outputs, ensure_ascii=False), completed_at, completed_at, run_id),
+                cancel_requested = 0, is_current = 1 WHERE id = ? AND state = '导出中'
+                AND source_snapshot = ? AND config = ? AND cancel_requested = 0""",
+                (
+                    json.dumps(outputs, ensure_ascii=False), completed_at, completed_at, run_id,
+                    export_run.get("source_snapshot"), export_run.get("config"),
+                ),
             )
+            if published.rowcount != 1:
+                raise RuntimeError("导出任务发布 CAS 失败")
             db.commit()
         record_export_event(run_id, "completed", "媒体校验与生产清单写入完成，已设为当前版本")
     except ExportCancelled as exc:

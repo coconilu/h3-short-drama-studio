@@ -1021,6 +1021,34 @@ export type ProductionBatch = {
   events: ProductionBatchEvent[]
 }
 
+export type ProductionConflictItem = {
+  id: number
+  item_id: string
+  batch_id: string
+  item_title: string
+  original_state: string
+  item_state: string
+  item_error?: string
+  state: 'unresolved' | 'resolved'
+  reason: string
+  proof: { verified: boolean; basis?: string; reason?: string; job_id?: number; job_revision?: number }
+  created_at: string
+  resolved_at?: string
+  resolved_by?: string
+  resolution_note?: string
+  revision: number
+}
+
+export type ProductionConflictGroup = {
+  shot_id: string
+  shot_title: string
+  state: 'unresolved' | 'resolved'
+  can_resolve: boolean
+  issues: string[]
+  expected_revisions: Record<string, number>
+  items: ProductionConflictItem[]
+}
+
 export type ScriptAgentProvider = {
   id: 'codex' | 'kimi'
   label: string

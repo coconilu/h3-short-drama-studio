@@ -107,6 +107,36 @@
 .queue-safety strong { color: #91bea2; font-size: 9px; font-weight: 600; }
 .queue-safety small { color: #66796e; font-size: 8px; }
 .queue-error { display: flex; align-items: center; gap: 8px; margin: -8px 0 14px; border-left: 2px solid #a95555; background: #201315; padding: 10px 12px; color: #cf8181; font-size: 9px; }
+.ownership-conflicts { margin: -2px 0 14px; border: 1px solid #4b3b2b; background: #15130f; }
+.ownership-conflicts > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid #382f25; padding: 11px 13px; }
+.ownership-conflicts > header > div { display: flex; align-items: center; gap: 9px; color: #c4944d; }
+.ownership-conflicts > header span { display: flex; flex-direction: column; gap: 3px; }
+.ownership-conflicts > header strong { color: #c9a66f; font-size: 9px; }
+.ownership-conflicts > header small { color: #776957; font-size: 8px; }
+.ownership-conflicts > header button, .conflict-resolution button { display: flex; align-items: center; gap: 5px; min-height: 30px; border: 1px solid #5a4933; background: #1b1813; padding: 0 9px; color: #ae8b57; font-size: 8px; cursor: pointer; }
+.ownership-conflicts > div { display: grid; gap: 1px; background: #2c2822; }
+.ownership-conflicts article { display: grid; grid-template-columns: 180px minmax(280px, 1fr) minmax(280px, .8fr); gap: 13px; align-items: center; background: #111318; padding: 12px 13px; }
+.ownership-conflicts article.resolved { opacity: .7; }
+.conflict-summary { display: flex; align-items: center; justify-content: space-between; gap: 9px; }
+.conflict-summary span { display: flex; flex-direction: column; gap: 4px; }
+.conflict-summary b { color: #9b7338; font-family: ui-monospace, monospace; font-size: 8px; }
+.conflict-summary strong { color: #c1b9ad; font-size: 9px; }
+.conflict-summary em { border: 1px solid #5a4933; padding: 3px 5px; color: #bd9254; font-size: 8px; font-style: normal; white-space: nowrap; }
+.conflict-attempts { display: flex; flex-wrap: wrap; gap: 6px; }
+.conflict-attempts > span { display: grid; grid-template-columns: auto auto; gap: 3px 8px; border: 1px solid #343942; background: #0e1014; padding: 6px 7px; }
+.conflict-attempts b { color: #9ca2aa; font-size: 8px; }
+.conflict-attempts small { color: #626a74; font-size: 7px; }
+.conflict-attempts em { grid-column: 1 / -1; max-width: 240px; color: #69717b; font-size: 7px; font-style: normal; }
+.conflict-attempts .verified { border-color: #315442; }
+.conflict-attempts .verified em { color: #70a986; }
+.conflict-attempts .blocked { border-color: #5c3937; }
+.conflict-attempts .blocked em { color: #b36e68; }
+.conflict-resolution { display: flex; align-items: flex-end; gap: 8px; }
+.conflict-resolution label { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 5px; color: #787f88; font-size: 8px; }
+.conflict-resolution input { min-height: 31px; border: 1px solid #383d45; background: #0d0f12; padding: 0 9px; color: #b9bdc3; font-size: 8px; outline: 0; }
+.conflict-resolution input:focus { border-color: #8d6732; }
+.conflict-resolution button:disabled { opacity: .4; cursor: not-allowed; }
+.ownership-conflicts article > footer { color: #6f776f; font-size: 8px; }
 .production-queue-grid { display: grid; grid-template-columns: 265px minmax(0, 1fr); min-height: 630px; border: 1px solid #30343d; background: #111318; }
 .production-batches { border-right: 1px solid #30343d; background: #0f1115; }
 .production-batches > header { height: 46px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #292d35; padding: 0 13px 0 16px; color: #777e88; font-size: 9px; letter-spacing: .1em; }
@@ -165,6 +195,7 @@
 .legacy-job-log > summary span { margin-left: 5px; border: 1px solid #3a3f47; padding: 2px 5px; color: #696f78; }
 
 @media (max-width: 1040px) {
+  .ownership-conflicts article { grid-template-columns: 1fr; }
   .production-queue-grid { grid-template-columns: 220px minmax(0, 1fr); }
   .production-items-head, .production-items article { grid-template-columns: 34px minmax(200px, 1fr) 45px 65px; }
   .production-items-head span:last-child, .production-item-actions { display: none; }

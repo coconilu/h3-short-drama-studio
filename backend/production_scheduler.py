@@ -180,6 +180,14 @@ def init_production_schema(db: sqlite3.Connection) -> None:
             db.execute(f"ALTER TABLE production_batch_items ADD COLUMN {column} {definition}")
         if column not in attempt_columns:
             db.execute(f"ALTER TABLE production_item_attempts ADD COLUMN {column} {definition}")
+    conflict_columns = {row[1] for row in db.execute("PRAGMA table_info(production_shot_conflicts)").fetchall()}
+    for column, definition in (
+        ("resolved_by", "TEXT"),
+        ("resolution_note", "TEXT"),
+        ("revision", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in conflict_columns:
+            db.execute(f"ALTER TABLE production_shot_conflicts ADD COLUMN {column} {definition}")
     # Upgrade safety: older databases had no cross-batch ownership row.  The
     # migration is one atomic unit: a shot with more than one actionable or
     # outcome-unknown item is never assigned an arbitrary winner.  Every
@@ -488,7 +496,77 @@ def _authoritative_draft_job(
         return None
     if "candidate_ids" not in result or list(result["candidate_ids"] or []) != _decode_json(job.get("candidate_ids"), []):
         return None
+    if int(job.get("reconciliation_revision") or 0) < int(item.get("draft_job_revision") or 0):
+        return None
     return job
+
+
+def _attempt_owns_current_job(
+    db: sqlite3.Connection, item: dict[str, Any], job: dict[str, Any],
+) -> bool:
+    """Check immutable attempt-owned records after the initial submit bind."""
+    attempt = db.execute(
+        """SELECT * FROM production_item_attempts
+        WHERE item_id = ? AND attempt = ? AND draft_job_id = ?""",
+        (item["id"], int(item.get("attempts") or 0), int(job["id"])),
+    ).fetchone()
+    if not attempt:
+        return False
+    # Job identity alone is insufficient: an external/manual sync may have
+    # accidentally attached candidates from another attempt.
+    return (
+        _decode_json(attempt["prompt_ids"], []) == _decode_json(job.get("prompt_ids"), [])
+        and _decode_json(attempt["candidate_ids"], []) == _decode_json(job.get("candidate_ids"), [])
+    )
+
+
+def _fail_poll_reconciliation(
+    db: sqlite3.Connection,
+    item: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    now: str,
+) -> None:
+    """Fail closed when a running attempt can no longer prove job ownership."""
+    job = _draft_job(db, item.get("draft_job_id"))
+    retry_safe = bool(
+        job
+        and job.get("shot_id") == item["shot_id"]
+        and job.get("retry_safe")
+        and not _decode_json(job.get("candidate_ids"), [])
+    )
+    message = str(result.get("message") or "draft job 修订或候选所有权冲突，已失败关闭并等待人工审计")
+    updated = db.execute(
+        """UPDATE production_batch_items SET state = 'failed', message = ?,
+        error = 'draft_job_reconciliation_conflict', updated_at = ?, completed_at = ?
+        WHERE id = ? AND state = 'running'""",
+        (message, now, now, item["id"]),
+    )
+    if updated.rowcount != 1:
+        raise HTTPException(409, "生产条目已被另一同步请求更新")
+    db.execute(
+        """UPDATE production_item_attempts SET state = ?,
+        error = 'draft_job_reconciliation_conflict', updated_at = ?, completed_at = ?
+        WHERE item_id = ? AND attempt = ? AND state = 'running'""",
+        ("failed" if retry_safe else "submission_unknown", now, now, item["id"], int(item.get("attempts") or 0)),
+    )
+    if retry_safe:
+        db.execute("DELETE FROM production_shot_leases WHERE item_id = ?", (item["id"],))
+    else:
+        db.execute(
+            """UPDATE production_shot_leases SET state = 'unknown', updated_at = ?
+            WHERE item_id = ?""",
+            (now, item["id"]),
+        )
+    _event(
+        db,
+        item["batch_id"],
+        "draft_job_reconciliation_conflict",
+        message,
+        item_id=item["id"],
+        level="error",
+    )
+    _refresh_batch(db, item["batch_id"])
 
 
 def _refresh_attempt_evidence(
@@ -662,6 +740,184 @@ def get_batch(db_path: Path, batch_id: str) -> dict[str, Any]:
         if not batch:
             raise HTTPException(404, "生产批次不存在")
         return _batch_public(db, batch)
+
+
+def _zero_submit_proof(
+    db: sqlite3.Connection, conflict: dict[str, Any], item: dict[str, Any],
+) -> dict[str, Any]:
+    attempts = [
+        dict(value)
+        for value in db.execute(
+            "SELECT * FROM production_item_attempts WHERE item_id = ? ORDER BY attempt",
+            (item["id"],),
+        ).fetchall()
+    ]
+    if conflict["original_state"] == "queued" and int(item.get("attempts") or 0) == 0 and not attempts and not item.get("draft_job_id"):
+        return {"verified": True, "basis": "queued_never_claimed", "job_id": None}
+    if any(_decode_json(attempt.get("candidate_ids"), []) or _decode_json(attempt.get("media_evidence"), []) for attempt in attempts):
+        return {"verified": False, "reason": "历史尝试已记录候选或媒体证据，不能证明零提交"}
+    attempt_job_ids = {int(attempt["draft_job_id"]) for attempt in attempts if attempt.get("draft_job_id")}
+    if len(attempt_job_ids) > 1 or (attempt_job_ids and int(item.get("draft_job_id") or 0) not in attempt_job_ids):
+        return {"verified": False, "reason": "历史尝试绑定了不同 draft job，不能证明整条 attempt 链零提交"}
+    job = _draft_job(db, item.get("draft_job_id"))
+    if not job or job.get("shot_id") != item["shot_id"]:
+        return {"verified": False, "reason": "缺少该冲突条目精确绑定的 draft job"}
+    if job.get("state") != "提交失败" or not bool(job.get("retry_safe")) or _decode_json(job.get("candidate_ids"), []):
+        return {"verified": False, "reason": "draft job 尚未被可信地确认成零提交"}
+    evidence = _decode_json(job.get("reconciliation_snapshot"), {})
+    manual = any(
+        isinstance(value, dict) and value.get("action") == "confirm_not_submitted"
+        for value in evidence.get("manual_resolutions") or []
+    )
+    frozen_pre_spawn = bool(
+        evidence.get("adapter_returned_success") is False
+        and isinstance(evidence.get("frozen_command"), dict)
+        and len(str(evidence.get("input_hash") or "")) == 64
+        and isinstance(evidence.get("manifest_before"), dict)
+        and evidence["manifest_before"].get("trusted") is True
+    )
+    if not manual and not frozen_pre_spawn:
+        return {"verified": False, "reason": "retry_safe 缺少人工确认或受信任的进程未启动冻结证据"}
+    return {
+        "verified": True,
+        "basis": "manual_confirm_not_submitted" if manual else "audited_pre_spawn_failure",
+        "job_id": int(job["id"]),
+        "job_revision": int(job.get("reconciliation_revision") or 0),
+    }
+
+
+def _conflict_groups(db: sqlite3.Connection, project_id: str) -> list[dict[str, Any]]:
+    conflict_rows = db.execute(
+        """SELECT conflicts.*, items.batch_id, items.shot_id, items.title AS item_title,
+        items.state AS item_state, items.error AS item_error, items.attempts, items.draft_job_id,
+        shots.title AS shot_title
+        FROM production_shot_conflicts conflicts
+        JOIN production_batch_items items ON items.id = conflicts.item_id
+        JOIN production_batches batches ON batches.id = items.batch_id
+        JOIN shots ON shots.id = conflicts.shot_id
+        WHERE batches.project_id = ?
+        ORDER BY conflicts.created_at DESC, conflicts.id""",
+        (project_id,),
+    ).fetchall()
+    grouped: dict[str, dict[str, Any]] = {}
+    for raw in conflict_rows:
+        conflict = dict(raw)
+        item = db.execute("SELECT * FROM production_batch_items WHERE id = ?", (conflict["item_id"],)).fetchone()
+        proof = _zero_submit_proof(db, conflict, dict(item)) if conflict["state"] == "unresolved" and item else {
+            "verified": conflict["state"] == "resolved",
+            "basis": "resolved_audit" if conflict["state"] == "resolved" else None,
+        }
+        public = {
+            "id": int(conflict["id"]),
+            "item_id": conflict["item_id"],
+            "batch_id": conflict["batch_id"],
+            "item_title": conflict["item_title"],
+            "original_state": conflict["original_state"],
+            "item_state": conflict["item_state"],
+            "item_error": conflict["item_error"],
+            "state": conflict["state"],
+            "reason": conflict["reason"],
+            "evidence": _decode_json(conflict.get("evidence"), {}),
+            "proof": proof,
+            "created_at": conflict["created_at"],
+            "resolved_at": conflict.get("resolved_at"),
+            "resolved_by": conflict.get("resolved_by"),
+            "resolution_note": conflict.get("resolution_note"),
+            "revision": int(conflict.get("revision") or 0),
+        }
+        group = grouped.setdefault(conflict["shot_id"], {
+            "shot_id": conflict["shot_id"], "shot_title": conflict["shot_title"], "items": [],
+        })
+        group["items"].append(public)
+    groups = []
+    for group in grouped.values():
+        unresolved = [item for item in group["items"] if item["state"] == "unresolved"]
+        group["state"] = "unresolved" if unresolved else "resolved"
+        group["can_resolve"] = bool(unresolved) and all(item["proof"].get("verified") for item in unresolved)
+        group["issues"] = [item["proof"].get("reason") for item in unresolved if not item["proof"].get("verified")]
+        group["expected_revisions"] = {str(item["id"]): item["revision"] for item in unresolved}
+        groups.append(group)
+    return groups
+
+
+def list_ownership_conflicts(db_path: Path, *, include_resolved: bool = True) -> list[dict[str, Any]]:
+    with closing(connect(db_path)) as db:
+        project = _active_project(db)
+        groups = _conflict_groups(db, project["id"])
+        return groups if include_resolved else [group for group in groups if group["state"] == "unresolved"]
+
+
+def resolve_ownership_conflicts(
+    db_path: Path,
+    shot_id: str,
+    *,
+    expected_revisions: dict[str, int],
+    resolved_by: str,
+    note: str,
+) -> dict[str, Any]:
+    with closing(connect(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        project = _active_project(db)
+        shot = db.execute("SELECT id FROM shots WHERE id = ? AND project_id = ?", (shot_id, project["id"])).fetchone()
+        if not shot:
+            raise HTTPException(404, "生产冲突不属于当前项目")
+        rows_found = db.execute(
+            """SELECT conflicts.*, items.batch_id, items.attempts, items.draft_job_id,
+            items.state AS item_state, items.shot_id
+            FROM production_shot_conflicts conflicts
+            JOIN production_batch_items items ON items.id = conflicts.item_id
+            JOIN production_batches batches ON batches.id = items.batch_id
+            WHERE conflicts.shot_id = ? AND conflicts.state = 'unresolved' AND batches.project_id = ?
+            ORDER BY conflicts.id""",
+            (shot_id, project["id"]),
+        ).fetchall()
+        if not rows_found:
+            raise HTTPException(409, "该镜头没有尚未解决的生产所有权冲突")
+        expected = {str(row["id"]): int(row["revision"] or 0) for row in rows_found}
+        if expected != {str(key): int(value) for key, value in expected_revisions.items()}:
+            raise HTTPException(409, "冲突审计修订已变化，请刷新后重新确认")
+        proofs: dict[str, dict[str, Any]] = {}
+        issues: list[dict[str, Any]] = []
+        for raw in rows_found:
+            conflict = dict(raw)
+            item = db.execute("SELECT * FROM production_batch_items WHERE id = ?", (conflict["item_id"],)).fetchone()
+            proof = _zero_submit_proof(db, conflict, dict(item)) if item else {"verified": False, "reason": "冲突条目已不存在"}
+            proofs[str(conflict["id"])] = proof
+            if not proof.get("verified"):
+                issues.append({"conflict_id": int(conflict["id"]), "item_id": conflict["item_id"], "reason": proof.get("reason")})
+        if issues:
+            raise HTTPException(409, {"message": "整组冲突尚未全部证明零提交", "issues": issues})
+        now = utc_now()
+        batch_ids: set[str] = set()
+        for raw in rows_found:
+            conflict = dict(raw)
+            evidence = _decode_json(conflict.get("evidence"), {})
+            evidence["resolution"] = {
+                "proof": proofs[str(conflict["id"])], "resolved_at": now,
+                "resolved_by": resolved_by, "note": note,
+            }
+            changed = db.execute(
+                """UPDATE production_shot_conflicts SET state = 'resolved', resolved_at = ?, resolved_by = ?,
+                resolution_note = ?, evidence = ?, revision = revision + 1
+                WHERE id = ? AND state = 'unresolved' AND revision = ?""",
+                (
+                    now, resolved_by, note, json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+                    conflict["id"], expected[str(conflict["id"])],
+                ),
+            )
+            if changed.rowcount != 1:
+                db.rollback()
+                raise HTTPException(409, "冲突已被另一解决请求更新")
+            db.execute("DELETE FROM production_shot_leases WHERE item_id = ?", (conflict["item_id"],))
+            _event(
+                db, conflict["batch_id"], "migration_conflict_resolved",
+                f"{resolved_by} 已确认整组旧尝试均未提交：{note}", item_id=conflict["item_id"], level="warning",
+            )
+            batch_ids.add(str(conflict["batch_id"]))
+        for batch_id in batch_ids:
+            _refresh_batch(db, batch_id)
+        db.commit()
+    return next(group for group in list_ownership_conflicts(db_path) if group["shot_id"] == shot_id)
 
 
 def batch_preflight(db_path: Path, plan_provider: PlanProvider, shot_ids: list[str]) -> dict[str, Any]:
@@ -1066,15 +1322,44 @@ def poll_running_items(db_path: Path, syncer: Syncer) -> int:
                 db.rollback()
                 continue
             current_item = dict(current)
-            job = None if result.get("authoritative") is False else _authoritative_draft_job(db, current_item, result)
+            job = (
+                None
+                if result.get("authoritative") is False or result.get("base_job_revision") is None
+                else _authoritative_draft_job(db, current_item, result)
+            )
+            if job is not None and not _attempt_owns_current_job(db, current_item, job):
+                job = None
             if job is None:
-                db.execute(
-                    """UPDATE production_batch_items SET message = ?, updated_at = ?
-                    WHERE id = ? AND state = 'running'""",
-                    (result.get("message") or "生产同步凭证冲突，保持运行并等待人工对账", now, item["id"]),
-                )
+                _fail_poll_reconciliation(db, current_item, result, now=now)
                 db.commit()
+                changed += 1
                 continue
+            old_revision = int(current_item.get("draft_job_revision") or 0)
+            job_revision = int(job.get("reconciliation_revision") or 0)
+            if job_revision > old_revision:
+                advanced = db.execute(
+                    """UPDATE production_batch_items SET draft_job_revision = ?, updated_at = ?
+                    WHERE id = ? AND state = 'running' AND COALESCE(draft_job_revision, 0) = ?""",
+                    (job_revision, now, item["id"], old_revision),
+                )
+                attempt_advanced = db.execute(
+                    """UPDATE production_item_attempts SET draft_job_revision = ?, updated_at = ?
+                    WHERE item_id = ? AND attempt = ? AND draft_job_id = ?
+                    AND COALESCE(draft_job_revision, 0) = ? AND state = 'running'""",
+                    (
+                        job_revision,
+                        now,
+                        item["id"],
+                        int(current_item.get("attempts") or 0),
+                        int(job["id"]),
+                        old_revision,
+                    ),
+                )
+                if advanced.rowcount != 1 or attempt_advanced.rowcount != 1:
+                    db.rollback()
+                    continue
+                current_item["draft_job_revision"] = job_revision
+                result = {**result, "base_job_revision": job_revision, "job_revision": job_revision}
             state = str(job.get("state") or "")
             next_state = "completed" if state == "完成" else "failed" if state in {"失败", "提交失败"} else "running"
             updated = db.execute(
@@ -1290,6 +1575,13 @@ class ProductionBatchPreflight(BaseModel):
     shot_ids: list[str] = Field(min_length=1, max_length=200)
 
 
+class ProductionConflictResolution(BaseModel):
+    confirm: bool = False
+    expected_revisions: dict[str, int]
+    resolved_by: str = Field(min_length=2, max_length=80)
+    note: str = Field(min_length=2, max_length=500)
+
+
 def create_production_router(db_path: Path, plan_provider: PlanProvider) -> APIRouter:
     router = APIRouter()
 
@@ -1322,5 +1614,21 @@ def create_production_router(db_path: Path, plan_provider: PlanProvider) -> APIR
     @router.post("/api/production-items/{item_id}/retry")
     def api_retry_item(item_id: str) -> dict[str, Any]:
         return retry_item(db_path, item_id, plan_provider)
+
+    @router.get("/api/production-conflicts")
+    def api_list_conflicts(include_resolved: bool = True) -> list[dict[str, Any]]:
+        return list_ownership_conflicts(db_path, include_resolved=include_resolved)
+
+    @router.post("/api/production-conflicts/{shot_id}/resolve")
+    def api_resolve_conflicts(shot_id: str, payload: ProductionConflictResolution) -> dict[str, Any]:
+        if not payload.confirm:
+            raise HTTPException(400, "解决生产所有权冲突必须显式确认")
+        return resolve_ownership_conflicts(
+            db_path,
+            shot_id,
+            expected_revisions=payload.expected_revisions,
+            resolved_by=payload.resolved_by,
+            note=payload.note,
+        )
 
     return router
