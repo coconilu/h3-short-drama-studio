@@ -1031,7 +1031,17 @@ export type ProductionConflictItem = {
   item_error?: string
   state: 'unresolved' | 'resolved'
   reason: string
-  proof: { verified: boolean; basis?: string; reason?: string; job_id?: number; job_revision?: number }
+  evidence: {
+    kind?: string
+    target_attempt?: {
+      item_id?: string
+      attempt?: number
+      draft_job_id?: number
+      item_job_revision?: number
+      attempt_job_revision?: number
+    }
+  }
+  proof: { verified: boolean; basis?: string; reason?: string; attempt?: number; job_id?: number; job_revision?: number }
   created_at: string
   resolved_at?: string
   resolved_by?: string

@@ -125,6 +125,12 @@ class FrozenDeliveryExportTests(unittest.TestCase):
     def probe(_: Path) -> dict:
         return {"width": 608, "height": 352, "duration_seconds": 2.0, "has_audio": 1}
 
+    @staticmethod
+    def staged_snapshot(run_id: str) -> dict:
+        return json.loads(
+            (studio.export_staging_root(run_id) / "request.json").read_text(encoding="utf-8")
+        )
+
     def test_export_uses_frozen_candidate_checksum_and_edit_controls(self) -> None:
         with patch("backend.app.probe_media", side_effect=self.probe):
             result = studio.export_preflight_payload(include_private=True)
@@ -163,6 +169,26 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertEqual(result["ready_shot_count"], 0)
         self.assertIn("SHA256", result["issues"][0]["message"])
+
+    def test_source_changed_while_copying_to_staging_fails_and_cleans_private_copy(self) -> None:
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            snapshot = studio.export_preflight_payload(include_private=True)
+        original_hash = studio.file_sha256
+        source_calls = 0
+
+        def mutate_after_first_source_hash(path: Path) -> str:
+            nonlocal source_calls
+            result = original_hash(path)
+            if path.resolve() == self.video.resolve():
+                source_calls += 1
+                if source_calls == 1:
+                    self.video.write_bytes(b"changed-between-copy-hash-boundaries")
+            return result
+
+        with patch("backend.app.file_sha256", side_effect=mutate_after_first_source_hash):
+            with self.assertRaisesRegex(RuntimeError, "staging 复制期间发生变化"):
+                studio.stage_export_sources("copy-race", snapshot)
+        self.assertFalse(studio.export_staging_root("copy-race").exists())
 
     def test_locked_item_or_plan_hash_tampering_fails_preflight_and_create_atomically(self) -> None:
         with closing(sqlite3.connect(self.db_path)) as db:
@@ -213,7 +239,7 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         self.assertEqual(failed[0], "失败")
         self.assertEqual(failed[1], 0)
 
-    def test_media_replaced_during_render_fails_before_publish(self) -> None:
+    def test_original_media_replaced_after_staging_does_not_change_render_input(self) -> None:
         with patch("backend.app.probe_media", side_effect=self.probe):
             queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
         claimed = studio.claim_next_export_run()
@@ -232,27 +258,33 @@ class FrozenDeliveryExportTests(unittest.TestCase):
 
             def poll(self) -> int:
                 if not self.finished:
+                    staged = self.test.staged_snapshot(queued["id"])
                     studio.EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
                     for suffix in (".mp4", ".srt", ".vtt"):
                         (studio.EXPORT_ROOT / f"{stem}{suffix}").write_bytes(b"controlled-output")
                     (studio.EXPORT_ROOT / f"{stem}.sources.json").write_text(
-                        json.dumps(snapshot["sources"], ensure_ascii=False), encoding="utf-8",
+                        json.dumps(staged["sources"], ensure_ascii=False), encoding="utf-8",
                     )
                     self.test.video.write_bytes(b"replaced-during-render-with-different-content")
                     self.finished = True
                 return 0
 
         fake = SuccessfulRender(self)
-        with patch("backend.app.subprocess.Popen", return_value=fake):
+        with patch("backend.app.subprocess.Popen", return_value=fake), patch(
+            "backend.app.probe_media", side_effect=self.probe,
+        ):
             studio.run_export_job(queued["id"])
         with closing(sqlite3.connect(self.db_path)) as db:
-            failed = db.execute("SELECT state, is_current, outputs FROM export_runs WHERE id = ?", (queued["id"],)).fetchone()
-        self.assertEqual(failed[0], "失败")
-        self.assertEqual(failed[1], 0)
-        self.assertEqual(json.loads(failed[2]), {})
-        self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
+            completed = db.execute("SELECT state, is_current, outputs FROM export_runs WHERE id = ?", (queued["id"],)).fetchone()
+        self.assertEqual(completed[0], "已完成")
+        self.assertEqual(completed[1], 1)
+        manifest = json.loads((studio.EXPORT_ROOT / f"{stem}.production.json").read_text(encoding="utf-8"))
+        frozen_sha = snapshot["sources"][0]["checksum_sha256"]
+        self.assertEqual(manifest["inputs"][0]["original"]["checksum_sha256"], frozen_sha)
+        self.assertEqual(manifest["inputs"][0]["staged"]["checksum_sha256"], frozen_sha)
+        self.assertNotEqual(manifest["inputs"][0]["original"]["path"], manifest["inputs"][0]["staged"]["path"])
 
-    def test_source_replaced_after_last_external_check_fails_inside_publication_transaction(self) -> None:
+    def test_original_replaced_after_last_external_check_still_publishes_staged_render(self) -> None:
         with patch("backend.app.probe_media", side_effect=self.probe):
             queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
         self.assertEqual(studio.claim_next_export_run()["id"], queued["id"])
@@ -269,11 +301,12 @@ class FrozenDeliveryExportTests(unittest.TestCase):
 
             def poll(self) -> int:
                 if not self.finished:
+                    staged = FrozenDeliveryExportTests.staged_snapshot(queued["id"])
                     studio.EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
                     for suffix in (".mp4", ".srt", ".vtt"):
                         (studio.EXPORT_ROOT / f"{stem}{suffix}").write_bytes(b"controlled-output")
                     (studio.EXPORT_ROOT / f"{stem}.sources.json").write_text(
-                        json.dumps(snapshot["sources"], ensure_ascii=False), encoding="utf-8",
+                        json.dumps(staged["sources"], ensure_ascii=False), encoding="utf-8",
                     )
                     self.finished = True
                 return 0
@@ -281,18 +314,67 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         original_verify = studio._verify_frozen_export_sources
         verify_calls = 0
 
-        def replace_after_fourth_verify(current_snapshot: dict, rendered_sources=None) -> None:
+        def replace_after_third_verify(current_snapshot: dict, rendered_sources=None) -> None:
             nonlocal verify_calls
             verify_calls += 1
             original_verify(current_snapshot, rendered_sources)
-            if verify_calls == 4:
+            if verify_calls == 3:
                 self.video.write_bytes(b"replacement-after-last-external-source-check")
 
         with patch("backend.app.subprocess.Popen", return_value=SuccessfulRender()), patch(
-            "backend.app._verify_frozen_export_sources", side_effect=replace_after_fourth_verify,
+            "backend.app._verify_frozen_export_sources", side_effect=replace_after_third_verify,
         ), patch("backend.app.probe_media", side_effect=self.probe):
             studio.run_export_job(queued["id"])
-        self.assertEqual(verify_calls, 5, "最终发布事务必须执行第五次权威 path/SHA 复核")
+        self.assertEqual(verify_calls, 4, "最终发布事务必须再次复核 staged path/SHA")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            completed = db.execute(
+                "SELECT state, is_current, outputs FROM export_runs WHERE id = ?", (queued["id"],),
+            ).fetchone()
+        self.assertEqual(completed[0], "已完成")
+        self.assertEqual(completed[1], 1)
+        self.assertTrue((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
+
+    def test_staged_source_tampered_after_last_external_check_fails_without_publish(self) -> None:
+        with patch("backend.app.probe_media", side_effect=self.probe):
+            queued = studio.create_export(studio.ExportRequest(width=608, height=352, polish_audio=False))
+        self.assertEqual(studio.claim_next_export_run()["id"], queued["id"])
+        run = studio.row("SELECT * FROM export_runs WHERE id = ?", (queued["id"],))
+        stem = run["output_name"]
+
+        class SuccessfulRender:
+            pid = 4245
+            returncode = 0
+            finished = False
+
+            def poll(self) -> int:
+                if not self.finished:
+                    staged = FrozenDeliveryExportTests.staged_snapshot(queued["id"])
+                    studio.EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+                    for suffix in (".mp4", ".srt", ".vtt"):
+                        (studio.EXPORT_ROOT / f"{stem}{suffix}").write_bytes(b"controlled-output")
+                    (studio.EXPORT_ROOT / f"{stem}.sources.json").write_text(
+                        json.dumps(staged["sources"], ensure_ascii=False), encoding="utf-8",
+                    )
+                    self.finished = True
+                return 0
+
+        original_verify = studio._verify_frozen_export_sources
+        verify_calls = 0
+
+        def tamper_staged_after_external_verify(current_snapshot: dict, rendered_sources=None) -> None:
+            nonlocal verify_calls
+            verify_calls += 1
+            original_verify(current_snapshot, rendered_sources)
+            if verify_calls == 3:
+                staged_path = Path(current_snapshot["sources"][0]["path"])
+                staged_path.chmod(0o666)
+                staged_path.write_bytes(b"tampered-private-staging")
+
+        with patch("backend.app.subprocess.Popen", return_value=SuccessfulRender()), patch(
+            "backend.app._verify_frozen_export_sources", side_effect=tamper_staged_after_external_verify,
+        ), patch("backend.app.probe_media", side_effect=self.probe):
+            studio.run_export_job(queued["id"])
+        self.assertEqual(verify_calls, 4)
         with closing(sqlite3.connect(self.db_path)) as db:
             failed = db.execute(
                 "SELECT state, is_current, outputs FROM export_runs WHERE id = ?", (queued["id"],),
@@ -301,6 +383,7 @@ class FrozenDeliveryExportTests(unittest.TestCase):
         self.assertEqual(failed[1], 0)
         self.assertEqual(json.loads(failed[2]), {})
         self.assertFalse((studio.EXPORT_ROOT / f"{stem}.production.json").exists())
+        self.assertFalse(studio.export_staging_root(queued["id"]).exists())
 
     def _assert_delivery_mutation_during_render_fails(self, sql: str) -> None:
         with patch("backend.app.probe_media", side_effect=self.probe):
@@ -320,11 +403,12 @@ class FrozenDeliveryExportTests(unittest.TestCase):
 
             def poll(self) -> int:
                 if not self.finished:
+                    staged = self.test.staged_snapshot(queued["id"])
                     studio.EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
                     for suffix in (".mp4", ".srt", ".vtt"):
                         (studio.EXPORT_ROOT / f"{stem}{suffix}").write_bytes(b"controlled-output")
                     (studio.EXPORT_ROOT / f"{stem}.sources.json").write_text(
-                        json.dumps(snapshot["sources"], ensure_ascii=False), encoding="utf-8",
+                        json.dumps(staged["sources"], ensure_ascii=False), encoding="utf-8",
                     )
                     with closing(sqlite3.connect(self.test.db_path)) as db:
                         db.execute(sql)

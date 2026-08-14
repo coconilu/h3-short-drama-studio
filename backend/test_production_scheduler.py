@@ -784,6 +784,110 @@ class ProductionSchedulerTests(unittest.TestCase):
                 "unknown",
             )
 
+    def test_poll_conflict_is_auditable_and_only_exact_zero_submit_job_unlocks_retry(self) -> None:
+        batch = self.make_batch()
+        claimed = claim_next_item(self.db_path)
+        draft = self.create_draft_job("s1")
+        submit_claimed_item(self.db_path, claimed, self.plan, lambda _: draft)
+        running = get_batch(self.db_path, batch["id"])["items"][0]
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("UPDATE jobs SET candidate_ids = '[]' WHERE id = ?", (draft["job_id"],))
+            db.execute(
+                """UPDATE production_item_attempts SET candidate_ids = '[]', media_evidence = '[]'
+                WHERE item_id = ? AND attempt = 1""",
+                (running["id"],),
+            )
+            db.commit()
+        unsafe = {
+            "authoritative": False,
+            "job_id": draft["job_id"] + 999,
+            "base_job_revision": 0,
+            "job_revision": 1,
+            "state": "完成",
+            "message": "返回了不属于该 attempt 的 job",
+            "prompt_ids": draft["prompt_ids"],
+            "candidate_ids": [],
+        }
+        self.assertEqual(poll_running_items(self.db_path, lambda _: unsafe), 1)
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.row_factory = sqlite3.Row
+            init_production_schema(db)
+            db.commit()
+
+        api = FastAPI()
+        api.include_router(create_production_router(self.db_path, self.plan))
+        client = TestClient(api)
+        groups = client.get("/api/production-conflicts?include_resolved=true").json()
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertEqual(group["shot_id"], "s1")
+        self.assertFalse(group["can_resolve"])
+        conflict = group["items"][0]
+        self.assertEqual(conflict["reason"], "draft_job_reconciliation_conflict")
+        self.assertEqual(conflict["evidence"]["target_attempt"]["attempt"], 1)
+        self.assertEqual(conflict["evidence"]["target_attempt"]["draft_job_id"], draft["job_id"])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            manual_job = db.execute(
+                "SELECT state, reconciliation_revision FROM jobs WHERE id = ?", (draft["job_id"],),
+            ).fetchone()
+        self.assertEqual(manual_job[0], "待人工对账")
+        self.assertEqual(manual_job[1], 1)
+        blocked = client.post(
+            "/api/production-conflicts/s1/resolve",
+            json={
+                "confirm": True,
+                "expected_revisions": group["expected_revisions"],
+                "resolved_by": "测试操作员",
+                "note": "尚无零提交证据",
+            },
+        )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(client.post(f"/api/production-items/{running['id']}/retry").status_code, 409)
+
+        manual_evidence = {"manual_resolutions": [{
+            "action": "confirm_not_submitted", "resolved_by": "测试操作员", "note": "精确 job 未启动",
+        }]}
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute(
+                """UPDATE jobs SET state = '提交失败', retry_safe = 1, candidate_ids = '[]',
+                reconciliation_snapshot = ?, reconciliation_revision = reconciliation_revision + 1
+                WHERE id = ?""",
+                (json.dumps(manual_evidence), draft["job_id"]),
+            )
+            db.commit()
+        group = client.get("/api/production-conflicts?include_resolved=true").json()[0]
+        self.assertTrue(group["can_resolve"])
+        self.assertEqual(group["items"][0]["proof"]["job_id"], draft["job_id"])
+
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("INSERT INTO projects VALUES ('p2', '隔离项目', 'EP02', 'other', 60, 'now')")
+            db.execute("UPDATE workspace_settings SET value = 'p2' WHERE key = 'active_project_id'")
+            db.commit()
+        self.assertEqual(client.get("/api/production-conflicts?include_resolved=true").json(), [])
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("UPDATE workspace_settings SET value = 'p1' WHERE key = 'active_project_id'")
+            db.commit()
+
+        resolved = client.post(
+            "/api/production-conflicts/s1/resolve",
+            json={
+                "confirm": True,
+                "expected_revisions": group["expected_revisions"],
+                "resolved_by": "测试操作员",
+                "note": "精确 attempt/job 已人工确认零提交",
+            },
+        )
+        self.assertEqual(resolved.status_code, 200, resolved.text)
+        retried = client.post(f"/api/production-items/{running['id']}/retry")
+        self.assertEqual(retried.status_code, 200, retried.text)
+        item = next(value for value in retried.json()["items"] if value["id"] == running["id"])
+        self.assertEqual(item["state"], "queued")
+        with closing(sqlite3.connect(self.db_path)) as db:
+            self.assertEqual(
+                db.execute("SELECT state FROM production_shot_leases WHERE shot_id = 's1'").fetchone()[0],
+                "queued",
+            )
+
     def test_external_job_revision_advance_is_cas_consumed_by_exact_attempt(self) -> None:
         batch = self.make_batch()
         claimed = claim_next_item(self.db_path)

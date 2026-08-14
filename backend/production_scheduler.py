@@ -455,6 +455,71 @@ def _has_unresolved_shot_conflict(db: sqlite3.Connection, shot_id: str) -> bool:
     ).fetchone())
 
 
+def _record_poll_reconciliation_conflict(
+    db: sqlite3.Connection,
+    item: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    now: str,
+) -> None:
+    """Persist a project-visible recovery path for an unsafe poll result."""
+    attempt_number = int(item.get("attempts") or 0)
+    attempt = db.execute(
+        "SELECT * FROM production_item_attempts WHERE item_id = ? AND attempt = ?",
+        (item["id"], attempt_number),
+    ).fetchone()
+    target = {
+        "item_id": item["id"],
+        "attempt": attempt_number,
+        "draft_job_id": int(item.get("draft_job_id") or 0) or None,
+        "item_job_revision": int(item.get("draft_job_revision") or 0),
+        "attempt_job_revision": int(attempt["draft_job_revision"] or 0) if attempt else None,
+    }
+    observation = {
+        "authoritative": result.get("authoritative"),
+        "job_id": result.get("job_id"),
+        "base_job_revision": result.get("base_job_revision"),
+        "job_revision": result.get("job_revision"),
+        "state": result.get("state"),
+        "prompt_ids": list(result.get("prompt_ids") or []),
+        "candidate_ids": list(result.get("candidate_ids") or []),
+        "message": str(result.get("message") or "")[:1000],
+        "detected_at": now,
+    }
+    existing = db.execute(
+        "SELECT * FROM production_shot_conflicts WHERE item_id = ?", (item["id"],),
+    ).fetchone()
+    if existing:
+        evidence = _decode_json(existing["evidence"], {})
+        detections = list(evidence.get("detections") or [])
+        detections.append(observation)
+        evidence = {
+            "kind": "draft_job_reconciliation_conflict",
+            "target_attempt": target,
+            "detections": detections[-20:],
+            "prior_audit": evidence,
+        }
+        db.execute(
+            """UPDATE production_shot_conflicts SET original_state = 'running', state = 'unresolved',
+            reason = 'draft_job_reconciliation_conflict', evidence = ?, resolved_at = NULL,
+            resolved_by = NULL, resolution_note = NULL, revision = revision + 1
+            WHERE id = ?""",
+            (json.dumps(evidence, ensure_ascii=False, sort_keys=True), existing["id"]),
+        )
+    else:
+        evidence = {
+            "kind": "draft_job_reconciliation_conflict",
+            "target_attempt": target,
+            "detections": [observation],
+        }
+        db.execute(
+            """INSERT INTO production_shot_conflicts
+            (shot_id, item_id, original_state, state, reason, evidence, created_at)
+            VALUES (?, ?, 'running', 'unresolved', 'draft_job_reconciliation_conflict', ?, ?)""",
+            (item["shot_id"], item["id"], json.dumps(evidence, ensure_ascii=False, sort_keys=True), now),
+        )
+
+
 def _bind_draft_job(
     db: sqlite3.Connection, item: dict[str, Any], result: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
@@ -528,14 +593,30 @@ def _fail_poll_reconciliation(
     now: str,
 ) -> None:
     """Fail closed when a running attempt can no longer prove job ownership."""
-    job = _draft_job(db, item.get("draft_job_id"))
-    retry_safe = bool(
-        job
-        and job.get("shot_id") == item["shot_id"]
-        and job.get("retry_safe")
-        and not _decode_json(job.get("candidate_ids"), [])
-    )
     message = str(result.get("message") or "draft job 修订或候选所有权冲突，已失败关闭并等待人工审计")
+    job = _draft_job(db, item.get("draft_job_id"))
+    if job and not bool(job.get("retry_safe")) and job.get("state") != "待人工对账":
+        job_evidence = _decode_json(job.get("reconciliation_snapshot"), {})
+        poll_conflicts = list(job_evidence.get("production_poll_conflicts") or [])
+        poll_conflicts.append({
+            "item_id": item["id"],
+            "attempt": int(item.get("attempts") or 0),
+            "observed_job_revision": int(job.get("reconciliation_revision") or 0),
+            "message": message[:1000],
+            "detected_at": now,
+        })
+        job_evidence["production_poll_conflicts"] = poll_conflicts[-20:]
+        db.execute(
+            """UPDATE jobs SET state = '待人工对账', message = ?, retry_safe = 0,
+            reconciliation_snapshot = ?, reconciliation_revision = reconciliation_revision + 1
+            WHERE id = ? AND reconciliation_revision = ?""",
+            (
+                "生产调度检测到 attempt/job 所有权冲突；请核对精确任务后确认是否零提交",
+                json.dumps(job_evidence, ensure_ascii=False, sort_keys=True),
+                int(job["id"]),
+                int(job.get("reconciliation_revision") or 0),
+            ),
+        )
     updated = db.execute(
         """UPDATE production_batch_items SET state = 'failed', message = ?,
         error = 'draft_job_reconciliation_conflict', updated_at = ?, completed_at = ?
@@ -545,19 +626,26 @@ def _fail_poll_reconciliation(
     if updated.rowcount != 1:
         raise HTTPException(409, "生产条目已被另一同步请求更新")
     db.execute(
-        """UPDATE production_item_attempts SET state = ?,
+        """UPDATE production_item_attempts SET state = 'submission_unknown',
         error = 'draft_job_reconciliation_conflict', updated_at = ?, completed_at = ?
         WHERE item_id = ? AND attempt = ? AND state IN ('running', 'submission_unknown')""",
-        ("failed" if retry_safe else "submission_unknown", now, now, item["id"], int(item.get("attempts") or 0)),
+        (now, now, item["id"], int(item.get("attempts") or 0)),
     )
-    if retry_safe:
-        db.execute("DELETE FROM production_shot_leases WHERE item_id = ?", (item["id"],))
-    else:
+    lease = db.execute(
+        """UPDATE production_shot_leases SET state = 'unknown', updated_at = ?
+        WHERE item_id = ?""",
+        (now, item["id"]),
+    )
+    if lease.rowcount != 1 and not db.execute(
+        "SELECT 1 FROM production_shot_leases WHERE shot_id = ?", (item["shot_id"],),
+    ).fetchone():
         db.execute(
-            """UPDATE production_shot_leases SET state = 'unknown', updated_at = ?
-            WHERE item_id = ?""",
-            (now, item["id"]),
+            """INSERT INTO production_shot_leases
+            (shot_id, batch_id, item_id, state, created_at, updated_at)
+            VALUES (?, ?, ?, 'unknown', ?, ?)""",
+            (item["shot_id"], item["batch_id"], item["id"], now, now),
         )
+    _record_poll_reconciliation_conflict(db, item, result, now=now)
     _event(
         db,
         item["batch_id"],
@@ -742,9 +830,74 @@ def get_batch(db_path: Path, batch_id: str) -> dict[str, Any]:
         return _batch_public(db, batch)
 
 
+def _job_zero_submit_basis(job: dict[str, Any], *, shot_id: str) -> tuple[str | None, str | None]:
+    if job.get("shot_id") != shot_id:
+        return None, "draft job 与冲突镜头不匹配"
+    if job.get("state") != "提交失败" or not bool(job.get("retry_safe")):
+        return None, "draft job 尚未被可信地确认成零提交"
+    if _decode_json(job.get("candidate_ids"), []):
+        return None, "draft job 已记录候选，不能证明零提交"
+    evidence = _decode_json(job.get("reconciliation_snapshot"), {})
+    manual = any(
+        isinstance(value, dict) and value.get("action") == "confirm_not_submitted"
+        for value in evidence.get("manual_resolutions") or []
+    )
+    frozen_pre_spawn = bool(
+        evidence.get("adapter_returned_success") is False
+        and isinstance(evidence.get("frozen_command"), dict)
+        and len(str(evidence.get("input_hash") or "")) == 64
+        and isinstance(evidence.get("manifest_before"), dict)
+        and evidence["manifest_before"].get("trusted") is True
+    )
+    if manual:
+        return "manual_confirm_not_submitted", None
+    if frozen_pre_spawn:
+        return "audited_pre_spawn_failure", None
+    return None, "retry_safe 缺少人工确认或受信任的进程未启动冻结证据"
+
+
+def _poll_conflict_zero_submit_proof(
+    db: sqlite3.Connection, conflict: dict[str, Any], item: dict[str, Any],
+) -> dict[str, Any]:
+    evidence = _decode_json(conflict.get("evidence"), {})
+    target = evidence.get("target_attempt") if isinstance(evidence, dict) else None
+    if not isinstance(target, dict) or target.get("item_id") != item["id"]:
+        return {"verified": False, "reason": "冲突缺少精确 attempt 审计目标"}
+    attempt_number = int(target.get("attempt") or 0)
+    job_id = int(target.get("draft_job_id") or 0)
+    if attempt_number <= 0 or job_id <= 0:
+        return {"verified": False, "reason": "冲突未绑定精确 attempt 或 draft job"}
+    attempt = db.execute(
+        """SELECT * FROM production_item_attempts
+        WHERE item_id = ? AND attempt = ?""",
+        (item["id"], attempt_number),
+    ).fetchone()
+    if not attempt or int(attempt["draft_job_id"] or 0) != job_id:
+        return {"verified": False, "reason": f"attempt {attempt_number} 的 draft job 所有权与冲突证据不一致"}
+    if attempt["state"] != "submission_unknown" or attempt["error"] != "draft_job_reconciliation_conflict":
+        return {"verified": False, "reason": f"attempt {attempt_number} 未处于本次冲突的 submission_unknown 审计状态"}
+    if _decode_json(attempt["candidate_ids"], []) or _decode_json(attempt["media_evidence"], []):
+        return {"verified": False, "reason": f"attempt {attempt_number} 已记录候选或媒体证据，不能证明零提交"}
+    job = _draft_job(db, job_id)
+    if not job:
+        return {"verified": False, "reason": f"attempt {attempt_number} 的精确 draft job 不存在"}
+    basis, reason = _job_zero_submit_basis(job, shot_id=item["shot_id"])
+    if not basis:
+        return {"verified": False, "reason": f"attempt {attempt_number}：{reason}"}
+    return {
+        "verified": True,
+        "basis": basis,
+        "attempt": attempt_number,
+        "job_id": job_id,
+        "job_revision": int(job.get("reconciliation_revision") or 0),
+    }
+
+
 def _zero_submit_proof(
     db: sqlite3.Connection, conflict: dict[str, Any], item: dict[str, Any],
 ) -> dict[str, Any]:
+    if conflict.get("reason") == "draft_job_reconciliation_conflict":
+        return _poll_conflict_zero_submit_proof(db, conflict, item)
     attempts = [
         dict(value)
         for value in db.execute(
@@ -777,28 +930,15 @@ def _zero_submit_proof(
         job = _draft_job(db, job_id)
         if not job or job.get("shot_id") != item["shot_id"]:
             return {"verified": False, "reason": f"attempt {attempt_number} 的精确 draft job 缺失或镜头不匹配"}
-        if job.get("state") != "提交失败" or not bool(job.get("retry_safe")) or _decode_json(job.get("candidate_ids"), []):
-            return {"verified": False, "reason": f"attempt {attempt_number} 尚未被可信地确认成零提交"}
-        evidence = _decode_json(job.get("reconciliation_snapshot"), {})
-        manual = any(
-            isinstance(value, dict) and value.get("action") == "confirm_not_submitted"
-            for value in evidence.get("manual_resolutions") or []
-        )
-        frozen_pre_spawn = bool(
-            evidence.get("adapter_returned_success") is False
-            and isinstance(evidence.get("frozen_command"), dict)
-            and len(str(evidence.get("input_hash") or "")) == 64
-            and isinstance(evidence.get("manifest_before"), dict)
-            and evidence["manifest_before"].get("trusted") is True
-        )
-        if not manual and not frozen_pre_spawn:
+        basis, reason = _job_zero_submit_basis(job, shot_id=item["shot_id"])
+        if not basis:
             return {
                 "verified": False,
-                "reason": f"attempt {attempt_number} 缺少独立的人工确认或受信任进程未启动证据",
+                "reason": f"attempt {attempt_number}：{reason}",
             }
         attempt_proofs.append({
             "attempt": attempt_number,
-            "basis": "manual_confirm_not_submitted" if manual else "audited_pre_spawn_failure",
+            "basis": basis,
             "job_id": int(job["id"]),
             "job_revision": int(job.get("reconciliation_revision") or 0),
         })

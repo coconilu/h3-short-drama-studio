@@ -3076,6 +3076,101 @@ def cleanup_export_outputs(stem: str) -> None:
         path.unlink(missing_ok=True)
 
 
+def export_staging_root(run_id: str) -> Path:
+    root = (EXPORT_JOB_ROOT / f"{run_id}.staging").resolve()
+    try:
+        root.relative_to(EXPORT_JOB_ROOT.resolve())
+    except ValueError as exc:
+        raise RuntimeError("导出 staging 路径越界") from exc
+    return root
+
+
+def allowed_staged_export_file(raw_path: str | None, run_id: str) -> Path:
+    path = Path(str(raw_path or "")).resolve()
+    source_root = (export_staging_root(run_id) / "sources").resolve()
+    try:
+        path.relative_to(source_root)
+    except ValueError as exc:
+        raise RuntimeError("导出 staged 来源不在本次运行私有目录内") from exc
+    if not path.is_file():
+        raise RuntimeError("导出 staged 来源不存在")
+    return path
+
+
+def cleanup_export_staging(run_id: str) -> None:
+    root = export_staging_root(run_id)
+    if not root.exists():
+        return
+
+    def make_writable_and_retry(function: Any, path: str, _error: Any) -> None:
+        os.chmod(path, 0o700)
+        function(path)
+
+    shutil.rmtree(root, onerror=make_writable_and_retry)
+
+
+def stage_export_sources(run_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Copy frozen sources into a private immutable run directory.
+
+    FFmpeg never receives the mutable original path.  Each copy is accepted
+    only when the original hash is stable before and after copying and the
+    staged bytes independently match the frozen credential.
+    """
+    frozen_sources = snapshot.get("sources")
+    if not isinstance(frozen_sources, list) or not frozen_sources:
+        raise RuntimeError("导出任务缺少冻结来源")
+    cleanup_export_staging(run_id)
+    root = export_staging_root(run_id)
+    source_root = root / "sources"
+    root.mkdir(parents=True, exist_ok=False)
+    source_root.mkdir(exist_ok=False)
+    staged_sources: list[dict[str, Any]] = []
+    try:
+        for index, frozen in enumerate(frozen_sources, 1):
+            original = allowed_output_file(frozen.get("path"))
+            expected_sha = str(frozen.get("checksum_sha256") or "").lower()
+            if len(expected_sha) != 64:
+                raise RuntimeError(f"镜头 {frozen.get('shot_id')} 缺少有效冻结 SHA256")
+            before_sha = file_sha256(original).lower()
+            if before_sha != expected_sha:
+                raise RuntimeError(f"镜头 {frozen.get('shot_id')} 的原始媒体与冻结 SHA256 不一致")
+            suffix = original.suffix.lower()
+            if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+                suffix = ".media"
+            staged_path = source_root / f"{index:04d}-{expected_sha}{suffix}"
+            staged_temp = source_root / f".{index:04d}-{uuid.uuid4().hex}.tmp"
+            with original.open("rb") as source_handle, staged_temp.open("xb") as staged_handle:
+                shutil.copyfileobj(source_handle, staged_handle, length=1024 * 1024)
+                staged_handle.flush()
+                os.fsync(staged_handle.fileno())
+            after_sha = file_sha256(original).lower()
+            staged_sha = file_sha256(staged_temp).lower()
+            if before_sha != after_sha or after_sha != expected_sha or staged_sha != expected_sha:
+                raise RuntimeError(f"镜头 {frozen.get('shot_id')} 在 staging 复制期间发生变化")
+            staged_temp.replace(staged_path)
+            os.chmod(staged_path, 0o444)
+            staged_sources.append({
+                **frozen,
+                "original_path": str(original),
+                "original_checksum_sha256": expected_sha,
+                "path": str(staged_path.resolve()),
+                "checksum_sha256": staged_sha,
+                "staged_path": str(staged_path.resolve()),
+                "staged_checksum_sha256": staged_sha,
+                "staged_size_bytes": staged_path.stat().st_size,
+            })
+        staged_snapshot = {**snapshot, "sources": staged_sources, "staging_run_id": run_id}
+        request_path = root / "request.json"
+        request_temp = root / f".{uuid.uuid4().hex}.request.tmp"
+        request_temp.write_text(json.dumps(staged_snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        request_temp.replace(request_path)
+        os.chmod(request_path, 0o444)
+        return staged_snapshot
+    except Exception:
+        cleanup_export_staging(run_id)
+        raise
+
+
 class ExportCancelled(RuntimeError):
     pass
 
@@ -3111,8 +3206,13 @@ def _verify_frozen_export_sources(
     }
     if rendered_sources is not None and len(rendered_by_shot) != len(frozen_sources):
         raise RuntimeError("FFmpeg 来源清单与冻结装配的镜头集合不一致")
+    staging_run_id = str(snapshot.get("staging_run_id") or "")
     for frozen in frozen_sources:
-        path = allowed_output_file(frozen.get("path"))
+        path = (
+            allowed_staged_export_file(frozen.get("path"), staging_run_id)
+            if staging_run_id
+            else allowed_output_file(frozen.get("path"))
+        )
         expected_sha = str(frozen.get("checksum_sha256") or "").lower()
         if len(expected_sha) != 64 or file_sha256(path).lower() != expected_sha:
             raise RuntimeError(f"镜头 {frozen.get('shot_id')} 的冻结媒体在导出期间发生变化")
@@ -3259,11 +3359,9 @@ def run_export_job(run_id: str) -> None:
             raise RuntimeError(f"导出脚本不存在：{EXPORT_SCRIPT}")
         EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
         EXPORT_JOB_ROOT.mkdir(parents=True, exist_ok=True)
-        snapshot = _validate_export_run_snapshot(export_run)
-        snapshot_path = EXPORT_JOB_ROOT / f"{run_id}.request.json"
-        snapshot_temp = EXPORT_JOB_ROOT / f"{run_id}.request.tmp.json"
-        snapshot_temp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        snapshot_temp.replace(snapshot_path)
+        original_snapshot = _validate_export_run_snapshot(export_run)
+        staged_snapshot = stage_export_sources(run_id, original_snapshot)
+        snapshot_path = export_staging_root(run_id) / "request.json"
         log_path = EXPORT_JOB_ROOT / f"{run_id}.log"
         with closing(connect()) as db:
             db.execute(
@@ -3271,7 +3369,11 @@ def run_export_job(run_id: str) -> None:
                 (str(log_path), utc_now(), run_id),
             )
             db.commit()
-        record_export_event(run_id, "snapshot_ready", f"已冻结 {len(snapshot['sources'])} 个镜头输入")
+        record_export_event(
+            run_id,
+            "snapshot_ready",
+            f"已将 {len(staged_snapshot['sources'])} 个冻结镜头复制到本次运行的只读 staging",
+        )
         command = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(EXPORT_SCRIPT),
             "-ApiBase", API_BASE,
@@ -3322,15 +3424,38 @@ def run_export_job(run_id: str) -> None:
         # Recheck the immutable inputs after FFmpeg exits and before publishing
         # any production manifest/current version.  A mid-render replacement
         # must fail closed even when the output process itself succeeded.
-        _verify_frozen_export_sources(snapshot, sources)
+        _verify_frozen_export_sources(staged_snapshot, sources)
         # FFmpeg may run for a long time.  Revalidate the complete normalized
         # locked assembly after it exits, not only the media files frozen at
         # worker start.
-        snapshot = _validate_export_run_snapshot(export_run)
+        _validate_export_run_snapshot(export_run, verify_sources=False)
+        original_by_shot = {
+            str(source.get("shot_id")): source for source in original_snapshot["sources"]
+        }
+        staged_by_shot = {
+            str(source.get("shot_id")): source for source in staged_snapshot["sources"]
+        }
         verified_sources = []
         for source in sources:
-            source_path = allowed_output_file(source.get("path"))
-            verified_sources.append({**source, "sha256": file_sha256(source_path)})
+            source_path = allowed_staged_export_file(source.get("path"), run_id)
+            shot_id = str(source.get("shot_id"))
+            original_source = original_by_shot.get(shot_id)
+            staged_source = staged_by_shot.get(shot_id)
+            if not original_source or not staged_source:
+                raise RuntimeError(f"镜头 {shot_id} 的 original/staged 来源映射不完整")
+            verified_sources.append({
+                **source,
+                "sha256": file_sha256(source_path),
+                "original": {
+                    "path": original_source.get("path"),
+                    "checksum_sha256": original_source.get("checksum_sha256"),
+                },
+                "staged": {
+                    "path": staged_source.get("path"),
+                    "checksum_sha256": staged_source.get("checksum_sha256"),
+                    "size_bytes": staged_source.get("staged_size_bytes"),
+                },
+            })
         config = json.loads(export_run.get("config") or "{}")
         video_probe = probe_media(video_path)
         production_manifest_path = EXPORT_ROOT / f"{stem}.production.json"
@@ -3345,6 +3470,10 @@ def run_export_job(run_id: str) -> None:
             "created_at": export_run["created_at"],
             "completed_at": utc_now(),
             "config": config,
+            "source_snapshot_sha256": config.get("source_snapshot_sha256"),
+            "staged_snapshot_sha256": hashlib.sha256(
+                json.dumps(staged_snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
             "inputs": verified_sources,
             "outputs": {
                 "video": {"file": video_path.name, "sha256": file_sha256(video_path), "probe": video_probe},
@@ -3368,7 +3497,7 @@ def run_export_job(run_id: str) -> None:
         completed_at = utc_now()
         # Reject obvious source drift before taking the publication lock.  The
         # authoritative hash is repeated inside the final transaction below.
-        _verify_frozen_export_sources(snapshot, sources)
+        _verify_frozen_export_sources(staged_snapshot, sources)
         with closing(connect()) as db:
             db.execute("BEGIN IMMEDIATE")
             current_run = db.execute(
@@ -3383,10 +3512,11 @@ def run_export_job(run_id: str) -> None:
                 or current_run.get("config") != export_run.get("config")
             ):
                 raise RuntimeError("导出任务冻结凭证在发布前发生变化")
-            # Final assembly and path/SHA validation share the publication
-            # transaction with the run CAS.  It contains no FFmpeg work, and a
-            # delivery edit or source replacement cannot slip into publication.
-            _validate_export_run_snapshot(current_run, db=db, verify_sources=True)
+            # The mutable originals are no longer render inputs.  Revalidate
+            # the locked assembly and this run's private staged bytes in the
+            # publication transaction before exposing manifest/current.
+            _validate_export_run_snapshot(current_run, db=db, verify_sources=False)
+            _verify_frozen_export_sources(staged_snapshot, sources)
             production_manifest_temp.replace(production_manifest_path)
             db.execute("UPDATE export_runs SET is_current = 0 WHERE project_id = ?", (export_run["project_id"],))
             published = db.execute(
@@ -3405,6 +3535,7 @@ def run_export_job(run_id: str) -> None:
         record_export_event(run_id, "completed", "媒体校验与生产清单写入完成，已设为当前版本")
     except ExportCancelled as exc:
         cleanup_export_outputs(export_run["output_name"])
+        cleanup_export_staging(run_id)
         cancelled_at = utc_now()
         with closing(connect()) as db:
             db.execute(
@@ -3416,6 +3547,7 @@ def run_export_job(run_id: str) -> None:
         record_export_event(run_id, "cancelled", str(exc), "warning")
     except ExportInterrupted as exc:
         cleanup_export_outputs(export_run["output_name"])
+        cleanup_export_staging(run_id)
         with closing(connect()) as db:
             db.execute(
                 """UPDATE export_runs SET state = '恢复排队', message = '服务停止，等待下次启动恢复',
@@ -3426,6 +3558,7 @@ def run_export_job(run_id: str) -> None:
         record_export_event(run_id, "interrupted", str(exc), "warning")
     except Exception as exc:
         cleanup_export_outputs(export_run["output_name"])
+        cleanup_export_staging(run_id)
         failed_at = utc_now()
         with closing(connect()) as db:
             db.execute(
